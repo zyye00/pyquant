@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyquant"
+version = "0.1.0"
+description = "Lightweight research toolkit for reproducing quantitative strategy reports."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "pyarrow",
+    "pyyaml",
+    "matplotlib",
+    "scipy",
+    "statsmodels",
+    "empyrical-reloaded",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+backtest = ["vectorbt"]
+report = ["quantstats"]
+factor = ["alphalens-reloaded"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

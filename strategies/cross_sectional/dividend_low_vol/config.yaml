@@ -1,0 +1,17 @@
+strategy:
+  name: dividend_low_vol
+  type: cross_sectional
+
+data:
+  price_path: data/processed/price.parquet
+
+backtest:
+  start: null
+  end: null
+  rebalance: monthly
+  fee_rate: 0.0
+
+selection:
+  dividend_top_n: 150
+  final_n: 50
+  volatility_lookback_days: 20
