@@ -1,0 +1,6 @@
+baostock_limits:
+  hard_max_requests_per_day: 50000
+  safe_max_requests_per_day: 49000
+
+paths:
+  raw_root: data/raw/baostock

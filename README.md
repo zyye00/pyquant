@@ -25,3 +25,101 @@ strategies/
 │  └─ dividend_low_vol/
 └─ timing/
 ```
+
+## 下载数据
+
+项目使用 BaoStock 下载原始数据。下载参数主要通过 CLI 指定；路径和请求限制写在
+`configs/baostock_download.yaml`：
+
+```yaml
+baostock_limits:
+  hard_max_requests_per_day: 50000
+  safe_max_requests_per_day: 49000
+
+paths:
+  raw_root: data/raw/baostock
+```
+
+查看命令帮助：
+
+```bash
+pyquant baostock-download --help
+```
+
+下载指数日频行情：
+
+```bash
+pyquant baostock-download \
+  --frequency d \
+  --index sh.000300 \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-03
+```
+
+下载某个股票池的股票行情，例如沪深 300 成分股：
+
+```bash
+pyquant baostock-download \
+  --frequency d \
+  --pool hs300 \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-03
+```
+
+`--pool` 支持 `all`、`sz50`、`hs300`、`zz500`，且必须与 `--index` 二选一。下载
+全 A 股票池时指定 `--pool all`：
+
+```bash
+pyquant baostock-download \
+  --frequency d \
+  --pool all \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-03
+```
+
+下载 5 分钟股票行情：
+
+```bash
+pyquant baostock-download \
+  --frequency 5 \
+  --pool hs300 \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-03
+```
+
+`--end-date` 可以省略，省略时使用当天日期。BaoStock 不提供指数分钟线，因此
+`--index` 只能与 `--frequency d` 一起使用。
+
+股票下载可用 `--adjustflag forward` 指定前复权，`--adjustflag backward` 指定后复权；
+不指定时为不复权，数据保存到 `stock/none/`。三种数据分别保存到
+`stock/forward/`、`stock/backward/`、`stock/none/`。
+
+如果当前环境尚未生成 `pyquant` 命令，也可以使用模块方式运行：
+
+```bash
+python -m pyquant.cli baostock-download --help
+```
+
+下载过程中终端会提示：
+
+```text
+p 暂停
+c 继续
+q 保存并退出
+```
+
+下载器根据现有 parquet 的最大日期计算每只证券需要补齐的时间范围。每次成功请求都会
+合并写回目标文件，因此重新运行会从已有数据后的日期继续。请求日志只保留当天记录，
+用于执行每日请求限制。
+
+数据落盘位置：
+
+```text
+data/raw/baostock/
+├─ daily/
+│  ├─ stock/
+│  └─ index/
+├─ minute_5/
+│  └─ stock/
+└─ state/
+```

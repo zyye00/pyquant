@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pandas",
     "numpy",
+    "baostock",
     "pyarrow",
     "pyyaml",
     "matplotlib",
@@ -24,6 +25,9 @@ test = ["pytest"]
 backtest = ["vectorbt"]
 report = ["quantstats"]
 factor = ["alphalens-reloaded"]
+
+[project.scripts]
+pyquant = "pyquant.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

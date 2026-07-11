@@ -5,6 +5,8 @@ from typing import Optional, Union
 
 import pandas as pd
 
+from pyquant.baostock_source import update_baostock_dataset
+
 
 PRICE_COLUMNS = ["date", "symbol", "open", "high", "low", "close", "volume", "amount"]
 DEFAULT_PRICE_FIELD_MAP = {
