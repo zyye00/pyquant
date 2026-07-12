@@ -177,17 +177,7 @@ class BaostockClient:
         return self.bs.query_trade_dates(start_date, end_date)
 
 
-class DownloadControl:
-    """Request-boundary pause/resume control for serial downloads."""
-
-    def before_request(self) -> bool:
-        return True
-
-    def after_request(self) -> bool:
-        return True
-
-
-class StdinDownloadControl(DownloadControl):
+class StdinDownloadControl:
     """Keyboard control using p=pause, c=continue, q=quit between requests."""
 
     def __init__(
@@ -490,7 +480,7 @@ def update_baostock_dataset(
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     adjustflag: str | None = None,
     client: Optional[Any] = None,
-    control: Optional[DownloadControl] = None,
+    control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
     """Download only data not already covered by local parquet files."""
@@ -523,7 +513,7 @@ def run_baostock_slices(
     adjustflag: str,
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Optional[Any] = None,
-    control: Optional[DownloadControl] = None,
+    control: StdinDownloadControl | None = None,
     total_codes: int | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
