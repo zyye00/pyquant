@@ -8,6 +8,9 @@ from pyquant.cli import load_baostock_download_config, run_baostock_download
 class FakeClientContext:
     entered = 0
 
+    def __init__(self):
+        self.bs = self
+
     def __enter__(self):
         type(self).entered += 1
         return self

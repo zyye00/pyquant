@@ -127,7 +127,6 @@ class BaostockClient:
         except ImportError as exc:
             raise ImportError("BaoStock download requires package 'baostock'.") from exc
         self.bs = bs
-        self.logged_in = False
 
     def __enter__(self) -> "BaostockClient":
         result = self.bs.login()
@@ -135,46 +134,10 @@ class BaostockClient:
             raise RuntimeError(
                 f"BaoStock login failed: {result.error_code} {result.error_msg}"
             )
-        self.logged_in = True
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self.logged_in:
-            self.bs.logout()
-            self.logged_in = False
-
-    def query_history_k_data_plus(
-        self,
-        code: str,
-        fields: str,
-        start_date: str,
-        end_date: str,
-        frequency: str,
-        adjustflag: str,
-    ) -> Any:
-        return self.bs.query_history_k_data_plus(
-            code,
-            fields,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            adjustflag=adjustflag,
-        )
-
-    def query_hs300_stocks(self, trade_date: str) -> Any:
-        return self.bs.query_hs300_stocks(trade_date)
-
-    def query_sz50_stocks(self, trade_date: str) -> Any:
-        return self.bs.query_sz50_stocks(trade_date)
-
-    def query_zz500_stocks(self, trade_date: str) -> Any:
-        return self.bs.query_zz500_stocks(trade_date)
-
-    def query_all_stock(self, trade_date: str) -> Any:
-        return self.bs.query_all_stock(trade_date)
-
-    def query_trade_dates(self, start_date: str, end_date: str) -> Any:
-        return self.bs.query_trade_dates(start_date, end_date)
+        self.bs.logout()
 
 
 class StdinDownloadControl:
@@ -604,15 +567,17 @@ def resolve_baostock_codes(
 ) -> list[str]:
     """Resolve a pool on its latest available trading day."""
     if pool == "all":
-        query = client.query_all_stock
+        query = client.bs.query_all_stock
     elif pool in BAOSTOCK_STOCK_POOL_QUERIES:
-        query = getattr(client, BAOSTOCK_STOCK_POOL_QUERIES[pool])
+        query = getattr(client.bs, BAOSTOCK_STOCK_POOL_QUERIES[pool])
     else:
         raise ValueError(f"Unsupported BaoStock stock pool: {pool}")
 
     end = pd.Timestamp(trade_date)
     calendar = baostock_result_to_frame(
-        client.query_trade_dates((end - pd.Timedelta(days=14)).strftime("%Y-%m-%d"), trade_date)
+        client.bs.query_trade_dates(
+            (end - pd.Timedelta(days=14)).strftime("%Y-%m-%d"), trade_date
+        )
     )
     if not {"calendar_date", "is_trading_day"}.issubset(calendar.columns):
         raise ValueError(f"BaoStock trade calendar has unexpected columns: {list(calendar.columns)}")
@@ -645,7 +610,7 @@ def query_baostock_history(
     client: Any,
 ) -> pd.DataFrame:
     """Query BaoStock history and convert its cursor-like result to DataFrame."""
-    result = client.query_history_k_data_plus(
+    result = client.bs.query_history_k_data_plus(
         code,
         ",".join(fields),
         start_date=start_date,

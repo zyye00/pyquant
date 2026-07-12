@@ -40,6 +40,7 @@ class FakeResult:
 
 class FakeClient:
     def __init__(self):
+        self.bs = self
         self.calls = []
 
     def query_history_k_data_plus(self, code, fields, start_date, end_date, frequency, adjustflag):
