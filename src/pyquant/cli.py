@@ -60,7 +60,7 @@ def run_baostock_download(args: argparse.Namespace) -> None:
     cfg = load_baostock_download_config(DEFAULT_BAOSTOCK_CONFIG)
     raw_root = cfg["raw_root"]
     max_requests_per_day = cfg["safe_max_requests_per_day"]
-    end_date = args.end_date or today_text()
+    end_date = args.end_date or date.today().isoformat()
 
     if args.index and args.frequency != "d":
         raise ValueError("BaoStock does not provide index minute data; use --frequency d with --index")
@@ -107,10 +107,6 @@ def run_baostock_download(args: argparse.Namespace) -> None:
     status_counts = result["status"].value_counts().to_dict()
     print(f"Selected codes: {len(codes)}")
     print(f"Download status: {status_counts}")
-
-
-def today_text() -> str:
-    return date.today().isoformat()
 
 
 def load_baostock_download_config(path: str | Path) -> dict:

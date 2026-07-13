@@ -1,4 +1,5 @@
 import argparse
+from datetime import date
 
 import pytest
 
@@ -119,7 +120,6 @@ def test_cli_uses_today_when_end_date_is_missing(monkeypatch):
         return _fake_result()
 
     monkeypatch.setattr("pyquant.cli.BaostockClient", FakeClientContext)
-    monkeypatch.setattr("pyquant.cli.today_text", lambda: "2026-07-09")
     monkeypatch.setattr("pyquant.cli.update_baostock_dataset", fake_update)
     args = argparse.Namespace(
         frequency="d",
@@ -132,7 +132,7 @@ def test_cli_uses_today_when_end_date_is_missing(monkeypatch):
     )
 
     assert run_baostock_download(args) is None
-    assert captured["end_date"] == "2026-07-09"
+    assert captured["end_date"] == date.today().isoformat()
 
 
 def test_cli_rejects_index_minute_frequency():

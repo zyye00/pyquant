@@ -201,13 +201,9 @@ class StdinDownloadControl:
         return line.strip()[:1] if line else None
 
 
-def baostock_paths(raw_root: str | Path = "data/raw/baostock") -> BaostockPaths:
-    return BaostockPaths(Path(raw_root))
-
-
 def init_baostock_storage(raw_root: str | Path = "data/raw/baostock") -> BaostockPaths:
     """Create the BaoStock raw-data directory skeleton."""
-    paths = baostock_paths(raw_root)
+    paths = BaostockPaths(Path(raw_root))
     for path in [
         paths.daily_stock_dir,
         *(paths.daily_stock_dir / name for name in ADJUSTMENT_DIRS.values()),
@@ -227,7 +223,7 @@ def daily_target_path(
     raw_root: str | Path = "data/raw/baostock",
     adjustflag: str | None = None,
 ) -> Path:
-    paths = baostock_paths(raw_root)
+    paths = BaostockPaths(Path(raw_root))
     if dataset == "stock":
         return paths.daily_stock_dir / adjustment_dir(adjustflag) / f"{code}.parquet"
     if dataset == "index":
@@ -241,7 +237,7 @@ def minute_5_target_path(
     raw_root: str | Path = "data/raw/baostock",
     adjustflag: str | None = None,
 ) -> Path:
-    paths = baostock_paths(raw_root)
+    paths = BaostockPaths(Path(raw_root))
     return paths.minute_5_stock_dir / adjustment_dir(adjustflag) / code / f"{year}.parquet"
 
 
@@ -388,7 +384,7 @@ def create_download_lock(raw_root: str | Path = "data/raw/baostock") -> Path:
 
 
 def remove_download_lock(raw_root: str | Path = "data/raw/baostock") -> None:
-    lock_path = baostock_paths(raw_root).lock_path
+    lock_path = BaostockPaths(Path(raw_root)).lock_path
     if lock_path.exists():
         lock_path.unlink()
 
