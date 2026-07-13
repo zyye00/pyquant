@@ -13,6 +13,7 @@ from pyquant.baostock_source import (
     StdinDownloadControl,
     resolve_baostock_codes,
     update_baostock_dataset,
+    update_baostock_dividends,
 )
 from pyquant.io import load_config
 
@@ -24,9 +25,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="pyquant")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_baostock_download_parser(subparsers)
+    _add_baostock_dividend_download_parser(subparsers)
     args = parser.parse_args(argv)
     if args.command == "baostock-download":
         run_baostock_download(args)
+        return
+    if args.command == "baostock-dividend-download":
+        run_baostock_dividend_download(args)
         return
     raise ValueError(f"Unsupported command: {args.command}")
 
@@ -53,6 +58,20 @@ def _add_baostock_download_parser(subparsers: argparse._SubParsersAction) -> Non
     parser.add_argument(
         "--pool-date",
         help="Date used to resolve a stock pool. Defaults to --end-date.",
+    )
+
+
+def _add_baostock_dividend_download_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "baostock-dividend-download",
+        help="Download BaoStock dividends by operating year.",
+    )
+    parser.add_argument("--start-year", type=int, required=True)
+    parser.add_argument("--end-year", type=int)
+    parser.add_argument("--pool", choices=["all", "sz50", "hs300", "zz500"], required=True)
+    parser.add_argument(
+        "--pool-date",
+        help="Date used to resolve a stock pool. Defaults to today.",
     )
 
 
@@ -107,6 +126,43 @@ def run_baostock_download(args: argparse.Namespace) -> None:
     status_counts = result["status"].value_counts().to_dict()
     print(f"Selected codes: {len(codes)}")
     print(f"Download status: {status_counts}")
+
+
+def run_baostock_dividend_download(args: argparse.Namespace) -> None:
+    cfg = load_baostock_download_config(DEFAULT_BAOSTOCK_CONFIG)
+    end_year = args.end_year or date.today().year
+    control = StdinDownloadControl()
+    progress_printed = False
+
+    def show_progress(completed: int, total: int) -> None:
+        nonlocal progress_printed
+        if progress_printed:
+            sys.stdout.write("\r\033[1A\033[2K")
+        progress_printed = True
+        sys.stdout.write(f"Downloaded {completed}/{total}\n> ")
+        sys.stdout.flush()
+
+    print("Keyboard control: 'p' pause, 'c' continue, 'q' save and quit.")
+    with BaostockClient() as client:
+        codes = resolve_baostock_codes(args.pool, args.pool_date or date.today().isoformat(), client)
+        if not codes:
+            raise ValueError("No BaoStock codes were selected")
+
+        print(f"Stock pool: {args.pool} ({len(codes)} securities)")
+        result = update_baostock_dividends(
+            codes,
+            args.start_year,
+            end_year,
+            raw_root=cfg["raw_root"],
+            max_requests_per_day=cfg["safe_max_requests_per_day"],
+            client=client,
+            control=control,
+            progress=show_progress,
+        )
+    if progress_printed:
+        print()
+    print(f"Selected codes: {len(codes)}")
+    print(f"Download status: {result['status'].value_counts().to_dict()}")
 
 
 def load_baostock_download_config(path: str | Path) -> dict:

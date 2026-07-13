@@ -1,5 +1,7 @@
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+import sys
 
 import pandas as pd
 import pytest
@@ -7,10 +9,13 @@ import pytest
 from pyquant.baostock_source import (
     BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY,
+    BAOSTOCK_SOCKET_TIMEOUT_SECONDS,
+    BaostockClient,
     append_request_log,
     atomic_write_parquet,
     build_baostock_slices,
     clean_baostock_data,
+    clean_baostock_dividends,
     daily_target_path,
     init_baostock_storage,
     minute_5_target_path,
@@ -18,6 +23,7 @@ from pyquant.baostock_source import (
     resolve_baostock_codes,
     run_baostock_slices,
     update_baostock_dataset,
+    update_baostock_dividends,
     validate_request_limit,
 )
 
@@ -36,6 +42,21 @@ class FakeResult:
 
     def get_row_data(self):
         return self.rows[self.index]
+
+
+def test_baostock_client_sets_socket_timeout(monkeypatch):
+    socket = SimpleNamespace(timeout=None, settimeout=lambda value: setattr(socket, "timeout", value))
+    bs = SimpleNamespace(
+        login=lambda: SimpleNamespace(error_code="0", error_msg=""),
+        logout=lambda: None,
+        common=SimpleNamespace(context=SimpleNamespace(default_socket=socket)),
+    )
+    monkeypatch.setitem(sys.modules, "baostock", bs)
+
+    with BaostockClient():
+        pass
+
+    assert socket.timeout == BAOSTOCK_SOCKET_TIMEOUT_SECONDS
 
 
 class FakeClient:
@@ -68,19 +89,45 @@ class FakeClient:
     def query_hs300_stocks(self, trade_date):
         return FakeResult(["code"], [["sh.600000"], ["sz.000001"]])
 
-    def query_all_stock(self, trade_date):
-        return FakeResult(["code"], [["sh.600000"], ["sh.600000"], ["sz.000001"]])
+    def query_stock_basic(self):
+        return FakeResult(
+            ["code", "type"],
+            [["sh.600000", "1"], ["sz.000001", "1"], ["sh.510050", "2"]],
+        )
 
     def query_trade_dates(self, start_date, end_date):
         return FakeResult(["calendar_date", "is_trading_day"], [[end_date, "1"]])
 
+    def query_dividend_data(self, code, year, yearType):
+        self.calls.append((code, year, yearType))
+        rows = [] if year == "2023" else [[code, "2022-05-01", "2022-05-10", "2022-05-11", "2022-05-20", "0.25"]]
+        return FakeResult(
+            [
+                "code",
+                "dividPlanAnnounceDate",
+                "dividRegistDate",
+                "dividOperateDate",
+                "dividPayDate",
+                "dividCashPsAfterTax",
+            ],
+            rows,
+        )
+
 
 class StopAfterFirstRequest:
+    quit_requested = True
+
+    def __init__(self):
+        self.messages = []
+
     def before_request(self):
         return True
 
     def after_request(self):
         return False
+
+    def output(self, message):
+        self.messages.append(message)
 
 
 def test_init_baostock_storage_has_no_task_state(tmp_path):
@@ -105,10 +152,29 @@ def test_build_slices_uses_existing_daily_data(tmp_path):
     )
 
     assert slices[["code", "start_date"]].values.tolist() == [
+        ["sh.600000", "2024-01-02"],
         ["sh.600000", "2024-01-04"],
         ["sz.000001", "2024-01-02"],
     ]
     assert Path(slices.loc[0, "target_path"]).parent.name == "none"
+
+
+def test_build_slices_adds_only_the_earlier_missing_range(tmp_path):
+    target = daily_target_path("sh.600000", "stock", tmp_path / "baostock")
+    atomic_write_parquet(
+        pd.DataFrame({"date": [date(2014, 1, 2), date(2014, 1, 3)]}), target
+    )
+
+    slices = build_baostock_slices(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2013-01-01",
+        "2014-01-03",
+        tmp_path / "baostock",
+    )
+
+    assert slices[["start_date", "end_date"]].values.tolist() == [["2013-01-01", "2014-01-02"]]
 
 
 def test_minute_slices_are_partitioned_by_year(tmp_path):
@@ -209,6 +275,97 @@ def test_clean_baostock_data_removes_source_fields_and_casts_types():
     assert len(out) == 1
     assert isinstance(out.loc[0, "date"], date)
     assert str(out["isST"].dtype) == "boolean"
+
+
+def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
+    out = clean_baostock_dividends(
+        pd.DataFrame(
+            {
+                "code": ["sh.600000"],
+                "dividPlanAnnounceDate": ["2022-05-01"],
+                "dividRegistDate": ["2022-05-10"],
+                "dividOperateDate": ["2022-05-11"],
+                "dividPayDate": ["2022-05-20"],
+                "dividCashPsAfterTax": ["0.25"],
+            }
+        ),
+        "sh.600000",
+        2022,
+    )
+
+    assert out.columns.tolist() == [
+        "code",
+        "year",
+        "announce_date",
+        "record_date",
+        "operate_date",
+        "payment_date",
+        "cash_dividend_after_tax",
+    ]
+    assert out.loc[0, "operate_date"] == date(2022, 5, 11)
+    assert out.loc[0, "cash_dividend_after_tax"] == pytest.approx(0.25)
+
+
+def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
+    client = FakeClient()
+    first = update_baostock_dividends(
+        ["sh.600000"], 2022, 2023, tmp_path / "baostock", 10, client=client
+    )
+    second = update_baostock_dividends(
+        ["sh.600000"], 2022, 2023, tmp_path / "baostock", 10, client=client
+    )
+
+    assert first["status"].tolist() == ["success", "success"]
+    assert second.empty
+    assert client.calls == [
+        ("sh.600000", "2022", "operate"),
+        ("sh.600000", "2023", "operate"),
+    ]
+    dividend_path = tmp_path / "baostock" / "dividend.parquet"
+    query_cache_path = tmp_path / "baostock" / "state" / "dividend_queries.parquet"
+    assert len(pd.read_parquet(dividend_path)) == 1
+    assert pd.read_parquet(query_cache_path).values.tolist() == [
+        ["sh.600000", 2022],
+        ["sh.600000", 2023],
+    ]
+
+
+def test_update_baostock_dividends_reports_completed_stock_count(tmp_path):
+    progress = []
+
+    update_baostock_dividends(
+        ["sh.600000", "sz.000001"],
+        2022,
+        2022,
+        tmp_path / "baostock",
+        10,
+        client=FakeClient(),
+        progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert progress == [(0, 2), (1, 2), (2, 2)]
+
+
+def test_update_baostock_dividends_saves_when_control_stops(tmp_path):
+    root = tmp_path / "baostock"
+    control = StopAfterFirstRequest()
+
+    result = update_baostock_dividends(
+        ["sh.600000"],
+        2022,
+        2023,
+        root,
+        10,
+        client=FakeClient(),
+        control=control,
+    )
+
+    assert result["year"].tolist() == [2022]
+    assert len(pd.read_parquet(root / "dividend.parquet")) == 1
+    assert pd.read_parquet(root / "state" / "dividend_queries.parquet").values.tolist() == [
+        ["sh.600000", 2022]
+    ]
+    assert control.messages == ["Downloaded data has been saved."]
 
 
 def test_request_log_counts_today(tmp_path):

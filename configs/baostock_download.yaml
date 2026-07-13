@@ -1,6 +1,67 @@
 baostock_limits:
   hard_max_requests_per_day: 50000
   safe_max_requests_per_day: 49000
+  socket_timeout_seconds: 30
 
 paths:
   raw_root: data/raw/baostock
+
+baostock:
+  fields:
+    daily:
+      - date
+      - code
+      - open
+      - high
+      - low
+      - close
+      - preclose
+      - volume
+      - amount
+      - adjustflag
+      - turn
+      - tradestatus
+      - pctChg
+      - peTTM
+      - pbMRQ
+      - psTTM
+      - pcfNcfTTM
+      - isST
+    minute_5:
+      - date
+      - time
+      - code
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+      - adjustflag
+  columns:
+    slice: [code, start_date, end_date, target_path]
+    result: [code, start_date, end_date, target_path, status, row_count, error]
+    dividend: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+    dividend_query: [code, year]
+    dividend_result: [code, year, status, row_count, error]
+    request_log: [date, time, endpoint, code, frequency, start_date, end_date, status, rows, error_code, error_msg]
+  stock_pool_queries:
+    sz50: query_sz50_stocks
+    hs300: query_hs300_stocks
+    zz500: query_zz500_stocks
+  adjustment_flags:
+    forward: "2"
+    backward: "1"
+    none: "3"
+  adjustment_dirs:
+    "1": backward
+    "2": forward
+    "3": none
+  float32_columns: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
+  dividend_numeric_columns: [cash_dividend_after_tax]
+  dividend_field_map:
+    dividPlanAnnounceDate: announce_date
+    dividRegistDate: record_date
+    dividOperateDate: operate_date
+    dividPayDate: payment_date
+    dividCashPsAfterTax: cash_dividend_after_tax

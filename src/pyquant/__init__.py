@@ -1,6 +1,7 @@
 """pyquant minimal public API."""
 
 from pyquant.backtest import run_backtest
+from pyquant.baostock_source import update_baostock_dividends
 from pyquant.data import (
     load_price,
     standardize_price,
@@ -22,4 +23,5 @@ __all__ = [
     "standardize_price",
     "transform_factor",
     "update_baostock_dataset",
+    "update_baostock_dividends",
 ]

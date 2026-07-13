@@ -17,76 +17,28 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+from pyquant.io import load_config
 
-DAILY_FIELDS = [
-    "date",
-    "code",
-    "open",
-    "high",
-    "low",
-    "close",
-    "preclose",
-    "volume",
-    "amount",
-    "adjustflag",
-    "turn",
-    "tradestatus",
-    "pctChg",
-    "peTTM",
-    "pbMRQ",
-    "psTTM",
-    "pcfNcfTTM",
-    "isST",
-]
-MINUTE_5_FIELDS = [
-    "date",
-    "time",
-    "code",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "amount",
-    "adjustflag",
-]
-SLICE_COLUMNS = ["code", "start_date", "end_date", "target_path"]
-RESULT_COLUMNS = SLICE_COLUMNS + ["status", "row_count", "error"]
-REQUEST_LOG_COLUMNS = [
-    "date",
-    "time",
-    "endpoint",
-    "code",
-    "frequency",
-    "start_date",
-    "end_date",
-    "status",
-    "rows",
-    "error_code",
-    "error_msg",
-]
-BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = 50_000
-BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = 49_000
-BAOSTOCK_STOCK_POOL_QUERIES = {
-    "sz50": "query_sz50_stocks",
-    "hs300": "query_hs300_stocks",
-    "zz500": "query_zz500_stocks",
-}
-ADJUSTMENT_FLAGS = {"forward": "2", "backward": "1", "none": "3"}
-ADJUSTMENT_DIRS = {value: key for key, value in ADJUSTMENT_FLAGS.items()}
-FLOAT32_COLUMNS = {
-    "open",
-    "high",
-    "low",
-    "close",
-    "preclose",
-    "turn",
-    "pctChg",
-    "peTTM",
-    "pbMRQ",
-    "psTTM",
-    "pcfNcfTTM",
-}
+_config = load_config(Path(__file__).parents[2] / "configs/baostock_download.yaml")
+_baostock = _config["baostock"]
+
+DAILY_FIELDS = _baostock["fields"]["daily"]
+MINUTE_5_FIELDS = _baostock["fields"]["minute_5"]
+SLICE_COLUMNS = _baostock["columns"]["slice"]
+RESULT_COLUMNS = _baostock["columns"]["result"]
+DIVIDEND_COLUMNS = _baostock["columns"]["dividend"]
+DIVIDEND_QUERY_COLUMNS = _baostock["columns"]["dividend_query"]
+DIVIDEND_RESULT_COLUMNS = _baostock["columns"]["dividend_result"]
+REQUEST_LOG_COLUMNS = _baostock["columns"]["request_log"]
+BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["hard_max_requests_per_day"]
+BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["safe_max_requests_per_day"]
+BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _config["baostock_limits"]["socket_timeout_seconds"]
+BAOSTOCK_STOCK_POOL_QUERIES = _baostock["stock_pool_queries"]
+ADJUSTMENT_FLAGS = _baostock["adjustment_flags"]
+ADJUSTMENT_DIRS = _baostock["adjustment_dirs"]
+FLOAT32_COLUMNS = set(_baostock["float32_columns"])
+DIVIDEND_NUMERIC_COLUMNS = _baostock["dividend_numeric_columns"]
+DIVIDEND_FIELD_MAP = _baostock["dividend_field_map"]
 
 
 @dataclass(frozen=True)
@@ -134,6 +86,7 @@ class BaostockClient:
             raise RuntimeError(
                 f"BaoStock login failed: {result.error_code} {result.error_msg}"
             )
+        self.bs.common.context.default_socket.settimeout(BAOSTOCK_SOCKET_TIMEOUT_SECONDS)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -159,6 +112,7 @@ class StdinDownloadControl:
         self.sleep_seconds = sleep_seconds
         self.output = output
         self.paused = False
+        self.quit_requested = False
 
     def before_request(self) -> bool:
         return self._handle_command(block_when_paused=True)
@@ -175,7 +129,8 @@ class StdinDownloadControl:
             self.paused = True
             self.output(f"Paused. Press '{self.resume_key}' to resume or '{self.quit_key}' to quit.")
         if command == self.quit_key:
-            self.output("Quit requested. Downloaded data has been saved.")
+            self.quit_requested = True
+            self.output("Quit requested. Saving downloaded data.")
             return False
 
         while self.paused and block_when_paused:
@@ -185,7 +140,8 @@ class StdinDownloadControl:
                 self.output("Resumed.")
                 return True
             if command == self.quit_key:
-                self.output("Quit requested. Downloaded data has been saved.")
+                self.quit_requested = True
+                self.output("Quit requested. Saving downloaded data.")
                 return False
             time.sleep(self.sleep_seconds)
         return True
@@ -278,20 +234,49 @@ def clean_baostock_data(data: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns=["code", "tradestatus", "adjustflag"], errors="ignore")
 
 
-def next_start_date(
+def clean_baostock_dividends(
+    data: pd.DataFrame,
+    code: str,
+    year: int,
+) -> pd.DataFrame:
+    """Keep dividend fields needed for point-in-time yield calculations."""
+    out = data.rename(columns=DIVIDEND_FIELD_MAP).copy()
+    for column in DIVIDEND_COLUMNS:
+        if column not in out:
+            out[column] = pd.NA
+    out["code"] = out["code"].fillna(code).astype(str)
+    out["year"] = year
+    for column in ["announce_date", "record_date", "operate_date", "payment_date"]:
+        out[column] = pd.to_datetime(out[column], errors="coerce").dt.date
+    for column in DIVIDEND_NUMERIC_COLUMNS:
+        out[column] = pd.to_numeric(out[column], errors="coerce").astype("float32")
+    return out[DIVIDEND_COLUMNS]
+
+
+def missing_baostock_ranges(
     target_path: str | Path,
-    default_start_date: str,
+    start_date: str,
+    end_date: str,
     date_column: str = "date",
-) -> str | None:
-    """Return the next calendar date after an existing file's max date."""
+) -> list[tuple[str, str]]:
+    """Return missing ranges before and after the locally covered dates."""
     path = Path(target_path)
     if not path.exists():
-        return default_start_date
+        return [(start_date, end_date)]
     existing = pd.read_parquet(path, columns=[date_column])
     if existing.empty:
-        return default_start_date
+        return [(start_date, end_date)]
+    first_date = pd.to_datetime(existing[date_column]).min()
     last_date = pd.to_datetime(existing[date_column]).max()
-    return (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    requested_start = pd.Timestamp(start_date)
+    requested_end = pd.Timestamp(end_date)
+    ranges = []
+    if requested_start < first_date:
+        ranges.append((start_date, min(requested_end, first_date).strftime("%Y-%m-%d")))
+    next_date = last_date + pd.Timedelta(days=1)
+    if next_date <= requested_end:
+        ranges.append((max(requested_start, next_date).strftime("%Y-%m-%d"), end_date))
+    return ranges
 
 
 def atomic_write_parquet(
@@ -404,17 +389,19 @@ def build_baostock_slices(
     for code in codes:
         if dataset in {"stock", "index"} and frequency == "d":
             target = daily_target_path(code, dataset, raw_root, adjustment)
-            next_date = next_start_date(target, start_date)
-            if next_date and next_date <= end_date:
-                rows.append((code, next_date, end_date, str(target)))
+            rows.extend(
+                (code, first, last, str(target))
+                for first, last in missing_baostock_ranges(target, start_date, end_date)
+            )
         elif dataset == "stock" and frequency == "5":
             for year in range(pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1):
                 first = max(pd.Timestamp(start_date), pd.Timestamp(f"{year}-01-01")).strftime("%Y-%m-%d")
                 last = min(pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")).strftime("%Y-%m-%d")
                 target = minute_5_target_path(code, year, raw_root, adjustment)
-                next_date = next_start_date(target, first)
-                if next_date and next_date <= last:
-                    rows.append((code, next_date, last, str(target)))
+                rows.extend(
+                    (code, range_start, range_end, str(target))
+                    for range_start, range_end in missing_baostock_ranges(target, first, last)
+                )
         else:
             raise ValueError(f"Unsupported BaoStock dataset/frequency: {dataset}/{frequency}")
     return pd.DataFrame(rows, columns=SLICE_COLUMNS)
@@ -427,6 +414,126 @@ def merge_baostock_data(data: pd.DataFrame, target_path: str | Path) -> pd.DataF
     out = pd.concat([pd.read_parquet(path), data], ignore_index=True)
     keys = ["date"] + (["time"] if "time" in out else [])
     return out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
+
+
+def update_baostock_dividends(
+    codes: Iterable[str],
+    start_year: int,
+    end_year: int,
+    raw_root: str | Path = "data/raw/baostock",
+    max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
+    client: Any | None = None,
+    control: StdinDownloadControl | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> pd.DataFrame:
+    """Download BaoStock dividends by operating year, skipping queried code-years."""
+    codes = list(codes)
+    paths = init_baostock_storage(raw_root)
+    dividend_path = Path(raw_root) / "dividend.parquet"
+    query_cache_path = paths.state_dir / "dividend_queries.parquet"
+    dividends = pd.read_parquet(dividend_path) if dividend_path.exists() else None
+    query_cache = (
+        pd.read_parquet(query_cache_path)
+        if query_cache_path.exists()
+        else pd.DataFrame(columns=DIVIDEND_QUERY_COLUMNS)
+    )
+    queried = set(query_cache.itertuples(index=False, name=None))
+    effective_limit = validate_request_limit(max_requests_per_day)
+    context = None if client is not None else BaostockClient()
+    active_client = client if client is not None else context.__enter__()
+    results = []
+    pending_dividends = []
+    pending_queries = []
+    remaining = {
+        code: sum(
+            (code, year) not in queried
+            for year in range(start_year, end_year + 1)
+        )
+        for code in codes
+    }
+    completed = sum(count == 0 for count in remaining.values())
+    if progress is not None:
+        progress(completed, len(codes))
+    create_download_lock(raw_root)
+    try:
+        for code in codes:
+            for year in range(start_year, end_year + 1):
+                if (code, year) in queried:
+                    continue
+                if request_count_today(paths.request_log_path) >= effective_limit:
+                    return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
+                if control is not None and not control.before_request():
+                    return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
+                try:
+                    data = query_baostock_dividends(code, year, active_client)
+                    data = clean_baostock_dividends(data, code, year)
+                    if not data.empty:
+                        pending_dividends.append(data)
+                    pending_queries.append((code, year))
+                    queried.add((code, year))
+                    append_request_log(
+                        paths.request_log_path,
+                        "query_dividend_data",
+                        code,
+                        "dividend",
+                        str(year),
+                        str(year),
+                        "success",
+                        len(data),
+                    )
+                    results.append((code, year, "success", len(data), ""))
+                    remaining[code] -= 1
+                    if remaining[code] == 0:
+                        completed += 1
+                        if progress is not None:
+                            progress(completed, len(codes))
+                except Exception as exc:
+                    append_request_log(
+                        paths.request_log_path,
+                        "query_dividend_data",
+                        code,
+                        "dividend",
+                        str(year),
+                        str(year),
+                        "failed",
+                        0,
+                        exc.__class__.__name__,
+                        str(exc),
+                    )
+                    results.append((code, year, "failed", 0, str(exc)))
+                if control is not None and not control.after_request():
+                    return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
+            if pending_dividends:
+                new_data = pd.concat(pending_dividends, ignore_index=True)
+                dividends = new_data if dividends is None else pd.concat([dividends, new_data])
+                dividends = dividends.drop_duplicates().sort_values(["code", "year"]).reset_index(drop=True)
+                atomic_write_parquet(dividends, dividend_path, overwrite=True)
+                pending_dividends.clear()
+            if pending_queries:
+                query_cache = pd.concat(
+                    [query_cache, pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS)],
+                    ignore_index=True,
+                ).drop_duplicates()
+                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+                pending_queries.clear()
+        return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
+    finally:
+        if pending_dividends:
+            new_data = pd.concat(pending_dividends, ignore_index=True)
+            dividends = new_data if dividends is None else pd.concat([dividends, new_data])
+            dividends = dividends.drop_duplicates().sort_values(["code", "year"]).reset_index(drop=True)
+            atomic_write_parquet(dividends, dividend_path, overwrite=True)
+        if pending_queries:
+            query_cache = pd.concat(
+                [query_cache, pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS)],
+                ignore_index=True,
+            ).drop_duplicates()
+            atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+        if getattr(control, "quit_requested", False):
+            control.output("Downloaded data has been saved.")
+        remove_download_lock(raw_root)
+        if context is not None:
+            context.__exit__(None, None, None)
 
 
 def update_baostock_dataset(
@@ -563,11 +670,19 @@ def resolve_baostock_codes(
 ) -> list[str]:
     """Resolve a pool on its latest available trading day."""
     if pool == "all":
-        query = client.bs.query_all_stock
-    elif pool in BAOSTOCK_STOCK_POOL_QUERIES:
-        query = getattr(client.bs, BAOSTOCK_STOCK_POOL_QUERIES[pool])
-    else:
+        data = baostock_result_to_frame(client.bs.query_stock_basic())
+        if not {"code", "type"}.issubset(data.columns):
+            raise ValueError(f"BaoStock stock-basic result has unexpected columns: {list(data.columns)}")
+        return (
+            data.loc[data["type"].astype(str) == "1", "code"]
+            .dropna()
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+        )
+    if pool not in BAOSTOCK_STOCK_POOL_QUERIES:
         raise ValueError(f"Unsupported BaoStock stock pool: {pool}")
+    query = getattr(client.bs, BAOSTOCK_STOCK_POOL_QUERIES[pool])
 
     end = pd.Timestamp(trade_date)
     calendar = baostock_result_to_frame(
@@ -620,3 +735,10 @@ def query_baostock_history(
         )
 
     return baostock_result_to_frame(result)
+
+
+def query_baostock_dividends(code: str, year: int, client: Any) -> pd.DataFrame:
+    """Query BaoStock dividends by operating year."""
+    return baostock_result_to_frame(
+        client.bs.query_dividend_data(code, str(year), yearType="operate")
+    )
