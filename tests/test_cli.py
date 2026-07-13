@@ -101,7 +101,7 @@ def test_cli_index_download_uses_frequency_and_config(monkeypatch):
         pool_date=None,
     )
 
-    assert run_baostock_download(args) == 0
+    assert run_baostock_download(args) is None
     assert captured["dataset"] == "index"
     assert captured["frequency"] == "d"
     assert captured["adjustflag"] is None
@@ -131,7 +131,7 @@ def test_cli_uses_today_when_end_date_is_missing(monkeypatch):
         pool_date=None,
     )
 
-    assert run_baostock_download(args) == 0
+    assert run_baostock_download(args) is None
     assert captured["end_date"] == "2026-07-09"
 
 
@@ -170,7 +170,7 @@ def test_cli_all_pool_means_all_a(monkeypatch):
         pool_date=None,
     )
 
-    assert run_baostock_download(args) == 0
+    assert run_baostock_download(args) is None
     assert captured["dataset"] == "stock"
     assert captured["frequency"] == "d"
     assert captured["codes"] == ["sh.600000"]

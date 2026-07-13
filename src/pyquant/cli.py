@@ -20,13 +20,14 @@ from pyquant.io import load_config
 DEFAULT_BAOSTOCK_CONFIG = Path("configs/baostock_download.yaml")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="pyquant")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_baostock_download_parser(subparsers)
     args = parser.parse_args(argv)
     if args.command == "baostock-download":
-        return run_baostock_download(args)
+        run_baostock_download(args)
+        return
     raise ValueError(f"Unsupported command: {args.command}")
 
 
@@ -55,7 +56,7 @@ def _add_baostock_download_parser(subparsers: argparse._SubParsersAction) -> Non
     )
 
 
-def run_baostock_download(args: argparse.Namespace) -> int:
+def run_baostock_download(args: argparse.Namespace) -> None:
     cfg = load_baostock_download_config(DEFAULT_BAOSTOCK_CONFIG)
     raw_root = cfg["raw_root"]
     max_requests_per_day = cfg["safe_max_requests_per_day"]
@@ -106,7 +107,6 @@ def run_baostock_download(args: argparse.Namespace) -> int:
     status_counts = result["status"].value_counts().to_dict()
     print(f"Selected codes: {len(codes)}")
     print(f"Download status: {status_counts}")
-    return 0
 
 
 def today_text() -> str:
@@ -138,4 +138,4 @@ def load_baostock_download_config(path: str | Path) -> dict:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
