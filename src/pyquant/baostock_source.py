@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -190,7 +190,7 @@ class StdinDownloadControl:
             time.sleep(self.sleep_seconds)
         return True
 
-    def _read_command(self, block: bool) -> Optional[str]:
+    def _read_command(self, block: bool) -> str | None:
         if block:
             line = sys.stdin.readline()
             return line.strip()[:1] if line else None
@@ -286,7 +286,7 @@ def next_start_date(
     target_path: str | Path,
     default_start_date: str,
     date_column: str = "date",
-) -> Optional[str]:
+) -> str | None:
     """Return the next calendar date after an existing file's max date."""
     path = Path(target_path)
     if not path.exists():
@@ -442,7 +442,7 @@ def update_baostock_dataset(
     raw_root: str | Path = "data/raw/baostock",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     adjustflag: str | None = None,
-    client: Optional[Any] = None,
+    client: Any | None = None,
     control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
@@ -475,7 +475,7 @@ def run_baostock_slices(
     frequency: str,
     adjustflag: str,
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
-    client: Optional[Any] = None,
+    client: Any | None = None,
     control: StdinDownloadControl | None = None,
     total_codes: int | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -561,7 +561,7 @@ def validate_request_limit(max_requests_per_day: int) -> int:
 
 
 def resolve_baostock_codes(
-    pool: Optional[str],
+    pool: str | None,
     trade_date: str,
     client: Any,
 ) -> list[str]:

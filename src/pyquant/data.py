@@ -1,7 +1,6 @@
 """Data loading and field standardization."""
 
 from pathlib import Path
-from typing import Optional, Union
 
 import pandas as pd
 
@@ -22,8 +21,8 @@ DEFAULT_PRICE_FIELD_MAP = {
 
 
 def load_price(
-    path: Union[str, Path],
-    field_map: Optional[dict[str, str]] = None,
+    path: str | Path,
+    field_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """读取标准行情数据并返回统一字段。"""
     path = Path(path)
@@ -38,7 +37,7 @@ def load_price(
 
 def standardize_price(
     df: pd.DataFrame,
-    field_map: Optional[dict[str, str]] = None,
+    field_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """统一行情字段名、日期类型和股票代码格式。"""
     rename_map = DEFAULT_PRICE_FIELD_MAP | (field_map or {})

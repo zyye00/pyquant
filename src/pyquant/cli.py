@@ -6,7 +6,6 @@ import argparse
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
 from pyquant.baostock_source import (
     BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY,
@@ -21,7 +20,7 @@ from pyquant.io import load_config
 DEFAULT_BAOSTOCK_CONFIG = Path("configs/baostock_download.yaml")
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pyquant")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_baostock_download_parser(subparsers)
