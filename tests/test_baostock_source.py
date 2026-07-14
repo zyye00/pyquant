@@ -367,10 +367,10 @@ def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
 def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
     client = FakeClient()
     first = update_baostock_profit_quarterly(
-        ["sh.600000"], 2022, 2022, tmp_path / "baostock", 10, client=client
+        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "baostock", 10, client=client
     )
     second = update_baostock_profit_quarterly(
-        ["sh.600000"], 2022, 2022, tmp_path / "baostock", 10, client=client
+        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "baostock", 10, client=client
     )
 
     assert first["status"].tolist() == ["success"] * 4
@@ -389,6 +389,20 @@ def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
         ["sh.600000", 2022, 2],
         ["sh.600000", 2022, 3],
         ["sh.600000", 2022, 4],
+    ]
+
+
+def test_update_baostock_profit_infers_quarters_from_dates(tmp_path):
+    client = FakeClient()
+
+    update_baostock_profit_quarterly(
+        ["sh.600000"], "2022-02-01", "2022-07-01", tmp_path / "baostock", 10, client=client
+    )
+
+    assert client.calls == [
+        ("sh.600000", "2022", "1"),
+        ("sh.600000", "2022", "2"),
+        ("sh.600000", "2022", "3"),
     ]
 
 

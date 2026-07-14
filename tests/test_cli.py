@@ -216,8 +216,8 @@ def test_cli_profit_download_uses_pool_and_config(monkeypatch):
 
     def fake_update(*args, **kwargs):
         captured["codes"] = args[0]
-        captured["start_year"] = args[1]
-        captured["end_year"] = args[2]
+        captured["start_date"] = args[1]
+        captured["end_date"] = args[2]
         captured.update(kwargs)
         return _fake_result()
 
@@ -225,16 +225,16 @@ def test_cli_profit_download_uses_pool_and_config(monkeypatch):
     monkeypatch.setattr("pyquant.cli.BaostockClient", FakeClientContext)
     monkeypatch.setattr("pyquant.cli.update_baostock_profit_quarterly", fake_update)
     args = argparse.Namespace(
-        start_year=2022,
-        end_year=2023,
+        start_date="2022-01-01",
+        end_date="2023-12-31",
         pool="all",
         pool_date="2024-01-03",
     )
 
     assert run_baostock_profit_download(args) is None
     assert captured["codes"] == ["sh.600000"]
-    assert captured["start_year"] == 2022
-    assert captured["end_year"] == 2023
+    assert captured["start_date"] == "2022-01-01"
+    assert captured["end_date"] == "2023-12-31"
     assert captured["raw_root"] == "data/raw/baostock"
     assert captured["max_requests_per_day"] == 49_000
     assert FakeClientContext.entered == 1

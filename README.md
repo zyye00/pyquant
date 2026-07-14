@@ -92,10 +92,10 @@ pyquant baostock-download \
 ```bash
 pyquant baostock-profit-download \
   --pool all \
-  --start-year 2013
+  --start-date 2013-01-01
 ```
 
-`--end-year` 可以省略，省略时使用当年。数据保存为
+`--end-date` 可以省略，省略时使用当天。下载器会查询起止日期覆盖到的所有季度。数据保存为
 `data/raw/baostock/stock_profit_quarterly.parquet`，字段为 `code`、`year`、`quarter`、
 `publish_date`、`report_date`、`total_shares`。已查询的股票、年份和季度组合（包括空结果）
 记录在 `data/raw/baostock/state/stock_profit_quarterly_queries.parquet`，重新运行时会跳过。

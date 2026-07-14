@@ -85,8 +85,8 @@ def _add_baostock_profit_download_parser(subparsers: argparse._SubParsersAction)
         "baostock-profit-download",
         help="Download BaoStock quarterly total shares.",
     )
-    parser.add_argument("--start-year", type=int, required=True)
-    parser.add_argument("--end-year", type=int)
+    parser.add_argument("--start-date", required=True)
+    parser.add_argument("--end-date")
     parser.add_argument("--pool", choices=["all", "sz50", "hs300", "zz500"], required=True)
     parser.add_argument(
         "--pool-date",
@@ -186,7 +186,7 @@ def run_baostock_dividend_download(args: argparse.Namespace) -> None:
 
 def run_baostock_profit_download(args: argparse.Namespace) -> None:
     cfg = load_baostock_download_config(DEFAULT_BAOSTOCK_CONFIG)
-    end_year = args.end_year or date.today().year
+    end_date = args.end_date or date.today().isoformat()
     control = StdinDownloadControl()
     progress_printed = False
 
@@ -207,8 +207,8 @@ def run_baostock_profit_download(args: argparse.Namespace) -> None:
         print(f"Stock pool: {args.pool} ({len(codes)} securities)")
         result = update_baostock_profit_quarterly(
             codes,
-            args.start_year,
-            end_year,
+            args.start_date,
+            end_date,
             raw_root=cfg["raw_root"],
             max_requests_per_day=cfg["safe_max_requests_per_day"],
             client=client,

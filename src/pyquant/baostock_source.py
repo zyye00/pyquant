@@ -564,15 +564,17 @@ def update_baostock_dividends(
 
 def update_baostock_profit_quarterly(
     codes: Iterable[str],
-    start_year: int,
-    end_year: int,
+    start_date: str,
+    end_date: str,
     raw_root: str | Path = "data/raw/baostock",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
     control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
-    """Download BaoStock quarterly total shares, skipping queried code-periods."""
+    """Download total shares for every quarter overlapping a date range."""
+    if pd.Timestamp(start_date) > pd.Timestamp(end_date):
+        raise ValueError("start_date must not be later than end_date")
     codes = list(codes)
     paths = init_baostock_storage(raw_root)
     profit_path = Path(raw_root) / "stock_profit_quarterly.parquet"
@@ -590,7 +592,10 @@ def update_baostock_profit_quarterly(
     results = []
     pending_profits = []
     pending_queries = []
-    periods = [(year, quarter) for year in range(start_year, end_year + 1) for quarter in range(1, 5)]
+    periods = [
+        (period.year, period.quarter)
+        for period in pd.period_range(start_date, end_date, freq="Q")
+    ]
     remaining = {code: sum((code, *period) not in queried for period in periods) for code in codes}
     completed = sum(count == 0 for count in remaining.values())
     if progress is not None:
