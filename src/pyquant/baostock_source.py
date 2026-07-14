@@ -29,6 +29,9 @@ RESULT_COLUMNS = _baostock["columns"]["result"]
 DIVIDEND_COLUMNS = _baostock["columns"]["dividend"]
 DIVIDEND_QUERY_COLUMNS = _baostock["columns"]["dividend_query"]
 DIVIDEND_RESULT_COLUMNS = _baostock["columns"]["dividend_result"]
+PROFIT_COLUMNS = _baostock["columns"]["profit"]
+PROFIT_QUERY_COLUMNS = _baostock["columns"]["profit_query"]
+PROFIT_RESULT_COLUMNS = _baostock["columns"]["profit_result"]
 REQUEST_LOG_COLUMNS = _baostock["columns"]["request_log"]
 BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["hard_max_requests_per_day"]
 BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["safe_max_requests_per_day"]
@@ -39,6 +42,8 @@ ADJUSTMENT_DIRS = _baostock["adjustment_dirs"]
 FLOAT32_COLUMNS = set(_baostock["float32_columns"])
 DIVIDEND_NUMERIC_COLUMNS = _baostock["dividend_numeric_columns"]
 DIVIDEND_FIELD_MAP = _baostock["dividend_field_map"]
+PROFIT_NUMERIC_COLUMNS = _baostock["profit_numeric_columns"]
+PROFIT_FIELD_MAP = _baostock["profit_field_map"]
 
 
 @dataclass(frozen=True)
@@ -251,6 +256,27 @@ def clean_baostock_dividends(
     for column in DIVIDEND_NUMERIC_COLUMNS:
         out[column] = pd.to_numeric(out[column], errors="coerce").astype("float32")
     return out[DIVIDEND_COLUMNS]
+
+
+def clean_baostock_profit(
+    data: pd.DataFrame,
+    code: str,
+    year: int,
+    quarter: int,
+) -> pd.DataFrame:
+    """Keep quarterly publication dates and total shares."""
+    out = data.rename(columns=PROFIT_FIELD_MAP).copy()
+    for column in PROFIT_COLUMNS:
+        if column not in out:
+            out[column] = pd.NA
+    out["code"] = out["code"].fillna(code).astype(str)
+    out["year"] = year
+    out["quarter"] = quarter
+    for column in ["publish_date", "report_date"]:
+        out[column] = pd.to_datetime(out[column], errors="coerce").dt.date
+    for column in PROFIT_NUMERIC_COLUMNS:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    return out[PROFIT_COLUMNS]
 
 
 def missing_baostock_ranges(
@@ -536,6 +562,127 @@ def update_baostock_dividends(
             context.__exit__(None, None, None)
 
 
+def update_baostock_profit_quarterly(
+    codes: Iterable[str],
+    start_year: int,
+    end_year: int,
+    raw_root: str | Path = "data/raw/baostock",
+    max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
+    client: Any | None = None,
+    control: StdinDownloadControl | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> pd.DataFrame:
+    """Download BaoStock quarterly total shares, skipping queried code-periods."""
+    codes = list(codes)
+    paths = init_baostock_storage(raw_root)
+    profit_path = Path(raw_root) / "stock_profit_quarterly.parquet"
+    query_cache_path = paths.state_dir / "stock_profit_quarterly_queries.parquet"
+    profits = pd.read_parquet(profit_path) if profit_path.exists() else None
+    query_cache = (
+        pd.read_parquet(query_cache_path)
+        if query_cache_path.exists()
+        else pd.DataFrame(columns=PROFIT_QUERY_COLUMNS)
+    )
+    queried = set(query_cache.itertuples(index=False, name=None))
+    effective_limit = validate_request_limit(max_requests_per_day)
+    context = None if client is not None else BaostockClient()
+    active_client = client if client is not None else context.__enter__()
+    results = []
+    pending_profits = []
+    pending_queries = []
+    periods = [(year, quarter) for year in range(start_year, end_year + 1) for quarter in range(1, 5)]
+    remaining = {code: sum((code, *period) not in queried for period in periods) for code in codes}
+    completed = sum(count == 0 for count in remaining.values())
+    if progress is not None:
+        progress(completed, len(codes))
+    create_download_lock(raw_root)
+    try:
+        for code in codes:
+            for year, quarter in periods:
+                if (code, year, quarter) in queried:
+                    continue
+                if request_count_today(paths.request_log_path) >= effective_limit:
+                    return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
+                if control is not None and not control.before_request():
+                    return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
+                try:
+                    data = clean_baostock_profit(
+                        query_baostock_profit(code, year, quarter, active_client),
+                        code,
+                        year,
+                        quarter,
+                    )
+                    if not data.empty:
+                        pending_profits.append(data)
+                    pending_queries.append((code, year, quarter))
+                    queried.add((code, year, quarter))
+                    append_request_log(
+                        paths.request_log_path,
+                        "query_profit_data",
+                        code,
+                        "profit_quarterly",
+                        str(year),
+                        str(quarter),
+                        "success",
+                        len(data),
+                    )
+                    results.append((code, year, quarter, "success", len(data), ""))
+                    remaining[code] -= 1
+                    if remaining[code] == 0:
+                        completed += 1
+                        if progress is not None:
+                            progress(completed, len(codes))
+                except Exception as exc:
+                    append_request_log(
+                        paths.request_log_path,
+                        "query_profit_data",
+                        code,
+                        "profit_quarterly",
+                        str(year),
+                        str(quarter),
+                        "failed",
+                        0,
+                        exc.__class__.__name__,
+                        str(exc),
+                    )
+                    results.append((code, year, quarter, "failed", 0, str(exc)))
+                if control is not None and not control.after_request():
+                    return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
+            if pending_profits:
+                new_data = pd.concat(pending_profits, ignore_index=True)
+                profits = new_data if profits is None else pd.concat([profits, new_data])
+                profits = profits.drop_duplicates(["code", "year", "quarter"], keep="last")
+                profits = profits.sort_values(["code", "year", "quarter"]).reset_index(drop=True)
+                atomic_write_parquet(profits, profit_path, overwrite=True)
+                pending_profits.clear()
+            if pending_queries:
+                query_cache = pd.concat(
+                    [query_cache, pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS)],
+                    ignore_index=True,
+                ).drop_duplicates()
+                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+                pending_queries.clear()
+        return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
+    finally:
+        if pending_profits:
+            new_data = pd.concat(pending_profits, ignore_index=True)
+            profits = new_data if profits is None else pd.concat([profits, new_data])
+            profits = profits.drop_duplicates(["code", "year", "quarter"], keep="last")
+            profits = profits.sort_values(["code", "year", "quarter"]).reset_index(drop=True)
+            atomic_write_parquet(profits, profit_path, overwrite=True)
+        if pending_queries:
+            query_cache = pd.concat(
+                [query_cache, pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS)],
+                ignore_index=True,
+            ).drop_duplicates()
+            atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+        if getattr(control, "quit_requested", False):
+            control.output("Downloaded data has been saved.")
+        remove_download_lock(raw_root)
+        if context is not None:
+            context.__exit__(None, None, None)
+
+
 def update_baostock_dataset(
     dataset: str,
     frequency: str,
@@ -741,4 +888,16 @@ def query_baostock_dividends(code: str, year: int, client: Any) -> pd.DataFrame:
     """Query BaoStock dividends by operating year."""
     return baostock_result_to_frame(
         client.bs.query_dividend_data(code, str(year), yearType="operate")
+    )
+
+
+def query_baostock_profit(
+    code: str,
+    year: int,
+    quarter: int,
+    client: Any,
+) -> pd.DataFrame:
+    """Query BaoStock quarterly profit data."""
+    return baostock_result_to_frame(
+        client.bs.query_profit_data(code, str(year), str(quarter))
     )

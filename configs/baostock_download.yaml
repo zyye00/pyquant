@@ -44,6 +44,9 @@ baostock:
     dividend: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
     dividend_query: [code, year]
     dividend_result: [code, year, status, row_count, error]
+    profit: [code, year, quarter, publish_date, report_date, total_shares]
+    profit_query: [code, year, quarter]
+    profit_result: [code, year, quarter, status, row_count, error]
     request_log: [date, time, endpoint, code, frequency, start_date, end_date, status, rows, error_code, error_msg]
   stock_pool_queries:
     sz50: query_sz50_stocks
@@ -65,3 +68,8 @@ baostock:
     dividOperateDate: operate_date
     dividPayDate: payment_date
     dividCashPsAfterTax: cash_dividend_after_tax
+  profit_numeric_columns: [total_shares]
+  profit_field_map:
+    pubDate: publish_date
+    statDate: report_date
+    totalShare: total_shares

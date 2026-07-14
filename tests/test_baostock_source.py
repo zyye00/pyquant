@@ -16,6 +16,7 @@ from pyquant.baostock_source import (
     build_baostock_slices,
     clean_baostock_data,
     clean_baostock_dividends,
+    clean_baostock_profit,
     daily_target_path,
     init_baostock_storage,
     minute_5_target_path,
@@ -24,6 +25,7 @@ from pyquant.baostock_source import (
     run_baostock_slices,
     update_baostock_dataset,
     update_baostock_dividends,
+    update_baostock_profit_quarterly,
     validate_request_limit,
 )
 
@@ -112,6 +114,11 @@ class FakeClient:
             ],
             rows,
         )
+
+    def query_profit_data(self, code, year, quarter):
+        self.calls.append((code, year, quarter))
+        rows = [] if quarter == "2" else [[code, "2022-04-30", "2022-03-31", "123456789"]]
+        return FakeResult(["code", "pubDate", "statDate", "totalShare"], rows)
 
 
 class StopAfterFirstRequest:
@@ -306,6 +313,33 @@ def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
     assert out.loc[0, "cash_dividend_after_tax"] == pytest.approx(0.25)
 
 
+def test_clean_baostock_profit_keeps_total_shares_and_dates():
+    out = clean_baostock_profit(
+        pd.DataFrame(
+            {
+                "code": ["sh.600000"],
+                "pubDate": ["2022-04-30"],
+                "statDate": ["2022-03-31"],
+                "totalShare": ["123456789"],
+            }
+        ),
+        "sh.600000",
+        2022,
+        1,
+    )
+
+    assert out.columns.tolist() == [
+        "code",
+        "year",
+        "quarter",
+        "publish_date",
+        "report_date",
+        "total_shares",
+    ]
+    assert out.loc[0, "report_date"] == date(2022, 3, 31)
+    assert out.loc[0, "total_shares"] == pytest.approx(123456789)
+
+
 def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
     client = FakeClient()
     first = update_baostock_dividends(
@@ -327,6 +361,34 @@ def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
     assert pd.read_parquet(query_cache_path).values.tolist() == [
         ["sh.600000", 2022],
         ["sh.600000", 2023],
+    ]
+
+
+def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
+    client = FakeClient()
+    first = update_baostock_profit_quarterly(
+        ["sh.600000"], 2022, 2022, tmp_path / "baostock", 10, client=client
+    )
+    second = update_baostock_profit_quarterly(
+        ["sh.600000"], 2022, 2022, tmp_path / "baostock", 10, client=client
+    )
+
+    assert first["status"].tolist() == ["success"] * 4
+    assert second.empty
+    assert client.calls == [
+        ("sh.600000", "2022", "1"),
+        ("sh.600000", "2022", "2"),
+        ("sh.600000", "2022", "3"),
+        ("sh.600000", "2022", "4"),
+    ]
+    profit_path = tmp_path / "baostock" / "stock_profit_quarterly.parquet"
+    query_cache_path = tmp_path / "baostock" / "state" / "stock_profit_quarterly_queries.parquet"
+    assert len(pd.read_parquet(profit_path)) == 3
+    assert pd.read_parquet(query_cache_path).values.tolist() == [
+        ["sh.600000", 2022, 1],
+        ["sh.600000", 2022, 2],
+        ["sh.600000", 2022, 3],
+        ["sh.600000", 2022, 4],
     ]
 
 

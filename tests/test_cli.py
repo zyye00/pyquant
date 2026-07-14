@@ -7,6 +7,7 @@ from pyquant.cli import (
     load_baostock_download_config,
     run_baostock_dividend_download,
     run_baostock_download,
+    run_baostock_profit_download,
 )
 
 
@@ -202,6 +203,35 @@ def test_cli_dividend_download_uses_pool_and_config(monkeypatch):
     )
 
     assert run_baostock_dividend_download(args) is None
+    assert captured["codes"] == ["sh.600000"]
+    assert captured["start_year"] == 2022
+    assert captured["end_year"] == 2023
+    assert captured["raw_root"] == "data/raw/baostock"
+    assert captured["max_requests_per_day"] == 49_000
+    assert FakeClientContext.entered == 1
+
+
+def test_cli_profit_download_uses_pool_and_config(monkeypatch):
+    captured = {}
+
+    def fake_update(*args, **kwargs):
+        captured["codes"] = args[0]
+        captured["start_year"] = args[1]
+        captured["end_year"] = args[2]
+        captured.update(kwargs)
+        return _fake_result()
+
+    FakeClientContext.entered = 0
+    monkeypatch.setattr("pyquant.cli.BaostockClient", FakeClientContext)
+    monkeypatch.setattr("pyquant.cli.update_baostock_profit_quarterly", fake_update)
+    args = argparse.Namespace(
+        start_year=2022,
+        end_year=2023,
+        pool="all",
+        pool_date="2024-01-03",
+    )
+
+    assert run_baostock_profit_download(args) is None
     assert captured["codes"] == ["sh.600000"]
     assert captured["start_year"] == 2022
     assert captured["end_year"] == 2023

@@ -87,6 +87,19 @@ pyquant baostock-download \
   --end-date 2024-01-03
 ```
 
+下载季度总股本数据：
+
+```bash
+pyquant baostock-profit-download \
+  --pool all \
+  --start-year 2013
+```
+
+`--end-year` 可以省略，省略时使用当年。数据保存为
+`data/raw/baostock/stock_profit_quarterly.parquet`，字段为 `code`、`year`、`quarter`、
+`publish_date`、`report_date`、`total_shares`。已查询的股票、年份和季度组合（包括空结果）
+记录在 `data/raw/baostock/state/stock_profit_quarterly_queries.parquet`，重新运行时会跳过。
+
 `--end-date` 可以省略，省略时使用当天日期。BaoStock 不提供指数分钟线，因此
 `--index` 只能与 `--frequency d` 一起使用。
 
