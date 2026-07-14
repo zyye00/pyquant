@@ -8,36 +8,8 @@ paths:
 
 baostock:
   fields:
-    daily:
-      - date
-      - code
-      - open
-      - high
-      - low
-      - close
-      - preclose
-      - volume
-      - amount
-      - adjustflag
-      - turn
-      - tradestatus
-      - pctChg
-      - peTTM
-      - pbMRQ
-      - psTTM
-      - pcfNcfTTM
-      - isST
-    minute_5:
-      - date
-      - time
-      - code
-      - open
-      - high
-      - low
-      - close
-      - volume
-      - amount
-      - adjustflag
+    daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
+    minute_5: [date, time, code, open, high, low, close, volume, amount, adjustflag]
   columns:
     slice: [code, start_date, end_date, target_path]
     result: [code, start_date, end_date, target_path, status, row_count, error]
