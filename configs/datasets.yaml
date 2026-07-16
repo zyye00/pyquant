@@ -1,0 +1,139 @@
+version: 1
+
+state:
+  root: data/state
+  request_log: data/state/request_log.csv
+  lock: data/state/download.lock
+
+sources:
+  baostock:
+    hard_max_requests_per_day: 50000
+    safe_max_requests_per_day: 49000
+    socket_timeout_seconds: 30
+    stock_pool_queries:
+      sz50: query_sz50_stocks
+      hs300: query_hs300_stocks
+      zz500: query_zz500_stocks
+    adjustment_flags:
+      forward: "2"
+      backward: "1"
+      none: "3"
+    adjustment_dirs:
+      "1": backward
+      "2": forward
+      "3": none
+    fields:
+      daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
+      minute_5: [date, time, code, open, high, low, close, volume, amount, adjustflag]
+    float32_columns: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
+    request_log_columns: [date, time, endpoint, code, frequency, start_date, end_date, status, rows, error_code, error_msg]
+
+datasets:
+  stock_daily:
+    description: Daily stock prices and valuation fields.
+    source: baostock
+    storage:
+      kind: symbol_files
+      path: data/raw/stock_daily/{adjustment}/{symbol}.parquet
+      symbol_from: stem
+    columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+    required: [date, symbol, close, amount, pe_ttm]
+    primary_key: [date, symbol]
+    date_column: date
+    date_columns: [date]
+    numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+    field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
+    update: {kind: history, target: stock, frequency: d, pool: true, adjustment: true}
+
+  index_daily:
+    description: Daily index prices.
+    source: baostock
+    storage:
+      kind: symbol_files
+      path: data/raw/index_daily/{adjustment}/{symbol}.parquet
+      symbol_from: stem
+    columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+    required: [date, symbol, close]
+    primary_key: [date, symbol]
+    date_column: date
+    date_columns: [date]
+    numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+    field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
+    update: {kind: history, target: index, frequency: d, pool: false, adjustment: true}
+
+  stock_5m:
+    description: Five-minute stock prices partitioned by symbol and year.
+    source: baostock
+    storage:
+      kind: symbol_year_files
+      path: data/raw/stock_5m/{adjustment}/{symbol}/{year}.parquet
+      symbol_from: parent
+    columns: [date, time, symbol, open, high, low, close, volume, amount]
+    required: [date, time, symbol, close]
+    primary_key: [date, time, symbol]
+    date_column: date
+    date_columns: [date]
+    numeric_columns: [open, high, low, close, volume, amount]
+    field_map: {code: symbol}
+    update: {kind: history, target: stock, frequency: "5", pool: true, adjustment: true}
+
+  other_daily:
+    description: Existing daily files for securities outside the stock dataset.
+    source: baostock
+    storage:
+      kind: symbol_files
+      path: data/raw/other_daily/{adjustment}/{symbol}.parquet
+      symbol_from: stem
+    columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+    required: [date, symbol, close]
+    primary_key: [date, symbol]
+    date_column: date
+    date_columns: [date]
+    numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+    field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
+
+  dividend:
+    description: Announced cash dividends per share.
+    source: baostock
+    storage: {kind: table, path: data/raw/dividend/data.parquet}
+    columns: [symbol, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+    required: [symbol, year, announce_date, cash_dividend_after_tax]
+    primary_key: [symbol, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+    date_column: announce_date
+    date_columns: [announce_date, record_date, operate_date, payment_date]
+    numeric_columns: [year, cash_dividend_after_tax]
+    field_map: {code: symbol, dividPlanAnnounceDate: announce_date, dividRegistDate: record_date, dividOperateDate: operate_date, dividPayDate: payment_date, dividCashPsAfterTax: cash_dividend_after_tax}
+    update: {kind: dividend, pool: true, adjustment: false}
+
+  dividend_queries:
+    description: Completed dividend source queries, including empty results.
+    source: generated
+    storage: {kind: table, path: data/raw/dividend/queries.parquet}
+    columns: [symbol, year]
+    required: [symbol, year]
+    primary_key: [symbol, year]
+    numeric_columns: [year]
+    field_map: {code: symbol}
+
+  stock_profit_quarterly:
+    description: Quarterly publication dates and total shares.
+    source: baostock
+    storage: {kind: table, path: data/raw/stock_profit_quarterly/data.parquet}
+    columns: [symbol, year, quarter, publish_date, report_date, total_shares]
+    required: [symbol, year, quarter, publish_date, total_shares]
+    primary_key: [symbol, year, quarter]
+    date_column: publish_date
+    date_columns: [publish_date, report_date]
+    numeric_columns: [year, quarter, total_shares]
+    field_map: {code: symbol, pubDate: publish_date, statDate: report_date, totalShare: total_shares}
+    update: {kind: profit_quarterly, pool: true, adjustment: false}
+
+  stock_profit_quarterly_queries:
+    description: Completed quarterly profit source queries, including empty results.
+    source: generated
+    storage: {kind: table, path: data/raw/stock_profit_quarterly/queries.parquet}
+    columns: [symbol, year, quarter]
+    required: [symbol, year, quarter]
+    primary_key: [symbol, year, quarter]
+    numeric_columns: [year, quarter]
+    field_map: {code: symbol}

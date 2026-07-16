@@ -1,8 +1,4 @@
-"""BaoStock download helpers.
-
-This module keeps BaoStock-specific behavior at the data-source boundary.
-Tests should use a fake client and must not access the network.
-"""
+"""Private dataset-update implementation for the configured upstream source."""
 
 from __future__ import annotations
 
@@ -13,66 +9,116 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Collection, Iterable
 
 import pandas as pd
 
-from pyquant.io import load_config
+from pyquant.data import _get_dataset, _load_dataset_catalog
 
-_config = load_config(Path(__file__).parents[2] / "configs/baostock_download.yaml")
-_baostock = _config["baostock"]
+_config = _load_dataset_catalog()
+_baostock = _config["sources"]["baostock"]
+_datasets = _config["datasets"]
 
 DAILY_FIELDS = _baostock["fields"]["daily"]
 MINUTE_5_FIELDS = _baostock["fields"]["minute_5"]
-SLICE_COLUMNS = _baostock["columns"]["slice"]
-RESULT_COLUMNS = _baostock["columns"]["result"]
-DIVIDEND_COLUMNS = _baostock["columns"]["dividend"]
-DIVIDEND_QUERY_COLUMNS = _baostock["columns"]["dividend_query"]
-DIVIDEND_RESULT_COLUMNS = _baostock["columns"]["dividend_result"]
-PROFIT_COLUMNS = _baostock["columns"]["profit"]
-PROFIT_QUERY_COLUMNS = _baostock["columns"]["profit_query"]
-PROFIT_RESULT_COLUMNS = _baostock["columns"]["profit_result"]
-REQUEST_LOG_COLUMNS = _baostock["columns"]["request_log"]
-BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["hard_max_requests_per_day"]
-BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _config["baostock_limits"]["safe_max_requests_per_day"]
-BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _config["baostock_limits"]["socket_timeout_seconds"]
+SLICE_COLUMNS = ["code", "start_date", "end_date", "target_path"]
+RESULT_COLUMNS = [*SLICE_COLUMNS, "status", "row_count", "error"]
+DIVIDEND_COLUMNS = ["code", "year", "announce_date", "record_date", "operate_date", "payment_date", "cash_dividend_after_tax"]
+DIVIDEND_QUERY_COLUMNS = ["code", "year"]
+DIVIDEND_RESULT_COLUMNS = ["code", "year", "status", "row_count", "error"]
+PROFIT_COLUMNS = ["code", "year", "quarter", "publish_date", "report_date", "total_shares"]
+PROFIT_QUERY_COLUMNS = ["code", "year", "quarter"]
+PROFIT_RESULT_COLUMNS = ["code", "year", "quarter", "status", "row_count", "error"]
+REQUEST_LOG_COLUMNS = _baostock["request_log_columns"]
+BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _baostock["hard_max_requests_per_day"]
+BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _baostock["safe_max_requests_per_day"]
+BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _baostock["socket_timeout_seconds"]
 BAOSTOCK_STOCK_POOL_QUERIES = _baostock["stock_pool_queries"]
 ADJUSTMENT_FLAGS = _baostock["adjustment_flags"]
 ADJUSTMENT_DIRS = _baostock["adjustment_dirs"]
 FLOAT32_COLUMNS = set(_baostock["float32_columns"])
-DIVIDEND_NUMERIC_COLUMNS = _baostock["dividend_numeric_columns"]
-DIVIDEND_FIELD_MAP = _baostock["dividend_field_map"]
-PROFIT_NUMERIC_COLUMNS = _baostock["profit_numeric_columns"]
-PROFIT_FIELD_MAP = _baostock["profit_field_map"]
+DIVIDEND_NUMERIC_COLUMNS = ["cash_dividend_after_tax"]
+DIVIDEND_FIELD_MAP = {
+    key: value
+    for key, value in _datasets["dividend"]["field_map"].items()
+    if key != "code"
+}
+PROFIT_NUMERIC_COLUMNS = ["total_shares"]
+PROFIT_FIELD_MAP = {
+    key: value
+    for key, value in _datasets["stock_profit_quarterly"]["field_map"].items()
+    if key != "code"
+}
 
 
 @dataclass(frozen=True)
-class BaostockPaths:
-    raw_root: Path
+class DataPaths:
+    data_root: Path
+
+    @property
+    def raw_root(self) -> Path:
+        return _configured_path("data/raw", self.data_root)
 
     @property
     def daily_stock_dir(self) -> Path:
-        return self.raw_root / "daily" / "stock"
+        return _dataset_path(
+            "stock_daily", self.data_root, adjustment="none", symbol="_"
+        ).parents[1]
 
     @property
     def daily_index_dir(self) -> Path:
-        return self.raw_root / "daily" / "index"
+        return _dataset_path(
+            "index_daily", self.data_root, adjustment="none", symbol="_"
+        ).parents[1]
 
     @property
     def minute_5_stock_dir(self) -> Path:
-        return self.raw_root / "minute_5" / "stock"
+        return _dataset_path(
+            "stock_5m", self.data_root, adjustment="none", symbol="_", year=2000
+        ).parents[2]
 
     @property
     def state_dir(self) -> Path:
-        return self.raw_root / "state"
+        return _configured_path(_config["state"]["root"], self.data_root)
+
+    @property
+    def dividend_path(self) -> Path:
+        return _dataset_path("dividend", self.data_root)
+
+    @property
+    def dividend_queries_path(self) -> Path:
+        return _dataset_path("dividend_queries", self.data_root)
+
+    @property
+    def profit_path(self) -> Path:
+        return _dataset_path("stock_profit_quarterly", self.data_root)
+
+    @property
+    def profit_queries_path(self) -> Path:
+        return _dataset_path("stock_profit_quarterly_queries", self.data_root)
 
     @property
     def request_log_path(self) -> Path:
-        return self.state_dir / "request_log.csv"
+        return _configured_path(_config["state"]["request_log"], self.data_root)
 
     @property
     def lock_path(self) -> Path:
-        return self.state_dir / "download.lock"
+        return _configured_path(_config["state"]["lock"], self.data_root)
+
+
+def _configured_path(template: str, data_root: str | Path, **values: object) -> Path:
+    rendered = Path(template.format(**values))
+    try:
+        relative = rendered.relative_to("data")
+    except ValueError as exc:
+        raise ValueError(f"Catalog data path must be under data/: {template}") from exc
+    return Path(data_root) / relative
+
+
+def _dataset_path(name: str, data_root: str | Path, **values: object) -> Path:
+    return _configured_path(
+        _datasets[name]["storage"]["path"], data_root, **values
+    )
 
 
 class BaostockClient:
@@ -162,9 +208,9 @@ class StdinDownloadControl:
         return line.strip()[:1] if line else None
 
 
-def init_baostock_storage(raw_root: str | Path = "data/raw/baostock") -> BaostockPaths:
-    """Create the BaoStock raw-data directory skeleton."""
-    paths = BaostockPaths(Path(raw_root))
+def init_data_storage(data_root: str | Path = "data") -> DataPaths:
+    """Create the dataset-oriented raw-data directory skeleton."""
+    paths = DataPaths(Path(data_root))
     for path in [
         paths.daily_stock_dir,
         *(paths.daily_stock_dir / name for name in ADJUSTMENT_DIRS.values()),
@@ -181,25 +227,36 @@ def init_baostock_storage(raw_root: str | Path = "data/raw/baostock") -> Baostoc
 def daily_target_path(
     code: str,
     dataset: str,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     adjustflag: str | None = None,
 ) -> Path:
-    paths = BaostockPaths(Path(raw_root))
     if dataset == "stock":
-        return paths.daily_stock_dir / adjustment_dir(adjustflag) / f"{code}.parquet"
+        name = "stock_daily"
     if dataset == "index":
-        return paths.daily_index_dir / f"{code}.parquet"
-    raise ValueError(f"Unsupported daily dataset: {dataset}")
+        name = "index_daily"
+    if dataset not in {"stock", "index"}:
+        raise ValueError(f"Unsupported daily dataset: {dataset}")
+    return _dataset_path(
+        name,
+        data_root,
+        adjustment=adjustment_dir(adjustflag),
+        symbol=code,
+    )
 
 
 def minute_5_target_path(
     code: str,
     year: int,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     adjustflag: str | None = None,
 ) -> Path:
-    paths = BaostockPaths(Path(raw_root))
-    return paths.minute_5_stock_dir / adjustment_dir(adjustflag) / code / f"{year}.parquet"
+    return _dataset_path(
+        "stock_5m",
+        data_root,
+        adjustment=adjustment_dir(adjustflag),
+        symbol=code,
+        year=year,
+    )
 
 
 def adjustment_dir(adjustflag: str | None) -> str:
@@ -386,27 +443,27 @@ def append_request_log(
     row.to_csv(path, mode="a", header=header, index=False)
 
 
-def create_download_lock(raw_root: str | Path = "data/raw/baostock") -> Path:
-    paths = init_baostock_storage(raw_root)
+def create_download_lock(data_root: str | Path = "data") -> Path:
+    paths = init_data_storage(data_root)
     if paths.lock_path.exists():
         raise RuntimeError(f"BaoStock download lock exists: {paths.lock_path}")
     paths.lock_path.write_text(str(os.getpid()), encoding="utf-8")
     return paths.lock_path
 
 
-def remove_download_lock(raw_root: str | Path = "data/raw/baostock") -> None:
-    lock_path = BaostockPaths(Path(raw_root)).lock_path
+def remove_download_lock(data_root: str | Path = "data") -> None:
+    lock_path = DataPaths(Path(data_root)).lock_path
     if lock_path.exists():
         lock_path.unlink()
 
 
-def build_baostock_slices(
+def build_download_slices(
     dataset: str,
     frequency: str,
     codes: Iterable[str],
     start_date: str,
     end_date: str,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     adjustflag: str | None = None,
 ) -> pd.DataFrame:
     """Build only the date ranges not already covered by local files."""
@@ -414,7 +471,7 @@ def build_baostock_slices(
     rows = []
     for code in codes:
         if dataset in {"stock", "index"} and frequency == "d":
-            target = daily_target_path(code, dataset, raw_root, adjustment)
+            target = daily_target_path(code, dataset, data_root, adjustment)
             rows.extend(
                 (code, first, last, str(target))
                 for first, last in missing_baostock_ranges(target, start_date, end_date)
@@ -423,7 +480,7 @@ def build_baostock_slices(
             for year in range(pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1):
                 first = max(pd.Timestamp(start_date), pd.Timestamp(f"{year}-01-01")).strftime("%Y-%m-%d")
                 last = min(pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")).strftime("%Y-%m-%d")
-                target = minute_5_target_path(code, year, raw_root, adjustment)
+                target = minute_5_target_path(code, year, data_root, adjustment)
                 rows.extend(
                     (code, range_start, range_end, str(target))
                     for range_start, range_end in missing_baostock_ranges(target, first, last)
@@ -433,7 +490,7 @@ def build_baostock_slices(
     return pd.DataFrame(rows, columns=SLICE_COLUMNS)
 
 
-def merge_baostock_data(data: pd.DataFrame, target_path: str | Path) -> pd.DataFrame:
+def merge_history_data(data: pd.DataFrame, target_path: str | Path) -> pd.DataFrame:
     path = Path(target_path)
     if not path.exists():
         return data
@@ -442,21 +499,22 @@ def merge_baostock_data(data: pd.DataFrame, target_path: str | Path) -> pd.DataF
     return out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
 
 
-def update_baostock_dividends(
+def update_dividends(
     codes: Iterable[str],
     start_year: int,
     end_year: int,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
     control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
 ) -> pd.DataFrame:
     """Download BaoStock dividends by operating year, skipping queried code-years."""
     codes = list(codes)
-    paths = init_baostock_storage(raw_root)
-    dividend_path = Path(raw_root) / "dividend.parquet"
-    query_cache_path = paths.state_dir / "dividend_queries.parquet"
+    paths = init_data_storage(data_root)
+    dividend_path = paths.dividend_path
+    query_cache_path = paths.dividend_queries_path
     dividends = pd.read_parquet(dividend_path) if dividend_path.exists() else None
     query_cache = (
         pd.read_parquet(query_cache_path)
@@ -480,12 +538,14 @@ def update_baostock_dividends(
     completed = sum(count == 0 for count in remaining.values())
     if progress is not None:
         progress(completed, len(codes))
-    create_download_lock(raw_root)
+    create_download_lock(data_root)
     try:
         for code in codes:
             for year in range(start_year, end_year + 1):
                 if (code, year) in queried:
                     continue
+                if max_tasks is not None and len(results) >= max_tasks:
+                    return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
                 if request_count_today(paths.request_log_path) >= effective_limit:
                     return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
                 if control is not None and not control.before_request():
@@ -557,28 +617,29 @@ def update_baostock_dividends(
             atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
         if getattr(control, "quit_requested", False):
             control.output("Downloaded data has been saved.")
-        remove_download_lock(raw_root)
+        remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
 
 
-def update_baostock_profit_quarterly(
+def update_profit_quarterly(
     codes: Iterable[str],
     start_date: str,
     end_date: str,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
     control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
 ) -> pd.DataFrame:
     """Download total shares for every quarter overlapping a date range."""
     if pd.Timestamp(start_date) > pd.Timestamp(end_date):
         raise ValueError("start_date must not be later than end_date")
     codes = list(codes)
-    paths = init_baostock_storage(raw_root)
-    profit_path = Path(raw_root) / "stock_profit_quarterly.parquet"
-    query_cache_path = paths.state_dir / "stock_profit_quarterly_queries.parquet"
+    paths = init_data_storage(data_root)
+    profit_path = paths.profit_path
+    query_cache_path = paths.profit_queries_path
     profits = pd.read_parquet(profit_path) if profit_path.exists() else None
     query_cache = (
         pd.read_parquet(query_cache_path)
@@ -600,12 +661,14 @@ def update_baostock_profit_quarterly(
     completed = sum(count == 0 for count in remaining.values())
     if progress is not None:
         progress(completed, len(codes))
-    create_download_lock(raw_root)
+    create_download_lock(data_root)
     try:
         for code in codes:
             for year, quarter in periods:
                 if (code, year, quarter) in queried:
                     continue
+                if max_tasks is not None and len(results) >= max_tasks:
+                    return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
                 if request_count_today(paths.request_log_path) >= effective_limit:
                     return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
                 if control is not None and not control.before_request():
@@ -683,33 +746,36 @@ def update_baostock_profit_quarterly(
             atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
         if getattr(control, "quit_requested", False):
             control.output("Downloaded data has been saved.")
-        remove_download_lock(raw_root)
+        remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
 
 
-def update_baostock_dataset(
+def update_history_dataset(
     dataset: str,
     frequency: str,
     codes: Iterable[str],
     start_date: str,
     end_date: str,
-    raw_root: str | Path = "data/raw/baostock",
+    data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     adjustflag: str | None = None,
     client: Any | None = None,
     control: StdinDownloadControl | None = None,
     progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
 ) -> pd.DataFrame:
     """Download only data not already covered by local parquet files."""
     codes = list(codes)
-    paths = init_baostock_storage(raw_root)
-    slices = build_baostock_slices(
-        dataset, frequency, codes, start_date, end_date, raw_root, adjustflag
+    paths = init_data_storage(data_root)
+    slices = build_download_slices(
+        dataset, frequency, codes, start_date, end_date, data_root, adjustflag
     )
-    create_download_lock(raw_root)
+    if max_tasks is not None:
+        slices = slices.head(max_tasks)
+    create_download_lock(data_root)
     try:
-        return run_baostock_slices(
+        return run_download_slices(
             slices,
             paths,
             frequency,
@@ -721,12 +787,12 @@ def update_baostock_dataset(
             progress=progress,
         )
     finally:
-        remove_download_lock(raw_root)
+        remove_download_lock(data_root)
 
 
-def run_baostock_slices(
+def run_download_slices(
     slices: pd.DataFrame,
-    paths: BaostockPaths,
+    paths: DataPaths,
     frequency: str,
     adjustflag: str,
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
@@ -763,7 +829,7 @@ def run_baostock_slices(
                     adjustflag,
                     active_client,
                 )
-                data = merge_baostock_data(clean_baostock_data(data), item.target_path)
+                data = merge_history_data(clean_baostock_data(data), item.target_path)
                 atomic_write_parquet(data, item.target_path, overwrite=True)
                 append_request_log(
                     paths.request_log_path,
@@ -813,6 +879,84 @@ def validate_request_limit(max_requests_per_day: int) -> int:
             f"{BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY}: {max_requests_per_day}"
         )
     return min(max_requests_per_day, BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY)
+
+
+def update_dataset(
+    name: str,
+    *,
+    start: str,
+    end: str | None = None,
+    symbols: Collection[str] | None = None,
+    pool: str | None = None,
+    pool_date: str | None = None,
+    adjustment: str | None = None,
+    max_tasks: int | None = None,
+    _client: Any | None = None,
+    _control: StdinDownloadControl | None = None,
+    _progress: Callable[[int, int], None] | None = None,
+    _data_root: str | Path = "data",
+) -> pd.DataFrame:
+    """Update a named catalog dataset through its current source."""
+    catalog = _load_dataset_catalog()
+    dataset = _get_dataset(catalog, name)
+    update = dataset.get("update")
+    if update is None:
+        raise ValueError(f"Dataset {name!r} is read-only")
+    if dataset["source"] != "baostock":
+        raise ValueError(f"Dataset {name!r} has unsupported source {dataset['source']!r}")
+    end_date = end or date.today().isoformat()
+    if pd.Timestamp(start) > pd.Timestamp(end_date):
+        raise ValueError("start must not be after end")
+    if (symbols is None) == (pool is None):
+        raise ValueError("Provide exactly one of symbols or pool")
+    if pool is not None and not update["pool"]:
+        raise ValueError(f"Dataset {name!r} does not support pool selection")
+    if adjustment is not None and not update["adjustment"]:
+        raise ValueError(f"Dataset {name!r} does not support adjustment")
+    if max_tasks is not None and max_tasks <= 0:
+        raise ValueError("max_tasks must be positive")
+
+    context = None if _client is not None else BaostockClient()
+    client = _client if _client is not None else context.__enter__()
+    try:
+        codes = (
+            [str(symbol) for symbol in symbols]
+            if symbols is not None
+            else resolve_baostock_codes(pool, pool_date or end_date, client)
+        )
+        if not codes:
+            raise ValueError("No symbols were selected")
+        common = {
+            "data_root": _data_root,
+            "max_requests_per_day": BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
+            "client": client,
+            "control": _control,
+            "progress": _progress,
+            "max_tasks": max_tasks,
+        }
+        if update["kind"] == "history":
+            return update_history_dataset(
+                update["target"],
+                update["frequency"],
+                codes,
+                start,
+                end_date,
+                adjustflag=adjustment,
+                **common,
+            )
+        if update["kind"] == "dividend":
+            return update_dividends(
+                codes,
+                pd.Timestamp(start).year,
+                pd.Timestamp(end_date).year,
+                **common,
+            )
+        if update["kind"] == "profit_quarterly":
+            return update_profit_quarterly(codes, start, end_date, **common)
+        raise ValueError(f"Dataset {name!r} has unsupported update kind {update['kind']!r}")
+    finally:
+        if context is not None:
+            context.__exit__(None, None, None)
 
 
 def resolve_baostock_codes(

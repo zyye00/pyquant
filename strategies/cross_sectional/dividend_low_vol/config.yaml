@@ -2,14 +2,18 @@ strategy:
   name: dividend_low_vol
   type: cross_sectional
 
-data:
-  price_path: data/processed/price.parquet
-
 backtest:
   start: null
   end: null
   rebalance: monthly
   fee_rate: 0.0
+
+universe:
+  lookback_days: 240
+  market_cap_keep_ratio: 0.8
+  amount_keep_ratio: 0.8
+  dividend_years: 3
+  payout_exclude_ratio: 0.05
 
 selection:
   dividend_top_n: 150

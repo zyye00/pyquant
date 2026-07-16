@@ -6,26 +6,27 @@ import sys
 import pandas as pd
 import pytest
 
-from pyquant.baostock_source import (
+from pyquant._data_update import (
     BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY,
     BAOSTOCK_SOCKET_TIMEOUT_SECONDS,
     BaostockClient,
     append_request_log,
     atomic_write_parquet,
-    build_baostock_slices,
+    build_download_slices,
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
     daily_target_path,
-    init_baostock_storage,
+    init_data_storage,
     minute_5_target_path,
     request_count_today,
     resolve_baostock_codes,
-    run_baostock_slices,
-    update_baostock_dataset,
-    update_baostock_dividends,
-    update_baostock_profit_quarterly,
+    run_download_slices,
+    update_dividends,
+    update_dataset,
+    update_history_dataset,
+    update_profit_quarterly,
     validate_request_limit,
 )
 
@@ -137,8 +138,8 @@ class StopAfterFirstRequest:
         self.messages.append(message)
 
 
-def test_init_baostock_storage_has_no_task_state(tmp_path):
-    paths = init_baostock_storage(tmp_path / "baostock")
+def test_init_data_storage_has_no_task_state(tmp_path):
+    paths = init_data_storage(tmp_path / "data")
 
     assert paths.daily_stock_dir.exists()
     assert paths.request_log_path.exists()
@@ -146,16 +147,16 @@ def test_init_baostock_storage_has_no_task_state(tmp_path):
 
 
 def test_build_slices_uses_existing_daily_data(tmp_path):
-    target = daily_target_path("sh.600000", "stock", tmp_path / "baostock")
+    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
     atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
 
-    slices = build_baostock_slices(
+    slices = build_download_slices(
         "stock",
         "d",
         ["sh.600000", "sz.000001"],
         "2024-01-02",
         "2024-01-05",
-        tmp_path / "baostock",
+        tmp_path / "data",
     )
 
     assert slices[["code", "start_date"]].values.tolist() == [
@@ -167,59 +168,59 @@ def test_build_slices_uses_existing_daily_data(tmp_path):
 
 
 def test_build_slices_adds_only_the_earlier_missing_range(tmp_path):
-    target = daily_target_path("sh.600000", "stock", tmp_path / "baostock")
+    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
     atomic_write_parquet(
         pd.DataFrame({"date": [date(2014, 1, 2), date(2014, 1, 3)]}), target
     )
 
-    slices = build_baostock_slices(
+    slices = build_download_slices(
         "stock",
         "d",
         ["sh.600000"],
         "2013-01-01",
         "2014-01-03",
-        tmp_path / "baostock",
+        tmp_path / "data",
     )
 
     assert slices[["start_date", "end_date"]].values.tolist() == [["2013-01-01", "2014-01-02"]]
 
 
 def test_minute_slices_are_partitioned_by_year(tmp_path):
-    slices = build_baostock_slices(
+    slices = build_download_slices(
         "stock",
         "5",
         ["sh.600000"],
         "2023-12-29",
         "2024-01-03",
-        tmp_path / "baostock",
+        tmp_path / "data",
         "forward",
     )
 
     assert slices["target_path"].tolist() == [
-        str(minute_5_target_path("sh.600000", 2023, tmp_path / "baostock", "forward")),
-        str(minute_5_target_path("sh.600000", 2024, tmp_path / "baostock", "forward")),
+        str(minute_5_target_path("sh.600000", 2023, tmp_path / "data", "forward")),
+        str(minute_5_target_path("sh.600000", 2024, tmp_path / "data", "forward")),
     ]
 
 
 def test_update_merges_data_and_skips_covered_range(tmp_path):
     client = FakeClient()
-    first = update_baostock_dataset(
+    first = update_history_dataset(
         "stock",
         "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
-        tmp_path / "baostock",
+        tmp_path / "data",
         10,
         client=client,
     )
-    second = update_baostock_dataset(
+    second = update_history_dataset(
         "stock",
         "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
-        tmp_path / "baostock",
+        tmp_path / "data",
         10,
         client=client,
     )
@@ -232,13 +233,13 @@ def test_update_merges_data_and_skips_covered_range(tmp_path):
 def test_update_reports_completed_stock_count(tmp_path):
     progress = []
 
-    update_baostock_dataset(
+    update_history_dataset(
         "stock",
         "d",
         ["sh.600000", "sz.000001"],
         "2024-01-02",
         "2024-01-02",
-        tmp_path / "baostock",
+        tmp_path / "data",
         10,
         client=FakeClient(),
         progress=lambda completed, total: progress.append((completed, total)),
@@ -248,14 +249,14 @@ def test_update_reports_completed_stock_count(tmp_path):
 
 
 def test_run_slices_respects_request_limit_and_pause(tmp_path):
-    paths = init_baostock_storage(tmp_path / "baostock")
-    slices = build_baostock_slices(
-        "stock", "d", ["sh.600000", "sz.000001"], "2024-01-02", "2024-01-02", paths.raw_root
+    paths = init_data_storage(tmp_path / "data")
+    slices = build_download_slices(
+        "stock", "d", ["sh.600000", "sz.000001"], "2024-01-02", "2024-01-02", paths.data_root
     )
     append_request_log(paths.request_log_path, "endpoint", "sh.600519", "d", "2024-01-02", "2024-01-02", "success", 1)
 
-    limited = run_baostock_slices(slices, paths, "d", "3", 2, FakeClient())
-    paused = run_baostock_slices(slices, paths, "d", "3", 10, FakeClient(), StopAfterFirstRequest())
+    limited = run_download_slices(slices, paths, "d", "3", 2, FakeClient())
+    paused = run_download_slices(slices, paths, "d", "3", 10, FakeClient(), StopAfterFirstRequest())
 
     assert limited["status"].tolist() == ["success"]
     assert paused["status"].tolist() == ["success"]
@@ -340,13 +341,13 @@ def test_clean_baostock_profit_keeps_total_shares_and_dates():
     assert out.loc[0, "total_shares"] == pytest.approx(123456789)
 
 
-def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
+def test_update_dividends_skips_saved_and_empty_code_years(tmp_path):
     client = FakeClient()
-    first = update_baostock_dividends(
-        ["sh.600000"], 2022, 2023, tmp_path / "baostock", 10, client=client
+    first = update_dividends(
+        ["sh.600000"], 2022, 2023, tmp_path / "data", 10, client=client
     )
-    second = update_baostock_dividends(
-        ["sh.600000"], 2022, 2023, tmp_path / "baostock", 10, client=client
+    second = update_dividends(
+        ["sh.600000"], 2022, 2023, tmp_path / "data", 10, client=client
     )
 
     assert first["status"].tolist() == ["success", "success"]
@@ -355,8 +356,8 @@ def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
         ("sh.600000", "2022", "operate"),
         ("sh.600000", "2023", "operate"),
     ]
-    dividend_path = tmp_path / "baostock" / "dividend.parquet"
-    query_cache_path = tmp_path / "baostock" / "state" / "dividend_queries.parquet"
+    dividend_path = tmp_path / "data" / "raw" / "dividend" / "data.parquet"
+    query_cache_path = tmp_path / "data" / "raw" / "dividend" / "queries.parquet"
     assert len(pd.read_parquet(dividend_path)) == 1
     assert pd.read_parquet(query_cache_path).values.tolist() == [
         ["sh.600000", 2022],
@@ -364,13 +365,13 @@ def test_update_baostock_dividends_skips_saved_and_empty_code_years(tmp_path):
     ]
 
 
-def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
+def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
     client = FakeClient()
-    first = update_baostock_profit_quarterly(
-        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "baostock", 10, client=client
+    first = update_profit_quarterly(
+        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "data", 10, client=client
     )
-    second = update_baostock_profit_quarterly(
-        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "baostock", 10, client=client
+    second = update_profit_quarterly(
+        ["sh.600000"], "2022-01-01", "2022-12-31", tmp_path / "data", 10, client=client
     )
 
     assert first["status"].tolist() == ["success"] * 4
@@ -381,8 +382,8 @@ def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
         ("sh.600000", "2022", "3"),
         ("sh.600000", "2022", "4"),
     ]
-    profit_path = tmp_path / "baostock" / "stock_profit_quarterly.parquet"
-    query_cache_path = tmp_path / "baostock" / "state" / "stock_profit_quarterly_queries.parquet"
+    profit_path = tmp_path / "data" / "raw" / "stock_profit_quarterly" / "data.parquet"
+    query_cache_path = tmp_path / "data" / "raw" / "stock_profit_quarterly" / "queries.parquet"
     assert len(pd.read_parquet(profit_path)) == 3
     assert pd.read_parquet(query_cache_path).values.tolist() == [
         ["sh.600000", 2022, 1],
@@ -392,11 +393,11 @@ def test_update_baostock_profit_skips_saved_and_empty_code_quarters(tmp_path):
     ]
 
 
-def test_update_baostock_profit_infers_quarters_from_dates(tmp_path):
+def test_update_profit_infers_quarters_from_dates(tmp_path):
     client = FakeClient()
 
-    update_baostock_profit_quarterly(
-        ["sh.600000"], "2022-02-01", "2022-07-01", tmp_path / "baostock", 10, client=client
+    update_profit_quarterly(
+        ["sh.600000"], "2022-02-01", "2022-07-01", tmp_path / "data", 10, client=client
     )
 
     assert client.calls == [
@@ -406,14 +407,14 @@ def test_update_baostock_profit_infers_quarters_from_dates(tmp_path):
     ]
 
 
-def test_update_baostock_dividends_reports_completed_stock_count(tmp_path):
+def test_update_dividends_reports_completed_stock_count(tmp_path):
     progress = []
 
-    update_baostock_dividends(
+    update_dividends(
         ["sh.600000", "sz.000001"],
         2022,
         2022,
-        tmp_path / "baostock",
+        tmp_path / "data",
         10,
         client=FakeClient(),
         progress=lambda completed, total: progress.append((completed, total)),
@@ -422,11 +423,11 @@ def test_update_baostock_dividends_reports_completed_stock_count(tmp_path):
     assert progress == [(0, 2), (1, 2), (2, 2)]
 
 
-def test_update_baostock_dividends_saves_when_control_stops(tmp_path):
-    root = tmp_path / "baostock"
+def test_update_dividends_saves_when_control_stops(tmp_path):
+    root = tmp_path / "data"
     control = StopAfterFirstRequest()
 
-    result = update_baostock_dividends(
+    result = update_dividends(
         ["sh.600000"],
         2022,
         2023,
@@ -437,8 +438,8 @@ def test_update_baostock_dividends_saves_when_control_stops(tmp_path):
     )
 
     assert result["year"].tolist() == [2022]
-    assert len(pd.read_parquet(root / "dividend.parquet")) == 1
-    assert pd.read_parquet(root / "state" / "dividend_queries.parquet").values.tolist() == [
+    assert len(pd.read_parquet(root / "raw" / "dividend" / "data.parquet")) == 1
+    assert pd.read_parquet(root / "raw" / "dividend" / "queries.parquet").values.tolist() == [
         ["sh.600000", 2022]
     ]
     assert control.messages == ["Downloaded data has been saved."]
@@ -463,3 +464,45 @@ def test_resolve_hs300_and_all_a_codes():
 
     assert resolve_baostock_codes("hs300", "2024-01-03", client) == ["sh.600000", "sz.000001"]
     assert resolve_baostock_codes("all", "2024-01-03", client) == ["sh.600000", "sz.000001"]
+
+
+def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
+    client = FakeClient()
+
+    out = update_dataset(
+        "dividend",
+        start="2022-02-01",
+        end="2023-07-01",
+        symbols=["sh.600000"],
+        max_tasks=1,
+        _client=client,
+        _data_root=tmp_path / "data",
+    )
+
+    assert out[["year", "status"]].values.tolist() == [[2022, "success"]]
+    assert client.calls == [("sh.600000", "2022", "operate")]
+
+
+def test_update_dataset_validates_options_before_requests(tmp_path):
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match="does not support adjustment"):
+        update_dataset(
+            "dividend",
+            start="2022-01-01",
+            symbols=["sh.600000"],
+            adjustment="forward",
+            _client=client,
+            _data_root=tmp_path / "data",
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        update_dataset(
+            "stock_daily",
+            start="2024-01-01",
+            symbols=["sh.600000"],
+            pool="all",
+            _client=client,
+            _data_root=tmp_path / "data",
+        )
+
+    assert client.calls == []
