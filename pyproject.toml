@@ -22,6 +22,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+notebook = [
+    "jupyterlab",
+    "ipykernel",
+]
 backtest = ["vectorbt"]
 report = ["quantstats"]
 factor = ["alphalens-reloaded"]

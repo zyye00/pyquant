@@ -1,4 +1,4 @@
-"""Strategy-specific components for the dividend low-volatility strategy."""
+"""Original dividend low-volatility index components."""
 
 from math import floor
 
@@ -6,115 +6,264 @@ import numpy as np
 import pandas as pd
 
 
-UNIVERSE_OUTPUT_COLUMNS = [
+CONSTITUENT_COLUMNS = [
+    "as_of_date",
+    "price_date",
     "avg_market_cap_240d",
     "avg_amount_240d",
     "dividend_yield_ttm",
     "payout_ratio",
     "dividend_growth_slope",
-    "in_universe",
+    "avg_dividend_yield_3y",
+    "volatility_240d",
+    "dividend_yield_rank",
+    "volatility_rank",
+    "weight",
+]
+INDEX_COLUMNS = [
+    "price_return",
+    "total_return",
+    "dividend_cash",
+    "price_index",
+    "total_return_index",
 ]
 
 
-def build_dividend_universe(
+def select_dividend_low_vol_constituents(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
     shares: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
     config: dict,
 ) -> pd.DataFrame:
-    """Build the monthly dividend stock universe from announced dividends."""
-    settings, start, end = _validate_config(config)
+    """Select one point-in-time constituent snapshot and dividend-yield weights."""
+    settings = _validate_selection_config(config)
+    as_of = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
-    dividend_data = _prepare_dividends(dividends)
+    price_data = price_data[price_data["date"] <= as_of]
+    if price_data.empty:
+        raise ValueError(f"No price data is available on or before {as_of.date()}")
+    dividend_data = _prepare_selection_dividends(dividends)
     query_data = _prepare_dividend_queries(dividend_queries)
     share_data = _prepare_shares(shares)
-
-    missing_share_symbols = sorted(
-        set(price_data["symbol"]) - set(share_data["symbol"])
-    )
-    if missing_share_symbols:
-        raise ValueError(
-            "Total-share data missing for "
-            f"{len(missing_share_symbols)} price symbols; examples: "
-            f"{missing_share_symbols[:5]}"
-        )
 
     daily = _add_rolling_market_metrics(
         price_data,
         share_data,
-        settings["lookback_days"],
+        settings["market_lookback_days"],
     )
-    trading_dates = daily["date"].drop_duplicates().sort_values()
-    rebalance_dates = trading_dates.groupby(trading_dates.dt.to_period("M")).max()
-    if start is not None:
-        rebalance_dates = rebalance_dates[rebalance_dates >= start]
-    if end is not None:
-        rebalance_dates = rebalance_dates[rebalance_dates <= end]
+    snapshot = (
+        daily.sort_values(["symbol", "date"])
+        .groupby("symbol", sort=False)
+        .tail(1)
+        .dropna(subset=["avg_market_cap_240d", "avg_amount_240d"])
+    )
+    market_symbols = _top_symbols(
+        snapshot,
+        "avg_market_cap_240d",
+        settings["market_cap_keep_ratio"],
+    )
+    amount_symbols = _top_symbols(
+        snapshot,
+        "avg_amount_240d",
+        settings["amount_keep_ratio"],
+    )
+    eligible_symbols = sorted(market_symbols & amount_symbols)
+    if not eligible_symbols:
+        raise ValueError("No symbols passed the market-cap and liquidity filters")
 
-    completed_queries = set(query_data.itertuples(index=False, name=None))
-    results = []
-    for rebalance_date in rebalance_dates:
-        selected = _build_monthly_universe(
-            daily,
-            dividend_data,
-            completed_queries,
-            pd.Timestamp(rebalance_date),
-            settings,
+    required_years = range(
+        as_of.year - settings["dividend_years"],
+        as_of.year + 1,
+    )
+    _require_query_coverage(
+        query_data,
+        eligible_symbols,
+        required_years,
+        f"selection at {as_of.date()}",
+    )
+    metrics = _add_dividend_metrics(
+        snapshot[snapshot["symbol"].isin(eligible_symbols)].copy(),
+        dividend_data,
+        as_of,
+        settings["dividend_years"],
+    )
+    metrics = metrics[metrics["consecutive_dividends"]].copy()
+    high_payout_count = floor(len(metrics) * settings["payout_exclude_ratio"])
+    high_payout_symbols = set(
+        metrics.dropna(subset=["payout_ratio"])
+        .sort_values(["payout_ratio", "symbol"], ascending=[False, True])
+        .head(high_payout_count)["symbol"]
+    )
+    metrics = metrics[
+        metrics["payout_ratio"].ge(0)
+        & metrics["dividend_growth_slope"].ge(0)
+        & ~metrics["symbol"].isin(high_payout_symbols)
+    ].copy()
+
+    candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
+    metrics["avg_dividend_yield_3y"] = metrics["symbol"].map(
+        _average_ttm_dividend_yield(
+            candidate_price,
+            dividend_data[dividend_data["announce_date"] <= as_of],
+            settings["dividend_yield_lookback_days"],
         )
-        if not selected.empty:
-            results.append(selected)
-    if not results:
-        return _empty_universe()
+    )
+    metrics = metrics.dropna(subset=["avg_dividend_yield_3y"])
+    metrics = metrics.sort_values(
+        ["avg_dividend_yield_3y", "symbol"], ascending=[False, True]
+    ).head(settings["dividend_top_n"])
+    metrics["dividend_yield_rank"] = np.arange(1, len(metrics) + 1)
 
-    return (
-        pd.concat(results, ignore_index=True)
-        .set_index(["date", "symbol"])
-        .sort_index()[UNIVERSE_OUTPUT_COLUMNS]
+    candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
+    metrics["volatility_240d"] = metrics["symbol"].map(
+        _price_volatility(candidate_price, settings["volatility_lookback_days"])
+    )
+    metrics = metrics.dropna(subset=["volatility_240d"])
+    if len(metrics) < settings["final_n"]:
+        raise ValueError(
+            f"Only {len(metrics)} eligible symbols remain; "
+            f"at least {settings['final_n']} are required"
+        )
+    metrics = metrics.sort_values(
+        ["volatility_240d", "symbol"], ascending=[True, True]
+    ).head(settings["final_n"])
+    metrics["volatility_rank"] = np.arange(1, len(metrics) + 1)
+    weight_total = metrics["avg_dividend_yield_3y"].sum()
+    if not np.isfinite(weight_total) or weight_total <= 0:
+        raise ValueError("Selected dividend yields must sum to a positive value")
+    metrics["weight"] = metrics["avg_dividend_yield_3y"] / weight_total
+    metrics["as_of_date"] = as_of
+    metrics["price_date"] = metrics["date"]
+    return metrics.set_index("symbol")[CONSTITUENT_COLUMNS]
+
+
+def calculate_dividend_low_vol_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    constituents: pd.DataFrame,
+    effective_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    price_base_value: float = 1000.0,
+    total_return_base_value: float = 1000.0,
+) -> pd.DataFrame:
+    """Calculate one fixed-constituent price and total-return index segment."""
+    effective = pd.Timestamp(effective_date)
+    end = pd.Timestamp(end_date)
+    if effective > end:
+        raise ValueError("effective_date must not be after end_date")
+    if price_base_value <= 0 or total_return_base_value <= 0:
+        raise ValueError("Index base values must be positive")
+    members = _prepare_constituents(constituents)
+    price_data = _prepare_index_price(price)
+    query_data = _prepare_dividend_queries(dividend_queries)
+    symbols = members.index.tolist()
+    _require_query_coverage(
+        query_data,
+        symbols,
+        range(effective.year - 1, end.year + 1),
+        f"index period {effective.date()} to {end.date()}",
     )
 
+    member_price = price_data[price_data["symbol"].isin(symbols)]
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(effective, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    if effective not in calendar:
+        raise ValueError(f"effective_date is not present in the price calendar: {effective.date()}")
+    prices = (
+        member_price[member_price["date"].le(end)]
+        .pivot(index="date", columns="symbol", values="close")
+        .reindex(columns=symbols)
+        .reindex(
+            price_data.loc[price_data["date"].le(end), "date"]
+            .drop_duplicates()
+            .sort_values()
+        )
+        .ffill()
+        .reindex(calendar)
+    )
+    missing = prices.loc[effective][prices.loc[effective].isna()].index.tolist()
+    if missing:
+        raise ValueError(
+            "No price is available on or before effective_date for "
+            f"{len(missing)} constituents; examples: {missing[:5]}"
+        )
+    prices = prices.ffill()
+    normalized_shares = members["weight"] / prices.loc[effective]
+    portfolio_value = prices.mul(normalized_shares, axis="columns").sum(axis=1)
 
-def calc_factor(
-    price: pd.DataFrame,
-    universe: pd.DataFrame,
-    config: dict,
-) -> pd.Series:
-    """Calculate the strategy factor."""
-    raise NotImplementedError("dividend_low_vol factor logic is not implemented yet")
+    dividend_cash = _index_dividend_cash(
+        dividends,
+        normalized_shares,
+        calendar,
+        effective,
+        end,
+    )
+    price_return = portfolio_value.pct_change(fill_method=None).fillna(0.0)
+    total_return = (
+        (portfolio_value + dividend_cash)
+        .div(portfolio_value.shift(1))
+        .sub(1.0)
+        .fillna(0.0)
+    )
+    out = pd.DataFrame(
+        {
+            "price_return": price_return,
+            "total_return": total_return,
+            "dividend_cash": dividend_cash,
+            "price_index": price_base_value
+            * portfolio_value.div(portfolio_value.iloc[0]),
+            "total_return_index": total_return_base_value
+            * (1.0 + total_return).cumprod(),
+        },
+        index=calendar,
+    )
+    return out[INDEX_COLUMNS]
 
 
-def _validate_config(config: dict) -> tuple[dict, pd.Timestamp | None, pd.Timestamp | None]:
+def _validate_selection_config(config: dict) -> dict:
     try:
-        settings = config["universe"]
-        backtest = config["backtest"]
-        lookback_days = int(settings["lookback_days"])
-        dividend_years = int(settings["dividend_years"])
-        market_cap_keep_ratio = float(settings["market_cap_keep_ratio"])
-        amount_keep_ratio = float(settings["amount_keep_ratio"])
-        payout_exclude_ratio = float(settings["payout_exclude_ratio"])
+        universe = config["universe"]
+        selection = config["selection"]
+        settings = {
+            "market_lookback_days": int(universe["lookback_days"]),
+            "market_cap_keep_ratio": float(universe["market_cap_keep_ratio"]),
+            "amount_keep_ratio": float(universe["amount_keep_ratio"]),
+            "dividend_years": int(universe["dividend_years"]),
+            "payout_exclude_ratio": float(universe["payout_exclude_ratio"]),
+            "dividend_yield_lookback_days": int(
+                selection["dividend_yield_lookback_days"]
+            ),
+            "dividend_top_n": int(selection["dividend_top_n"]),
+            "volatility_lookback_days": int(selection["volatility_lookback_days"]),
+            "final_n": int(selection["final_n"]),
+        }
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Invalid dividend-universe configuration") from exc
-
-    if lookback_days <= 0 or dividend_years < 2:
+        raise ValueError("Invalid dividend-low-volatility selection configuration") from exc
+    if settings["market_lookback_days"] <= 0 or settings["dividend_years"] < 2:
         raise ValueError("lookback_days must be positive and dividend_years at least 2")
-    if not 0 < market_cap_keep_ratio <= 1 or not 0 < amount_keep_ratio <= 1:
-        raise ValueError("Universe keep ratios must be in (0, 1]")
-    if not 0 <= payout_exclude_ratio < 1:
+    for name in ["market_cap_keep_ratio", "amount_keep_ratio"]:
+        if not 0 < settings[name] <= 1:
+            raise ValueError("Universe keep ratios must be in (0, 1]")
+    if not 0 <= settings["payout_exclude_ratio"] < 1:
         raise ValueError("payout_exclude_ratio must be in [0, 1)")
-    if backtest.get("rebalance") != "monthly":
-        raise ValueError("Dividend universe requires monthly rebalancing")
-
-    start = pd.Timestamp(backtest["start"]) if backtest.get("start") else None
-    end = pd.Timestamp(backtest["end"]) if backtest.get("end") else None
-    if start is not None and end is not None and start > end:
-        raise ValueError("backtest.start must not be after backtest.end")
-    return {
-        "lookback_days": lookback_days,
-        "dividend_years": dividend_years,
-        "market_cap_keep_ratio": market_cap_keep_ratio,
-        "amount_keep_ratio": amount_keep_ratio,
-        "payout_exclude_ratio": payout_exclude_ratio,
-    }, start, end
+    for name in [
+        "dividend_yield_lookback_days",
+        "dividend_top_n",
+        "volatility_lookback_days",
+        "final_n",
+    ]:
+        if settings[name] <= 0:
+            raise ValueError(f"{name} must be positive")
+    if settings["dividend_top_n"] < settings["final_n"]:
+        raise ValueError("dividend_top_n must not be smaller than final_n")
+    return settings
 
 
 def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
@@ -129,10 +278,23 @@ def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("price contains duplicate (date, symbol) rows")
     for column in ["close", "amount", "pe_ttm"]:
         out[column] = pd.to_numeric(out[column], errors="coerce")
+    out = out[out["close"].gt(0) & out["amount"].ge(0)]
     return out.sort_values(["symbol", "date"]).reset_index(drop=True)
 
 
-def _prepare_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
+def _prepare_index_price(price: pd.DataFrame) -> pd.DataFrame:
+    required = {"date", "symbol", "close"}
+    _require_columns(price, required, "price")
+    out = price.loc[:, sorted(required)].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="raise")
+    out["symbol"] = out["symbol"].astype(str)
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    if out.duplicated(["date", "symbol"]).any():
+        raise ValueError("price contains duplicate (date, symbol) rows")
+    return out.dropna(subset=["close"]).sort_values(["date", "symbol"])
+
+
+def _prepare_selection_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "year", "announce_date", "cash_dividend_after_tax"}
     _require_columns(dividends, required, "dividends")
     out = dividends.loc[:, sorted(required)].copy()
@@ -170,6 +332,24 @@ def _prepare_shares(shares: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(["symbol", "publish_date"], keep="last")
 
 
+def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
+    out = constituents.copy()
+    if out.index.name != "symbol":
+        if "symbol" not in out:
+            raise ValueError("constituents must have a symbol index or column")
+        out = out.set_index("symbol")
+    if out.index.has_duplicates:
+        raise ValueError("constituents contain duplicate symbols")
+    _require_columns(out, {"weight"}, "constituents")
+    out.index = out.index.astype(str)
+    out["weight"] = pd.to_numeric(out["weight"], errors="coerce")
+    if out["weight"].isna().any() or not out["weight"].gt(0).all():
+        raise ValueError("constituent weights must be positive numbers")
+    if not np.isclose(out["weight"].sum(), 1.0):
+        raise ValueError("constituent weights must sum to 1")
+    return out
+
+
 def _add_rolling_market_metrics(
     price: pd.DataFrame,
     shares: pd.DataFrame,
@@ -197,104 +377,141 @@ def _add_rolling_market_metrics(
     return daily
 
 
-def _build_monthly_universe(
-    daily: pd.DataFrame,
+def _add_dividend_metrics(
+    metrics: pd.DataFrame,
     dividends: pd.DataFrame,
-    completed_queries: set[tuple[str, int]],
-    rebalance_date: pd.Timestamp,
-    settings: dict,
+    as_of: pd.Timestamp,
+    dividend_years: int,
 ) -> pd.DataFrame:
-    snapshot = daily.loc[
-        daily["date"].eq(rebalance_date),
-        [
-            "symbol",
-            "close",
-            "pe_ttm",
-            "avg_market_cap_240d",
-            "avg_amount_240d",
-        ],
-    ].dropna(subset=["avg_market_cap_240d", "avg_amount_240d"])
-    if snapshot.empty:
-        return pd.DataFrame()
-
-    market_symbols = _top_symbols(
-        snapshot,
-        "avg_market_cap_240d",
-        settings["market_cap_keep_ratio"],
-    )
-    amount_symbols = _top_symbols(
-        snapshot,
-        "avg_amount_240d",
-        settings["amount_keep_ratio"],
-    )
-    ranked_symbols = sorted(market_symbols & amount_symbols)
-    if not ranked_symbols:
-        return pd.DataFrame()
-
-    year = rebalance_date.year
-    required_queries = {
-        (symbol, query_year)
-        for symbol in ranked_symbols
-        for query_year in range(year - settings["dividend_years"], year + 1)
-    }
-    missing_queries = sorted(required_queries - completed_queries)
-    if missing_queries:
-        raise ValueError(
-            "Dividend query coverage missing for "
-            f"{len(missing_queries)} symbol-years at {rebalance_date.date()}; "
-            f"examples: {missing_queries[:5]}"
-        )
-
-    metrics = snapshot[snapshot["symbol"].isin(ranked_symbols)].copy()
-    visible = dividends[dividends["announce_date"] <= rebalance_date]
-    annual_dividends = visible.groupby(["symbol", "year"])[
-        "cash_dividend_after_tax"
-    ].sum()
+    visible = dividends[dividends["announce_date"] <= as_of]
+    annual = visible.groupby(["symbol", "year"])["cash_dividend_after_tax"].sum()
     trailing = visible[
-        visible["announce_date"] > rebalance_date - pd.Timedelta(days=365)
+        visible["announce_date"] > as_of - pd.Timedelta(days=365)
     ].groupby("symbol")["cash_dividend_after_tax"].sum()
-
-    dividend_years = settings["dividend_years"]
-    continuous_start = year - dividend_years + (1 if rebalance_date.month == 12 else 0)
+    continuous_start = as_of.year - dividend_years + (1 if as_of.month == 12 else 0)
     continuous_years = range(continuous_start, continuous_start + dividend_years)
     metrics["consecutive_dividends"] = metrics["symbol"].map(
         lambda symbol: all(
-            annual_dividends.get((symbol, item), 0.0) > 0 for item in continuous_years
+            annual.get((symbol, year), 0.0) > 0 for year in continuous_years
         )
     )
-    metrics = metrics[metrics["consecutive_dividends"]].copy()
-    if metrics.empty:
-        return pd.DataFrame()
 
-    def dividend_growth(symbol: str) -> float:
-        current_paid = annual_dividends.get((symbol, year), 0.0) > 0
-        first_year = year - dividend_years + (1 if current_paid else 0)
+    def growth(symbol: str) -> float:
+        current_announced = annual.get((symbol, as_of.year), 0.0) > 0
+        first_year = as_of.year - dividend_years + (1 if current_announced else 0)
         values = [
-            annual_dividends.get((symbol, item), 0.0)
-            for item in range(first_year, first_year + dividend_years)
+            annual.get((symbol, year), 0.0)
+            for year in range(first_year, first_year + dividend_years)
         ]
-        return float(np.polyfit(np.arange(dividend_years), values, 1)[0])
+        slope = float(np.polyfit(np.arange(dividend_years), values, 1)[0])
+        return 0.0 if np.isclose(slope, 0.0, atol=1e-12) else slope
 
-    metrics["dividend_growth_slope"] = metrics["symbol"].map(dividend_growth)
-    metrics["dividend_yield_ttm"] = metrics["symbol"].map(trailing).fillna(0.0) / metrics[
-        "close"
-    ]
-    metrics["payout_ratio"] = metrics["dividend_yield_ttm"] * metrics["pe_ttm"]
-
-    high_payout_count = floor(len(metrics) * settings["payout_exclude_ratio"])
-    high_payout_symbols = set(
-        metrics.dropna(subset=["payout_ratio"])
-        .sort_values(["payout_ratio", "symbol"], ascending=[False, True])
-        .head(high_payout_count)["symbol"]
+    metrics["dividend_growth_slope"] = metrics["symbol"].map(growth)
+    metrics["dividend_yield_ttm"] = metrics["symbol"].map(trailing).fillna(0.0).div(
+        metrics["close"]
     )
-    selected = metrics[
-        metrics["payout_ratio"].ge(0)
-        & metrics["dividend_growth_slope"].ge(0)
-        & ~metrics["symbol"].isin(high_payout_symbols)
-    ].copy()
-    selected["date"] = rebalance_date
-    selected["in_universe"] = True
-    return selected[["date", "symbol", *UNIVERSE_OUTPUT_COLUMNS]]
+    metrics["payout_ratio"] = metrics["dividend_yield_ttm"] * metrics["pe_ttm"]
+    return metrics
+
+
+def _average_ttm_dividend_yield(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    lookback_days: int,
+) -> dict[str, float]:
+    values = {}
+    for symbol, history in price.groupby("symbol", sort=False):
+        history = history.dropna(subset=["close"])
+        history = history[history["close"] > 0].tail(lookback_days)
+        if len(history) < lookback_days:
+            continue
+        events = dividends[dividends["symbol"] == symbol].sort_values("announce_date")
+        event_dates = events["announce_date"].to_numpy(dtype="datetime64[ns]")
+        cash = events["cash_dividend_after_tax"].to_numpy(dtype=float)
+        cumulative = np.concatenate(([0.0], np.cumsum(cash)))
+        dates = history["date"].to_numpy(dtype="datetime64[ns]")
+        right = np.searchsorted(event_dates, dates, side="right")
+        left = np.searchsorted(
+            event_dates,
+            dates - np.timedelta64(365, "D"),
+            side="right",
+        )
+        trailing_cash = cumulative[right] - cumulative[left]
+        values[str(symbol)] = float((trailing_cash / history["close"].to_numpy()).mean())
+    return values
+
+
+def _price_volatility(price: pd.DataFrame, lookback_days: int) -> dict[str, float]:
+    values = {}
+    for symbol, history in price.groupby("symbol", sort=False):
+        close = history["close"].dropna()
+        close = close[close > 0].tail(lookback_days)
+        if len(close) < lookback_days:
+            continue
+        values[str(symbol)] = float(close.pct_change(fill_method=None).dropna().std())
+    return values
+
+
+def _index_dividend_cash(
+    dividends: pd.DataFrame,
+    normalized_shares: pd.Series,
+    calendar: pd.Index,
+    effective: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.Series:
+    required = {"symbol", "payment_date", "cash_dividend_after_tax"}
+    _require_columns(dividends, required, "dividends")
+    event_key = [
+        column
+        for column in [
+            "symbol",
+            "year",
+            "announce_date",
+            "record_date",
+            "operate_date",
+            "payment_date",
+            "cash_dividend_after_tax",
+        ]
+        if column in dividends
+    ]
+    if dividends.duplicated(event_key).any():
+        raise ValueError(f"dividends contain duplicate event keys: {event_key}")
+    events = dividends.loc[:, sorted(required)].copy()
+    events["symbol"] = events["symbol"].astype(str)
+    events["payment_date"] = pd.to_datetime(events["payment_date"], errors="coerce")
+    events["cash_dividend_after_tax"] = pd.to_numeric(
+        events["cash_dividend_after_tax"], errors="coerce"
+    )
+    events = events[
+        events["symbol"].isin(normalized_shares.index)
+        & events["payment_date"].gt(effective)
+        & events["payment_date"].le(end)
+        & events["cash_dividend_after_tax"].gt(0)
+    ]
+    cash = pd.Series(0.0, index=calendar, name="dividend_cash")
+    for event in events.itertuples(index=False):
+        position = calendar.searchsorted(event.payment_date, side="left")
+        if position < len(calendar):
+            cash.iloc[position] += (
+                normalized_shares[event.symbol] * event.cash_dividend_after_tax
+            )
+    return cash
+
+
+def _require_query_coverage(
+    queries: pd.DataFrame,
+    symbols: list[str],
+    years: range,
+    context: str,
+) -> None:
+    completed = set(queries.itertuples(index=False, name=None))
+    required = {(symbol, year) for symbol in symbols for year in years}
+    missing = sorted(required - completed)
+    if missing:
+        raise ValueError(
+            f"Dividend query coverage missing for {len(missing)} symbol-years "
+            f"during {context}; examples: {missing[:5]}"
+        )
 
 
 def _top_symbols(data: pd.DataFrame, column: str, keep_ratio: float) -> set[str]:
@@ -310,9 +527,3 @@ def _require_columns(data: pd.DataFrame, required: set[str], name: str) -> None:
     missing = sorted(required - set(data.columns))
     if missing:
         raise ValueError(f"{name} missing required columns: {missing}")
-
-
-def _empty_universe() -> pd.DataFrame:
-    out = pd.DataFrame(columns=UNIVERSE_OUTPUT_COLUMNS)
-    out.index = pd.MultiIndex.from_arrays([[], []], names=["date", "symbol"])
-    return out

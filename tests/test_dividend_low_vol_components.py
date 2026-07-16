@@ -5,74 +5,101 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from pyquant.io import load_config
 
-COMPONENT_PATH = (
+
+STRATEGY_DIR = (
     Path(__file__).parents[1]
     / "strategies"
     / "cross_sectional"
     / "dividend_low_vol"
-    / "components.py"
 )
-SPEC = importlib.util.spec_from_file_location("dividend_low_vol_components", COMPONENT_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "dividend_low_vol_components", STRATEGY_DIR / "components.py"
+)
 assert SPEC is not None and SPEC.loader is not None
 COMPONENTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMPONENTS)
-UNIVERSE_OUTPUT_COLUMNS = COMPONENTS.UNIVERSE_OUTPUT_COLUMNS
-build_dividend_universe = COMPONENTS.build_dividend_universe
+
+CONSTITUENT_COLUMNS = COMPONENTS.CONSTITUENT_COLUMNS
+INDEX_COLUMNS = COMPONENTS.INDEX_COLUMNS
+calculate_index = COMPONENTS.calculate_dividend_low_vol_index
+select_constituents = COMPONENTS.select_dividend_low_vol_constituents
 
 
 def make_config(
-    start: str = "2024-11-01",
-    end: str = "2024-12-31",
+    *,
+    market_lookback_days: int = 4,
     market_cap_keep_ratio: float = 1.0,
     amount_keep_ratio: float = 1.0,
     payout_exclude_ratio: float = 0.0,
+    dividend_yield_lookback_days: int = 6,
+    dividend_top_n: int = 3,
+    volatility_lookback_days: int = 4,
+    final_n: int = 2,
 ) -> dict:
     return {
-        "backtest": {"start": start, "end": end, "rebalance": "monthly"},
         "universe": {
-            "lookback_days": 240,
+            "lookback_days": market_lookback_days,
             "market_cap_keep_ratio": market_cap_keep_ratio,
             "amount_keep_ratio": amount_keep_ratio,
             "dividend_years": 3,
             "payout_exclude_ratio": payout_exclude_ratio,
+        },
+        "selection": {
+            "dividend_yield_lookback_days": dividend_yield_lookback_days,
+            "dividend_top_n": dividend_top_n,
+            "volatility_lookback_days": volatility_lookback_days,
+            "final_n": final_n,
         },
     }
 
 
 def make_price(
     symbols: list[str],
-    end: str = "2024-12-31",
-    pe_by_symbol: dict[str, float] | None = None,
+    *,
+    closes: dict[str, list[float]] | None = None,
+    amounts: dict[str, float] | None = None,
+    pe_ttm: dict[str, float] | None = None,
+    dates: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
-    dates = pd.bdate_range("2023-12-01", end)
-    pe_by_symbol = pe_by_symbol or {}
-    return pd.DataFrame(
-        [
-            {
-                "date": date,
-                "symbol": symbol,
-                "close": 10.0,
-                "amount": float(index + 1) * 1_000_000,
-                "pe_ttm": pe_by_symbol.get(symbol, 10.0),
-            }
-            for index, symbol in enumerate(symbols)
-            for date in dates
-        ]
-    )
+    dates = dates if dates is not None else pd.bdate_range("2024-11-18", periods=10)
+    rows = []
+    for index, symbol in enumerate(symbols):
+        symbol_closes = (closes or {}).get(symbol, [10.0] * len(dates))
+        for date, close in zip(dates, symbol_closes, strict=True):
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol,
+                    "close": close,
+                    "amount": (amounts or {}).get(symbol, float(index + 1) * 1_000),
+                    "pe_ttm": (pe_ttm or {}).get(symbol, 10.0),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
-def make_shares(symbols: list[str]) -> pd.DataFrame:
+def make_shares(
+    symbols: list[str],
+    values: dict[str, float] | None = None,
+) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "symbol": symbols,
             "publish_date": pd.Timestamp("2023-01-01"),
-            "total_shares": [float(index + 1) * 100 for index in range(len(symbols))],
+            "total_shares": [
+                (values or {}).get(symbol, float(index + 1) * 100)
+                for index, symbol in enumerate(symbols)
+            ],
         }
     )
 
 
-def make_queries(symbols: list[str], years: range = range(2021, 2025)) -> pd.DataFrame:
+def make_queries(
+    symbols: list[str],
+    years: range = range(2021, 2025),
+) -> pd.DataFrame:
     return pd.DataFrame(
         [(symbol, year) for symbol in symbols for year in years],
         columns=["symbol", "year"],
@@ -96,155 +123,178 @@ def make_dividends(
                 "announce_date": announce_dates[year],
                 "cash_dividend_after_tax": value,
             }
-            for year, value in zip(years, symbol_values)
+            for year, value in zip(years, symbol_values, strict=True)
         )
     return pd.DataFrame(rows)
 
 
-def test_build_dividend_universe_builds_expected_monthly_members():
-    symbols = [f"S{index:02d}" for index in range(25)]
+def make_index_price(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["date", "symbol", "close"])
+
+
+def make_index_queries(symbols: list[str]) -> pd.DataFrame:
+    return make_queries(symbols, range(2023, 2025))
+
+
+def empty_index_dividends() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["symbol", "payment_date", "cash_dividend_after_tax"]
+    )
+
+
+def test_full_75_then_50_selection_order_and_weights():
+    symbols = [f"S{index:03d}" for index in range(80)]
+    dividend_values = {
+        symbol: [cash, cash, cash, cash]
+        for symbol, cash in zip(
+            symbols,
+            [float(80 - index) for index in range(80)],
+            strict=True,
+        )
+    }
     price = make_price(symbols)
-    dividends = make_dividends(symbols)
+    dividends = make_dividends(symbols, dividend_values)
     queries = make_queries(symbols)
     shares = make_shares(symbols)
-    original_inputs = [data.copy(deep=True) for data in [price, dividends, queries, shares]]
+    originals = [frame.copy(deep=True) for frame in [price, dividends, queries, shares]]
+    config = make_config(dividend_top_n=75, final_n=50)
 
-    out = build_dividend_universe(
+    out = select_constituents(
         price,
         dividends,
         queries,
         shares,
-        make_config(market_cap_keep_ratio=0.8, amount_keep_ratio=0.8),
+        "2024-11-29",
+        config,
     )
 
-    assert out.index.names == ["date", "symbol"]
-    assert out.columns.tolist() == UNIVERSE_OUTPUT_COLUMNS
-    assert set(out.index.get_level_values("date")) == {
-        pd.Timestamp("2024-11-29"),
-        pd.Timestamp("2024-12-31"),
-    }
-    assert set(out.xs("2024-12-31").index) == set(symbols[5:])
-    assert len(out) == 40
-    assert out.loc[("2024-12-31", "S05"), "dividend_yield_ttm"] == pytest.approx(0.4)
-    assert out.loc[("2024-12-31", "S05"), "payout_ratio"] == pytest.approx(4.0)
-    assert out.loc[("2024-12-31", "S05"), "dividend_growth_slope"] == pytest.approx(1.0)
-    assert out["in_universe"].all()
-    for data, original in zip([price, dividends, queries, shares], original_inputs):
-        pd.testing.assert_frame_equal(data, original)
+    assert out.index.tolist() == symbols[:50]
+    assert out.index.name == "symbol"
+    assert out.columns.tolist() == CONSTITUENT_COLUMNS
+    assert out["dividend_yield_rank"].tolist() == list(range(1, 51))
+    assert out["volatility_rank"].tolist() == list(range(1, 51))
+    assert out["weight"].sum() == pytest.approx(1.0)
+    assert out.loc["S000", "weight"] > out.loc["S049", "weight"]
+    assert out["as_of_date"].eq(pd.Timestamp("2024-11-29")).all()
+    assert out["price_date"].eq(pd.Timestamp("2024-11-29")).all()
+    for frame, original in zip([price, dividends, queries, shares], originals, strict=True):
+        pd.testing.assert_frame_equal(frame, original)
 
 
-def test_announcement_date_controls_december_continuous_dividend_window():
-    symbols = ["A"]
-    dividends = make_dividends(
-        symbols,
-        announce_dates={
-            2021: "2021-04-30",
-            2022: "2022-04-30",
-            2023: "2023-04-30",
-            2024: "2025-01-02",
-        },
-    )
-
-    out = build_dividend_universe(
-        make_price(symbols),
-        dividends,
-        make_queries(symbols),
-        make_shares(symbols),
-        make_config(),
-    )
-
-    assert out.index.get_level_values("date").unique().tolist() == [
-        pd.Timestamp("2024-11-29")
-    ]
-
-
-def test_announced_dividend_is_available_before_payment_date():
-    symbols = ["A"]
-    dividends = make_dividends(symbols)
-    dividends["announce_date"] = dividends["announce_date"].mask(
-        dividends["year"].eq(2024), "2024-12-15"
-    )
-    dividends["payment_date"] = dividends["announce_date"].mask(
-        dividends["year"].eq(2024), "2025-01-02"
-    )
-
-    out = build_dividend_universe(
-        make_price(symbols),
-        dividends,
-        make_queries(symbols),
-        make_shares(symbols),
-        make_config(),
-    )
-
-    assert out.index.get_level_values("date").unique().tolist() == [
-        pd.Timestamp("2024-11-29"),
-        pd.Timestamp("2024-12-31"),
-    ]
-
-
-def test_growth_filter_removes_negative_slope_and_keeps_zero_slope():
-    symbols = ["FLAT", "DOWN"]
-    dividends = make_dividends(
-        symbols,
-        values={"FLAT": [1.0, 1.0, 1.0, 0.0], "DOWN": [3.0, 2.0, 1.0, 0.0]},
-    )
-
-    out = build_dividend_universe(
-        make_price(symbols, end="2024-11-29"),
-        dividends,
-        make_queries(symbols),
-        make_shares(symbols),
-        make_config(end="2024-11-29"),
-    )
-
-    assert out.index.get_level_values("symbol").tolist() == ["FLAT"]
-    assert out.iloc[0]["dividend_growth_slope"] == pytest.approx(0.0, abs=1e-12)
-
-
-def test_payout_filter_removes_negative_and_highest_five_percent():
-    symbols = [f"S{index:02d}" for index in range(20)]
-    pe_by_symbol = {symbol: 10.0 for symbol in symbols}
-    pe_by_symbol["S00"] = -10.0
-    pe_by_symbol["S19"] = 100.0
-
-    out = build_dividend_universe(
-        make_price(symbols, end="2024-11-29", pe_by_symbol=pe_by_symbol),
-        make_dividends(symbols),
-        make_queries(symbols),
-        make_shares(symbols),
-        make_config(end="2024-11-29", payout_exclude_ratio=0.05),
-    )
-
-    selected = set(out.index.get_level_values("symbol"))
-    assert len(selected) == 18
-    assert "S00" not in selected
-    assert "S19" not in selected
-
-
-def test_market_rank_ties_use_symbol_order():
+def test_market_cap_and_amount_top_80_percent_use_symbol_tie_order():
     symbols = ["E", "D", "C", "B", "A"]
-    price = make_price(symbols, end="2024-11-29")
-    price["amount"] = 1_000_000.0
-    shares = make_shares(symbols)
-    shares["total_shares"] = 100.0
+    price = make_price(symbols, amounts={symbol: 1_000.0 for symbol in symbols})
+    shares = make_shares(symbols, {symbol: 100.0 for symbol in symbols})
+    config = make_config(
+        market_cap_keep_ratio=0.8,
+        amount_keep_ratio=0.8,
+        dividend_top_n=4,
+        final_n=4,
+    )
 
-    out = build_dividend_universe(
+    out = select_constituents(
         price,
         make_dividends(symbols),
         make_queries(symbols),
         shares,
-        make_config(
-            end="2024-11-29",
-            market_cap_keep_ratio=0.8,
-            amount_keep_ratio=0.8,
-        ),
+        "2024-11-29",
+        config,
     )
 
-    assert set(out.index.get_level_values("symbol")) == {"A", "B", "C", "D"}
+    assert set(out.index) == {"A", "B", "C", "D"}
 
 
-def test_total_shares_use_only_published_values():
-    symbols = ["A"]
+def test_payout_filters_negative_and_highest_five_percent_after_continuity():
+    symbols = [f"S{index:02d}" for index in range(21)]
+    pe_ttm = {symbol: 10.0 for symbol in symbols}
+    pe_ttm["S00"] = -10.0
+    pe_ttm["S19"] = 100.0
+    dividends = make_dividends(symbols)
+    dividends.loc[dividends["symbol"].eq("S20") & dividends["year"].eq(2021), "cash_dividend_after_tax"] = 0.0
+    config = make_config(
+        payout_exclude_ratio=0.05,
+        dividend_top_n=18,
+        final_n=18,
+    )
+
+    out = select_constituents(
+        make_price(symbols, pe_ttm=pe_ttm),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        "2024-11-29",
+        config,
+    )
+
+    assert len(out) == 18
+    assert "S00" not in out.index
+    assert "S19" not in out.index
+    assert "S20" not in out.index
+
+
+def test_negative_dividend_growth_is_removed_and_zero_growth_is_kept():
+    symbols = ["DOWN", "FLAT"]
+    dividends = make_dividends(
+        symbols,
+        {"DOWN": [4.0, 3.0, 2.0, 1.0], "FLAT": [1.0, 1.0, 1.0, 1.0]},
+    )
+
+    out = select_constituents(
+        make_price(symbols),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        "2024-11-29",
+        make_config(dividend_top_n=1, final_n=1),
+    )
+
+    assert out.index.tolist() == ["FLAT"]
+    assert out.loc["FLAT", "dividend_growth_slope"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_low_volatility_stage_runs_after_dividend_yield_ranking():
+    symbols = ["HIGH_STABLE", "MID_VOLATILE", "LOW_STABLE", "OUTSIDE"]
+    dividends = make_dividends(
+        symbols,
+        {
+            "HIGH_STABLE": [4.0] * 4,
+            "MID_VOLATILE": [3.0] * 4,
+            "LOW_STABLE": [2.0] * 4,
+            "OUTSIDE": [1.0] * 4,
+        },
+    )
+    closes = {
+        "HIGH_STABLE": [10.0] * 10,
+        "MID_VOLATILE": [10.0, 12.0, 9.0, 13.0, 8.0, 14.0, 7.0, 15.0, 6.0, 16.0],
+        "LOW_STABLE": [10.0] * 10,
+        "OUTSIDE": [10.0] * 10,
+    }
+
+    out = select_constituents(
+        make_price(symbols, closes=closes),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        "2024-11-29",
+        make_config(dividend_top_n=3, final_n=2),
+    )
+
+    assert out.index.tolist() == ["HIGH_STABLE", "LOW_STABLE"]
+    assert out.loc["HIGH_STABLE", "dividend_yield_rank"] == 1
+    assert "OUTSIDE" not in out.index
+
+
+def test_future_dividend_announcement_and_share_publication_are_not_visible():
+    dividends = make_dividends(
+        ["A"],
+        {"A": [1.0, 1.0, 1.0, 100.0]},
+        {
+            2021: "2021-04-30",
+            2022: "2022-04-30",
+            2023: "2024-02-01",
+            2024: "2025-01-02",
+        },
+    )
     shares = pd.DataFrame(
         {
             "symbol": ["A", "A"],
@@ -253,60 +303,272 @@ def test_total_shares_use_only_published_values():
         }
     )
 
-    out = build_dividend_universe(
-        make_price(symbols, end="2024-11-29"),
-        make_dividends(symbols),
-        make_queries(symbols),
+    out = select_constituents(
+        make_price(["A"]),
+        dividends,
+        make_queries(["A"]),
         shares,
-        make_config(end="2024-11-29"),
+        "2024-11-29",
+        make_config(dividend_top_n=1, final_n=1),
     )
 
-    assert out.iloc[0]["avg_market_cap_240d"] == pytest.approx(1_000.0)
+    assert out.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
+    assert out.loc["A", "dividend_yield_ttm"] == pytest.approx(0.1)
+    assert out.loc["A", "avg_dividend_yield_3y"] == pytest.approx(0.1)
 
 
-def test_missing_dividend_query_coverage_raises_clear_error():
-    symbols = ["A"]
+def test_missing_query_coverage_and_insufficient_history_raise():
+    inputs = [make_price(["A"]), make_dividends(["A"]), make_shares(["A"])]
+    config = make_config(dividend_top_n=1, final_n=1)
 
     with pytest.raises(ValueError, match="Dividend query coverage missing"):
-        build_dividend_universe(
-            make_price(symbols, end="2024-11-29"),
-            make_dividends(symbols),
-            make_queries(symbols, range(2021, 2024)),
-            make_shares(symbols),
-            make_config(end="2024-11-29"),
+        select_constituents(
+            inputs[0],
+            inputs[1],
+            make_queries(["A"], range(2021, 2024)),
+            inputs[2],
+            "2024-11-29",
+            config,
+        )
+
+    short_price = inputs[0].groupby("symbol").tail(5)
+    with pytest.raises(ValueError, match="Only 0 eligible symbols remain"):
+        select_constituents(
+            short_price,
+            inputs[1],
+            make_queries(["A"]),
+            inputs[2],
+            "2024-11-29",
+            config,
         )
 
 
-def test_missing_total_share_symbol_raises_clear_error():
-    symbols = ["A", "B"]
-
-    with pytest.raises(ValueError, match="Total-share data missing for 1 price symbols"):
-        build_dividend_universe(
-            make_price(symbols, end="2024-11-29"),
-            make_dividends(symbols),
-            make_queries(symbols),
-            make_shares(["A"]),
-            make_config(end="2024-11-29"),
-        )
-
-
-def test_duplicate_price_key_and_invalid_config_raise_clear_errors():
-    symbols = ["A"]
-    price = make_price(symbols, end="2024-11-29")
+def test_duplicate_price_key_and_invalid_config_raise():
+    price = make_price(["A"])
     duplicate_price = pd.concat([price, price.iloc[[0]]], ignore_index=True)
-    inputs = [make_dividends(symbols), make_queries(symbols), make_shares(symbols)]
+    inputs = [make_dividends(["A"]), make_queries(["A"]), make_shares(["A"])]
+    config = make_config(dividend_top_n=1, final_n=1)
 
     with pytest.raises(ValueError, match=r"duplicate \(date, symbol\)"):
-        build_dividend_universe(duplicate_price, *inputs, make_config(end="2024-11-29"))
-
-    with pytest.raises(ValueError, match="price missing required columns: \\['pe_ttm'\\]"):
-        build_dividend_universe(
-            price.drop(columns="pe_ttm"),
+        select_constituents(
+            duplicate_price,
             *inputs,
-            make_config(end="2024-11-29"),
+            "2024-11-29",
+            config,
         )
 
-    invalid_config = deepcopy(make_config(end="2024-11-29"))
-    invalid_config["universe"]["market_cap_keep_ratio"] = 0
-    with pytest.raises(ValueError, match="keep ratios"):
-        build_dividend_universe(price, *inputs, invalid_config)
+    invalid_config = deepcopy(config)
+    invalid_config["selection"]["dividend_top_n"] = 0
+    with pytest.raises(ValueError, match="dividend_top_n must be positive"):
+        select_constituents(
+            price,
+            *inputs,
+            "2024-11-29",
+            invalid_config,
+        )
+
+
+def test_strategy_config_contains_original_index_parameters_only():
+    config = load_config(STRATEGY_DIR / "config.yaml")
+
+    assert "backtest" not in config
+    assert config["selection"] == {
+        "dividend_yield_lookback_days": 720,
+        "dividend_top_n": 75,
+        "final_n": 50,
+        "volatility_lookback_days": 240,
+    }
+
+
+def test_fixed_quantity_price_index_and_suspension_forward_fill():
+    price = make_index_price(
+        [
+            ("2024-01-02", "A", 10.0),
+            ("2024-01-02", "B", 20.0),
+            ("2024-01-03", "A", 11.0),
+            ("2024-01-04", "A", 12.0),
+            ("2024-01-04", "B", 18.0),
+        ]
+    )
+    constituents = pd.DataFrame(
+        {"symbol": ["A", "B"], "weight": [0.5, 0.5]}
+    ).set_index("symbol")
+
+    out = calculate_index(
+        price,
+        empty_index_dividends(),
+        make_index_queries(["A", "B"]),
+        constituents,
+        "2024-01-02",
+        "2024-01-04",
+    )
+
+    assert out.columns.tolist() == INDEX_COLUMNS
+    assert out.index.name == "date"
+    assert out["price_index"].tolist() == pytest.approx([1000.0, 1050.0, 1050.0])
+    assert out["price_return"].tolist() == pytest.approx([0.0, 0.05, 0.0])
+    pd.testing.assert_series_equal(
+        out["price_index"], out["total_return_index"], check_names=False
+    )
+
+
+def test_all_constituents_can_forward_fill_on_a_market_trading_day():
+    price = make_index_price(
+        [
+            ("2024-01-01", "A", 10.0),
+            ("2024-01-02", "MARKET_CALENDAR", 1.0),
+            ("2024-01-03", "A", 11.0),
+            ("2024-01-03", "MARKET_CALENDAR", 1.0),
+        ]
+    )
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
+        "symbol"
+    )
+
+    out = calculate_index(
+        price,
+        empty_index_dividends(),
+        make_index_queries(["A"]),
+        constituents,
+        "2024-01-02",
+        "2024-01-03",
+    )
+
+    assert out.index.tolist() == [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")]
+    assert out["price_index"].tolist() == pytest.approx([1000.0, 1100.0])
+
+
+def test_total_return_credits_payment_and_moves_weekend_payment_forward():
+    price = make_index_price(
+        [
+            ("2024-01-05", "A", 10.0),
+            ("2024-01-08", "A", 10.0),
+            ("2024-01-09", "A", 10.0),
+        ]
+    )
+    dividends = pd.DataFrame(
+        {
+            "symbol": ["A", "A"],
+            "payment_date": ["2024-01-06", "2024-01-09"],
+            "cash_dividend_after_tax": [1.0, 1.0],
+        }
+    )
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
+        "symbol"
+    )
+
+    out = calculate_index(
+        price,
+        dividends,
+        make_index_queries(["A"]),
+        constituents,
+        "2024-01-05",
+        "2024-01-09",
+    )
+
+    assert out.loc["2024-01-05", "dividend_cash"] == 0.0
+    assert out.loc["2024-01-08", "dividend_cash"] == pytest.approx(0.1)
+    assert out.loc["2024-01-08", "total_return"] == pytest.approx(0.1)
+    assert out.loc["2024-01-08", "price_index"] == pytest.approx(1000.0)
+    assert out.loc["2024-01-08", "total_return_index"] == pytest.approx(1100.0)
+    assert out.loc["2024-01-09", "dividend_cash"] == pytest.approx(0.1)
+    assert out.loc["2024-01-09", "total_return_index"] == pytest.approx(1210.0)
+
+
+def test_no_dividend_indices_match_and_separate_base_values_chain():
+    price = make_index_price(
+        [
+            ("2024-01-02", "A", 10.0),
+            ("2024-01-03", "A", 11.0),
+            ("2024-01-04", "A", 12.0),
+        ]
+    )
+    queries = make_index_queries(["A"])
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
+        "symbol"
+    )
+    first = calculate_index(
+        price,
+        empty_index_dividends(),
+        queries,
+        constituents,
+        "2024-01-02",
+        "2024-01-03",
+    )
+    second = calculate_index(
+        price,
+        empty_index_dividends(),
+        queries,
+        constituents,
+        "2024-01-03",
+        "2024-01-04",
+        price_base_value=first["price_index"].iloc[-1],
+        total_return_base_value=first["total_return_index"].iloc[-1],
+    )
+    chained = pd.concat([first, second.iloc[1:]])
+    full = calculate_index(
+        price,
+        empty_index_dividends(),
+        queries,
+        constituents,
+        "2024-01-02",
+        "2024-01-04",
+    )
+
+    pd.testing.assert_series_equal(chained["price_index"], full["price_index"])
+    pd.testing.assert_series_equal(
+        chained["total_return_index"], full["total_return_index"]
+    )
+
+
+def test_index_validates_coverage_effective_prices_and_duplicate_events():
+    price = make_index_price(
+        [
+            ("2024-01-02", "A", 10.0),
+            ("2024-01-03", "A", 10.0),
+            ("2024-01-03", "B", 20.0),
+        ]
+    )
+    constituents = pd.DataFrame(
+        {"symbol": ["A", "B"], "weight": [0.5, 0.5]}
+    ).set_index("symbol")
+    single_constituent = pd.DataFrame(
+        {"symbol": ["A"], "weight": [1.0]}
+    ).set_index("symbol")
+
+    with pytest.raises(ValueError, match="No price is available on or before"):
+        calculate_index(
+            price,
+            empty_index_dividends(),
+            make_index_queries(["A", "B"]),
+            constituents,
+            "2024-01-02",
+            "2024-01-03",
+        )
+
+    with pytest.raises(ValueError, match="Dividend query coverage missing"):
+        calculate_index(
+            price[price["symbol"].eq("A")],
+            empty_index_dividends(),
+            make_queries(["A"], range(2024, 2025)),
+            single_constituent,
+            "2024-01-02",
+            "2024-01-03",
+        )
+
+    duplicated_dividends = pd.DataFrame(
+        {
+            "symbol": ["A", "A"],
+            "payment_date": ["2024-01-03", "2024-01-03"],
+            "cash_dividend_after_tax": [1.0, 1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate event keys"):
+        calculate_index(
+            price[price["symbol"].eq("A")],
+            duplicated_dividends,
+            make_index_queries(["A"]),
+            single_constituent,
+            "2024-01-02",
+            "2024-01-03",
+        )

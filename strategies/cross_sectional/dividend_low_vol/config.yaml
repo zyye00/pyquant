@@ -2,12 +2,6 @@ strategy:
   name: dividend_low_vol
   type: cross_sectional
 
-backtest:
-  start: null
-  end: null
-  rebalance: monthly
-  fee_rate: 0.0
-
 universe:
   lookback_days: 240
   market_cap_keep_ratio: 0.8
@@ -16,6 +10,7 @@ universe:
   payout_exclude_ratio: 0.05
 
 selection:
-  dividend_top_n: 150
+  dividend_yield_lookback_days: 720
+  dividend_top_n: 75
   final_n: 50
-  volatility_lookback_days: 20
+  volatility_lookback_days: 240
