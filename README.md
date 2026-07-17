@@ -35,10 +35,10 @@ stock_profit_quarterly
 ```text
 data/
 ├─ raw/
-│  ├─ stock_daily/{adjustment}/{symbol}.parquet
-│  ├─ index_daily/{adjustment}/{symbol}.parquet
-│  ├─ stock_5m/{adjustment}/{symbol}/{year}.parquet
-│  ├─ other_daily/{adjustment}/{symbol}.parquet
+│  ├─ stock_daily/{symbol}.parquet
+│  ├─ index_daily/{symbol}.parquet
+│  ├─ stock_5m/{symbol}/{year}.parquet
+│  ├─ other_daily/{symbol}.parquet
 │  ├─ dividend/{data,queries}.parquet
 │  └─ stock_profit_quarterly/{data,queries}.parquet
 └─ state/

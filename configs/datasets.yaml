@@ -46,7 +46,8 @@ datasets:
     source: baostock
     storage:
       kind: symbol_files
-      path: data/raw/stock_daily/{adjustment}/{symbol}.parquet
+      path: data/raw/stock_daily/{symbol}.parquet
+      query_path: data/raw/stock_daily/queries.parquet
       symbol_from: stem
     columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
     required: [date, symbol, close, amount, pe_ttm]
@@ -62,7 +63,8 @@ datasets:
     source: baostock
     storage:
       kind: symbol_files
-      path: data/raw/index_daily/{adjustment}/{symbol}.parquet
+      path: data/raw/index_daily/{symbol}.parquet
+      query_path: data/raw/index_daily/queries.parquet
       symbol_from: stem
     columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
     required: [date, symbol, close]
@@ -78,7 +80,8 @@ datasets:
     source: baostock
     storage:
       kind: symbol_year_files
-      path: data/raw/stock_5m/{adjustment}/{symbol}/{year}.parquet
+      path: data/raw/stock_5m/{symbol}/{year}.parquet
+      query_path: data/raw/stock_5m/queries.parquet
       symbol_from: parent
     columns: [date, time, symbol, open, high, low, close, volume, amount]
     required: [date, time, symbol, close]
@@ -94,7 +97,7 @@ datasets:
     source: baostock
     storage:
       kind: symbol_files
-      path: data/raw/other_daily/{adjustment}/{symbol}.parquet
+      path: data/raw/other_daily/{symbol}.parquet
       symbol_from: stem
     columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
     required: [date, symbol, close]

@@ -195,7 +195,7 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
         ["sh.600000", "2024-01-02", "2024-01-02"],
         ["sh.600000", "2024-01-04", "2024-01-05"],
     ]
-    assert Path(result.loc[0, "target_path"]).parent.name == "none"
+    assert Path(result.loc[0, "target_path"]).parent.name == "stock_daily"
     assert progress == [(0, 1), (1, 1)]
 
 

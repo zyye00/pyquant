@@ -47,7 +47,7 @@ def test_load_price_csv(tmp_path):
 def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
     tmp_path, monkeypatch
 ):
-    path = tmp_path / "raw" / "stock_daily" / "none" / "sh.600000.parquet"
+    path = tmp_path / "raw" / "stock_daily" / "sh.600000.parquet"
     path.parent.mkdir(parents=True)
     pd.DataFrame(
         {
@@ -68,7 +68,6 @@ def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
                         tmp_path
                         / "raw"
                         / "stock_daily"
-                        / "{adjustment}"
                         / "{symbol}.parquet"
                     ),
                     "symbol_from": "stem",
