@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Iterable
 from glob import glob
 from pathlib import Path
+from threading import Condition, Thread
 from typing import Any
 
 import pandas as pd
@@ -26,6 +27,128 @@ DEFAULT_PRICE_FIELD_MAP = {
 }
 
 
+class DatasetUpdate:
+    """A controllable dataset update running in a background thread."""
+
+    def __init__(
+        self,
+        worker: Callable[
+            [Callable[[], bool], Callable[[int, int], None]], pd.DataFrame
+        ],
+    ) -> None:
+        self._condition = Condition()
+        self._state = "running"
+        self._completed = 0
+        self._total = 0
+        self._progress_printed = False
+        self._progress_handle: Any | None = None
+        self._error: Exception | None = None
+        self._result: pd.DataFrame | None = None
+        try:
+            from IPython import get_ipython
+            from IPython.display import DisplayHandle
+        except ImportError:
+            pass
+        else:
+            if get_ipython() is not None:
+                self._progress_handle = DisplayHandle()
+                self._progress_handle.display({"text/plain": "Updated 0/0"}, raw=True)
+        self._thread = Thread(target=self._run, args=(worker,))
+        self._thread.start()
+
+    @property
+    def state(self) -> str:
+        with self._condition:
+            return self._state
+
+    @property
+    def completed(self) -> int:
+        with self._condition:
+            return self._completed
+
+    @property
+    def total(self) -> int:
+        with self._condition:
+            return self._total
+
+    @property
+    def error(self) -> Exception | None:
+        with self._condition:
+            return self._error
+
+    def pause(self) -> None:
+        """Pause before the next remote request."""
+        with self._condition:
+            if self._state == "running":
+                self._state = "paused"
+
+    def resume(self) -> None:
+        """Resume a paused update."""
+        with self._condition:
+            if self._state == "paused":
+                self._state = "running"
+                self._condition.notify_all()
+
+    def stop(self) -> None:
+        """Stop gracefully after the current remote request."""
+        with self._condition:
+            if self._state not in {"completed", "failed"}:
+                self._state = "stopping"
+                self._condition.notify_all()
+
+    def wait(self) -> pd.DataFrame:
+        """Wait for completion and return results or raise the worker error."""
+        self._thread.join()
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            if self._result is None:
+                raise RuntimeError("Dataset update finished without a result")
+            return self._result
+
+    def _run(
+        self,
+        worker: Callable[
+            [Callable[[], bool], Callable[[int, int], None]], pd.DataFrame
+        ],
+    ) -> None:
+        def checkpoint() -> bool:
+            with self._condition:
+                while self._state == "paused":
+                    self._condition.wait()
+                return self._state != "stopping"
+
+        def progress(completed: int, total: int) -> None:
+            with self._condition:
+                self._completed = completed
+                self._total = total
+            self._show_progress(completed, total)
+            self._progress_printed = True
+
+        try:
+            result = worker(checkpoint, progress)
+        except Exception as exc:
+            with self._condition:
+                self._error = exc
+                self._state = "failed"
+                self._condition.notify_all()
+        else:
+            with self._condition:
+                self._result = result
+                self._state = "completed"
+                self._condition.notify_all()
+        finally:
+            if self._progress_printed:
+                self._show_progress(self._completed, self._total, final=True)
+
+    def _show_progress(self, completed: int, total: int, final: bool = False) -> None:
+        message = f"Updated {completed}/{total}"
+        if self._progress_handle is not None:
+            self._progress_handle.update({"text/plain": message}, raw=True)
+        else:
+            print(f"\r{message}", end="\n" if final else "", flush=True)
+
+
 def load_dataset(
     name: str,
     *,
@@ -35,8 +158,8 @@ def load_dataset(
     adjustment: str | None = None,
 ) -> pd.DataFrame:
     """Load a catalog dataset with canonical columns."""
-    catalog = _load_dataset_catalog()
-    dataset = _get_dataset(catalog, name)
+    catalog = load_dataset_catalog()
+    dataset = get_dataset(catalog, name)
     storage = dataset["storage"]
     kind = storage["kind"]
     if kind != "table" and (start is None or end is None):
@@ -50,8 +173,7 @@ def load_dataset(
     if not paths:
         raise FileNotFoundError(f"No files found for dataset {name!r}")
     frames = [
-        _read_dataset_file(path, dataset, storage, start_at, end_at)
-        for path in paths
+        _read_dataset_file(path, dataset, storage, start_at, end_at) for path in paths
     ]
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
@@ -71,26 +193,41 @@ def update_dataset(
     name: str,
     *,
     start: str,
+    pool: str | Iterable[str],
     end: str | None = None,
-    symbols: Collection[str] | None = None,
-    pool: str | None = None,
     pool_date: str | None = None,
     adjustment: str | None = None,
     max_tasks: int | None = None,
-) -> pd.DataFrame:
-    """Update a catalog dataset through its configured source."""
-    from pyquant._data_update import update_dataset as _update_dataset
+) -> DatasetUpdate:
+    """Start a background update for a named pool or security-code iterable."""
+    if not isinstance(pool, str):
+        pool = tuple(dict.fromkeys(str(symbol) for symbol in pool))
+        if not pool:
+            raise ValueError("pool must contain at least one security code")
+    options: dict[str, Any] = {"start": start, "pool": pool}
+    for key, value in {
+        "end": end,
+        "pool_date": pool_date,
+        "adjustment": adjustment,
+        "max_tasks": max_tasks,
+    }.items():
+        if value is not None:
+            options[key] = value
 
-    return _update_dataset(
-        name,
-        start=start,
-        end=end,
-        symbols=symbols,
-        pool=pool,
-        pool_date=pool_date,
-        adjustment=adjustment,
-        max_tasks=max_tasks,
-    )
+    def run(
+        checkpoint: Callable[[], bool],
+        progress: Callable[[int, int], None],
+    ) -> pd.DataFrame:
+        from pyquant._data_update import update_dataset as update_source_dataset
+
+        return update_source_dataset(
+            name,
+            checkpoint=checkpoint,
+            progress=progress,
+            **options,
+        )
+
+    return DatasetUpdate(run)
 
 
 def load_price(
@@ -127,14 +264,18 @@ def standardize_price(
     return out[ordered + extras].sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
-def _load_dataset_catalog(path: str | Path = DEFAULT_DATASET_CATALOG) -> dict[str, Any]:
+def load_dataset_catalog(
+    path: str | Path = DEFAULT_DATASET_CATALOG,
+) -> dict[str, Any]:
+    """Load and validate the dataset catalog."""
     catalog = load_config(path)
     if catalog.get("version") != 1 or not isinstance(catalog.get("datasets"), dict):
         raise ValueError("Invalid dataset catalog")
     return catalog
 
 
-def _get_dataset(catalog: dict[str, Any], name: str) -> dict[str, Any]:
+def get_dataset(catalog: dict[str, Any], name: str) -> dict[str, Any]:
+    """Return and validate one dataset definition from a catalog."""
     try:
         dataset = catalog["datasets"][name]
     except KeyError as exc:
@@ -197,7 +338,11 @@ def _read_dataset_file(
         data["symbol"] = path.parent.name
     date_column = dataset.get("date_column")
     source_date = next(
-        (source for source, target in dataset["field_map"].items() if target == date_column),
+        (
+            source
+            for source, target in dataset["field_map"].items()
+            if target == date_column
+        ),
         date_column,
     )
     if source_date in data:
@@ -210,9 +355,7 @@ def _read_dataset_file(
     return data
 
 
-def _canonicalize_dataset(
-    data: pd.DataFrame, dataset: dict[str, Any]
-) -> pd.DataFrame:
+def _canonicalize_dataset(data: pd.DataFrame, dataset: dict[str, Any]) -> pd.DataFrame:
     rename_map = {
         source: target
         for source, target in dataset["field_map"].items()

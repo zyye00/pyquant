@@ -30,9 +30,6 @@ backtest = ["vectorbt"]
 report = ["quantstats"]
 factor = ["alphalens-reloaded"]
 
-[project.scripts]
-pyquant = "pyquant.cli:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

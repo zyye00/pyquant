@@ -1,13 +1,22 @@
+from threading import Event
+
+import IPython
+import IPython.display
 import pandas as pd
 import pytest
 
 from pyquant import data as data_module
-from pyquant import load_dataset, load_price, standardize_price
-from pyquant._data_migration import migrate_legacy_data_layout
+from pyquant import (
+    DatasetUpdate,
+    load_dataset,
+    load_price,
+    standardize_price,
+    update_dataset,
+)
 
 
 def test_dataset_catalog_defines_complete_canonical_contracts():
-    catalog = data_module._load_dataset_catalog()
+    catalog = data_module.load_dataset_catalog()
 
     assert {
         "stock_daily",
@@ -20,7 +29,7 @@ def test_dataset_catalog_defines_complete_canonical_contracts():
         "stock_profit_quarterly_queries",
     } == set(catalog["datasets"])
     for name, dataset in catalog["datasets"].items():
-        data_module._get_dataset(catalog, name)
+        data_module.get_dataset(catalog, name)
         assert set(dataset["required"]) <= set(dataset["columns"])
         assert set(dataset.get("primary_key", [])) <= set(dataset["columns"])
         if dataset["source"] != "generated":
@@ -94,7 +103,7 @@ def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
             }
         },
     }
-    monkeypatch.setattr(data_module, "_load_dataset_catalog", lambda: catalog)
+    monkeypatch.setattr(data_module, "load_dataset_catalog", lambda: catalog)
 
     out = load_dataset(
         "stock_daily",
@@ -104,7 +113,10 @@ def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
     )
 
     assert out.columns.tolist() == ["date", "symbol", "close", "amount", "pe_ttm"]
-    assert out["date"].tolist() == [pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")]
+    assert out["date"].tolist() == [
+        pd.Timestamp("2024-01-03"),
+        pd.Timestamp("2024-01-04"),
+    ]
     assert out["symbol"].unique().tolist() == ["sh.600000"]
     assert out["pe_ttm"].tolist() == [9.0, 10.0]
 
@@ -122,49 +134,149 @@ def test_load_dataset_requires_explicit_partition_dates(monkeypatch):
             }
         },
     }
-    monkeypatch.setattr(data_module, "_load_dataset_catalog", lambda: catalog)
+    monkeypatch.setattr(data_module, "load_dataset_catalog", lambda: catalog)
 
     with pytest.raises(ValueError, match="requires explicit start and end"):
         load_dataset("stock_daily")
 
 
-def test_migrate_legacy_layout_dry_run_and_move(tmp_path):
-    legacy = tmp_path / "data" / "raw" / "baostock"
-    stock = legacy / "daily" / "stock" / "none" / "sh.600000.parquet"
-    index = legacy / "daily" / "index" / "sh.000300.parquet"
-    dividend = legacy / "dividend.parquet"
-    query = legacy / "state" / "dividend_queries.parquet"
-    for path in [stock, index, dividend, query]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(path.name.encode())
+def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys):
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
 
-    planned = migrate_legacy_data_layout(legacy, tmp_path / "data", dry_run=True)
+    def fake_update(name, *, checkpoint, progress, **options):
+        assert name == "stock_daily"
+        assert options == {"start": "2024-01-01", "pool": "all"}
+        progress(0, 2)
+        assert checkpoint()
+        first_started.set()
+        assert release_first.wait(1)
+        progress(1, 2)
+        if not checkpoint():
+            return pd.DataFrame({"status": ["success"]})
+        second_started.set()
+        progress(2, 2)
+        return pd.DataFrame({"status": ["success", "success"]})
 
-    assert len(planned) == 4
-    assert stock.exists()
-    moved = migrate_legacy_data_layout(legacy, tmp_path / "data")
-    assert moved == planned
-    assert not legacy.exists()
-    assert (
-        tmp_path / "data" / "raw" / "stock_daily" / "none" / "sh.600000.parquet"
-    ).read_bytes() == b"sh.600000.parquet"
-    assert (
-        tmp_path / "data" / "raw" / "index_daily" / "none" / "sh.000300.parquet"
-    ).exists()
-    assert (tmp_path / "data" / "raw" / "dividend" / "data.parquet").exists()
+    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+
+    job = update_dataset("stock_daily", start="2024-01-01", pool="all")
+
+    assert isinstance(job, DatasetUpdate)
+    assert first_started.wait(1)
+    assert job.state == "running"
+    job.pause()
+    assert job.state == "paused"
+    release_first.set()
+    assert not second_started.wait(0.05)
+    job.resume()
+    assert second_started.wait(1)
+    result = job.wait()
+
+    assert result["status"].tolist() == ["success", "success"]
+    assert job.state == "completed"
+    assert (job.completed, job.total, job.error) == (2, 2, None)
+    assert capsys.readouterr().out == (
+        "\rUpdated 0/2\rUpdated 1/2\rUpdated 2/2\rUpdated 2/2\n"
+    )
 
 
-def test_migrate_legacy_layout_stops_before_destination_collision(tmp_path):
-    legacy = tmp_path / "data" / "raw" / "baostock"
-    source = legacy / "dividend.parquet"
-    destination = tmp_path / "data" / "raw" / "dividend" / "data.parquet"
-    source.parent.mkdir(parents=True)
-    destination.parent.mkdir(parents=True)
-    source.write_bytes(b"source")
-    destination.write_bytes(b"destination")
+def test_dataset_update_materializes_and_deduplicates_iterable_pool(monkeypatch):
+    def fake_update(name, *, checkpoint, progress, **options):
+        assert options["pool"] == ("sh.600000", "sz.000001")
+        progress(2, 2)
+        return pd.DataFrame()
 
-    with pytest.raises(FileExistsError, match="destinations already exist"):
-        migrate_legacy_data_layout(legacy, tmp_path / "data")
+    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
 
-    assert source.read_bytes() == b"source"
-    assert destination.read_bytes() == b"destination"
+    pool = iter(["sh.600000", "sz.000001", "sh.600000"])
+    job = update_dataset("stock_daily", start="2024-01-01", pool=pool)
+
+    assert job.wait().empty
+
+
+def test_dataset_update_rejects_empty_iterable_pool():
+    with pytest.raises(ValueError, match="at least one security code"):
+        update_dataset("stock_daily", start="2024-01-01", pool=[])
+
+
+def test_dataset_update_uses_ipython_display_for_progress(monkeypatch):
+    records = []
+
+    class FakeDisplayHandle:
+        def display(self, data, *, raw):
+            records.append(("display", data, raw))
+
+        def update(self, data, *, raw):
+            records.append(("update", data, raw))
+
+    def fake_update(name, *, checkpoint, progress, **options):
+        progress(1, 1)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(IPython, "get_ipython", lambda: object())
+    monkeypatch.setattr(IPython.display, "DisplayHandle", FakeDisplayHandle)
+    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+
+    job = update_dataset("stock_daily", start="2024-01-01", pool=["sh.600000"])
+
+    assert job.wait().empty
+    assert records == [
+        ("display", {"text/plain": "Updated 0/0"}, True),
+        ("update", {"text/plain": "Updated 1/1"}, True),
+        ("update", {"text/plain": "Updated 1/1"}, True),
+    ]
+
+
+def test_dataset_update_stops_while_paused(monkeypatch):
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+
+    def fake_update(name, *, checkpoint, progress, **options):
+        progress(0, 2)
+        assert checkpoint()
+        first_started.set()
+        assert release_first.wait(1)
+        result = pd.DataFrame({"status": ["success"]})
+        progress(1, 2)
+        if not checkpoint():
+            return result
+        second_started.set()
+        return pd.concat([result, result], ignore_index=True)
+
+    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    job = update_dataset("stock_daily", start="2024-01-01", pool="all")
+
+    assert first_started.wait(1)
+    job.pause()
+    release_first.set()
+    job.stop()
+    assert job.state == "stopping"
+    result = job.wait()
+
+    assert result["status"].tolist() == ["success"]
+    assert not second_started.is_set()
+    assert job.state == "completed"
+    assert (job.completed, job.total) == (1, 2)
+    job.pause()
+    job.resume()
+    job.stop()
+    assert job.state == "completed"
+
+
+def test_dataset_update_reraises_background_error(monkeypatch):
+    error = RuntimeError("download failed")
+
+    def fake_update(name, *, checkpoint, progress, **options):
+        raise error
+
+    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    job = update_dataset("stock_daily", start="2024-01-01", pool="all")
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        job.wait()
+
+    assert job.state == "failed"
+    assert job.error is error

@@ -1,7 +1,8 @@
+import os
+import sys
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-import sys
 
 import pandas as pd
 import pytest
@@ -17,6 +18,7 @@ from pyquant._data_update import (
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
+    create_download_lock,
     daily_target_path,
     init_data_storage,
     minute_5_target_path,
@@ -48,7 +50,9 @@ class FakeResult:
 
 
 def test_baostock_client_sets_socket_timeout(monkeypatch):
-    socket = SimpleNamespace(timeout=None, settimeout=lambda value: setattr(socket, "timeout", value))
+    socket = SimpleNamespace(
+        timeout=None, settimeout=lambda value: setattr(socket, "timeout", value)
+    )
     bs = SimpleNamespace(
         login=lambda: SimpleNamespace(error_code="0", error_msg=""),
         logout=lambda: None,
@@ -67,7 +71,9 @@ class FakeClient:
         self.bs = self
         self.calls = []
 
-    def query_history_k_data_plus(self, code, fields, start_date, end_date, frequency, adjustflag):
+    def query_history_k_data_plus(
+        self, code, fields, start_date, end_date, frequency, adjustflag
+    ):
         self.calls.append((code, start_date, end_date, frequency, adjustflag))
         names = fields.split(",")
         row = {name: "" for name in names}
@@ -103,7 +109,13 @@ class FakeClient:
 
     def query_dividend_data(self, code, year, yearType):
         self.calls.append((code, year, yearType))
-        rows = [] if year == "2023" else [[code, "2022-05-01", "2022-05-10", "2022-05-11", "2022-05-20", "0.25"]]
+        rows = (
+            []
+            if year == "2023"
+            else [
+                [code, "2022-05-01", "2022-05-10", "2022-05-11", "2022-05-20", "0.25"]
+            ]
+        )
         return FakeResult(
             [
                 "code",
@@ -118,24 +130,19 @@ class FakeClient:
 
     def query_profit_data(self, code, year, quarter):
         self.calls.append((code, year, quarter))
-        rows = [] if quarter == "2" else [[code, "2022-04-30", "2022-03-31", "123456789"]]
+        rows = (
+            [] if quarter == "2" else [[code, "2022-04-30", "2022-03-31", "123456789"]]
+        )
         return FakeResult(["code", "pubDate", "statDate", "totalShare"], rows)
 
 
 class StopAfterFirstRequest:
-    quit_requested = True
-
     def __init__(self):
-        self.messages = []
+        self.calls = 0
 
-    def before_request(self):
-        return True
-
-    def after_request(self):
-        return False
-
-    def output(self, message):
-        self.messages.append(message)
+    def __call__(self):
+        self.calls += 1
+        return self.calls == 1
 
 
 def test_init_data_storage_has_no_task_state(tmp_path):
@@ -144,6 +151,29 @@ def test_init_data_storage_has_no_task_state(tmp_path):
     assert paths.daily_stock_dir.exists()
     assert paths.request_log_path.exists()
     assert not (paths.state_dir / "tasks.parquet").exists()
+
+
+def test_create_download_lock_replaces_stale_lock(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    lock_path = init_data_storage(root).lock_path
+    lock_path.write_text("12345", encoding="utf-8")
+
+    def process_does_not_exist(pid, signal):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", process_does_not_exist)
+
+    assert create_download_lock(root).read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_create_download_lock_rejects_active_lock(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    lock_path = init_data_storage(root).lock_path
+    lock_path.write_text("12345", encoding="utf-8")
+    monkeypatch.setattr(os, "kill", lambda pid, signal: None)
+
+    with pytest.raises(RuntimeError, match="download lock exists"):
+        create_download_lock(root)
 
 
 def test_build_slices_uses_existing_daily_data(tmp_path):
@@ -159,10 +189,10 @@ def test_build_slices_uses_existing_daily_data(tmp_path):
         tmp_path / "data",
     )
 
-    assert slices[["code", "start_date"]].values.tolist() == [
-        ["sh.600000", "2024-01-02"],
-        ["sh.600000", "2024-01-04"],
-        ["sz.000001", "2024-01-02"],
+    assert slices[["code", "start_date", "end_date"]].values.tolist() == [
+        ["sh.600000", "2024-01-02", "2024-01-02"],
+        ["sh.600000", "2024-01-04", "2024-01-05"],
+        ["sz.000001", "2024-01-02", "2024-01-05"],
     ]
     assert Path(slices.loc[0, "target_path"]).parent.name == "none"
 
@@ -182,7 +212,9 @@ def test_build_slices_adds_only_the_earlier_missing_range(tmp_path):
         tmp_path / "data",
     )
 
-    assert slices[["start_date", "end_date"]].values.tolist() == [["2013-01-01", "2014-01-02"]]
+    assert slices[["start_date", "end_date"]].values.tolist() == [
+        ["2013-01-01", "2014-01-01"]
+    ]
 
 
 def test_minute_slices_are_partitioned_by_year(tmp_path):
@@ -251,12 +283,28 @@ def test_update_reports_completed_stock_count(tmp_path):
 def test_run_slices_respects_request_limit_and_pause(tmp_path):
     paths = init_data_storage(tmp_path / "data")
     slices = build_download_slices(
-        "stock", "d", ["sh.600000", "sz.000001"], "2024-01-02", "2024-01-02", paths.data_root
+        "stock",
+        "d",
+        ["sh.600000", "sz.000001"],
+        "2024-01-02",
+        "2024-01-02",
+        paths.data_root,
     )
-    append_request_log(paths.request_log_path, "endpoint", "sh.600519", "d", "2024-01-02", "2024-01-02", "success", 1)
+    append_request_log(
+        paths.request_log_path,
+        "endpoint",
+        "sh.600519",
+        "d",
+        "2024-01-02",
+        "2024-01-02",
+        "success",
+        1,
+    )
 
     limited = run_download_slices(slices, paths, "d", "3", 2, FakeClient())
-    paused = run_download_slices(slices, paths, "d", "3", 10, FakeClient(), StopAfterFirstRequest())
+    paused = run_download_slices(
+        slices, paths, "d", "3", 10, FakeClient(), StopAfterFirstRequest()
+    )
 
     assert limited["status"].tolist() == ["success"]
     assert paused["status"].tolist() == ["success"]
@@ -383,7 +431,9 @@ def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
         ("sh.600000", "2022", "4"),
     ]
     profit_path = tmp_path / "data" / "raw" / "stock_profit_quarterly" / "data.parquet"
-    query_cache_path = tmp_path / "data" / "raw" / "stock_profit_quarterly" / "queries.parquet"
+    query_cache_path = (
+        tmp_path / "data" / "raw" / "stock_profit_quarterly" / "queries.parquet"
+    )
     assert len(pd.read_parquet(profit_path)) == 3
     assert pd.read_parquet(query_cache_path).values.tolist() == [
         ["sh.600000", 2022, 1],
@@ -423,9 +473,10 @@ def test_update_dividends_reports_completed_stock_count(tmp_path):
     assert progress == [(0, 2), (1, 2), (2, 2)]
 
 
-def test_update_dividends_saves_when_control_stops(tmp_path):
+def test_update_dividends_saves_when_checkpoint_stops(tmp_path):
     root = tmp_path / "data"
-    control = StopAfterFirstRequest()
+    checkpoint = StopAfterFirstRequest()
+    lock_path = init_data_storage(root).lock_path
 
     result = update_dividends(
         ["sh.600000"],
@@ -434,20 +485,48 @@ def test_update_dividends_saves_when_control_stops(tmp_path):
         root,
         10,
         client=FakeClient(),
-        control=control,
+        checkpoint=checkpoint,
     )
 
     assert result["year"].tolist() == [2022]
     assert len(pd.read_parquet(root / "raw" / "dividend" / "data.parquet")) == 1
-    assert pd.read_parquet(root / "raw" / "dividend" / "queries.parquet").values.tolist() == [
-        ["sh.600000", 2022]
-    ]
-    assert control.messages == ["Downloaded data has been saved."]
+    assert pd.read_parquet(
+        root / "raw" / "dividend" / "queries.parquet"
+    ).values.tolist() == [["sh.600000", 2022]]
+    assert not lock_path.exists()
+
+
+def test_update_profit_saves_when_checkpoint_stops(tmp_path):
+    root = tmp_path / "data"
+    checkpoint = StopAfterFirstRequest()
+    lock_path = init_data_storage(root).lock_path
+
+    result = update_profit_quarterly(
+        ["sh.600000"],
+        "2022-01-01",
+        "2022-12-31",
+        root,
+        10,
+        client=FakeClient(),
+        checkpoint=checkpoint,
+    )
+
+    assert result["quarter"].tolist() == [1]
+    assert (
+        len(pd.read_parquet(root / "raw" / "stock_profit_quarterly" / "data.parquet"))
+        == 1
+    )
+    assert pd.read_parquet(
+        root / "raw" / "stock_profit_quarterly" / "queries.parquet"
+    ).values.tolist() == [["sh.600000", 2022, 1]]
+    assert not lock_path.exists()
 
 
 def test_request_log_counts_today(tmp_path):
     log_path = tmp_path / "request_log.csv"
-    append_request_log(log_path, "endpoint", "sh.600000", "d", "2024-01-02", "2024-01-03", "success", 1)
+    append_request_log(
+        log_path, "endpoint", "sh.600000", "d", "2024-01-02", "2024-01-03", "success", 1
+    )
 
     assert request_count_today(log_path, date.today()) == 1
     assert request_count_today(log_path, "1999-01-01") == 0
@@ -462,8 +541,14 @@ def test_validate_request_limit_rejects_values_above_hard_limit():
 def test_resolve_hs300_and_all_a_codes():
     client = FakeClient()
 
-    assert resolve_baostock_codes("hs300", "2024-01-03", client) == ["sh.600000", "sz.000001"]
-    assert resolve_baostock_codes("all", "2024-01-03", client) == ["sh.600000", "sz.000001"]
+    assert resolve_baostock_codes("hs300", "2024-01-03", client) == [
+        "sh.600000",
+        "sz.000001",
+    ]
+    assert resolve_baostock_codes("all", "2024-01-03", client) == [
+        "sh.600000",
+        "sz.000001",
+    ]
 
 
 def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
@@ -473,10 +558,10 @@ def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
         "dividend",
         start="2022-02-01",
         end="2023-07-01",
-        symbols=["sh.600000"],
+        pool=["sh.600000", "sh.600000"],
         max_tasks=1,
-        _client=client,
-        _data_root=tmp_path / "data",
+        client=client,
+        data_root=tmp_path / "data",
     )
 
     assert out[["year", "status"]].values.tolist() == [[2022, "success"]]
@@ -490,19 +575,41 @@ def test_update_dataset_validates_options_before_requests(tmp_path):
         update_dataset(
             "dividend",
             start="2022-01-01",
-            symbols=["sh.600000"],
+            pool=["sh.600000"],
             adjustment="forward",
-            _client=client,
-            _data_root=tmp_path / "data",
+            client=client,
+            data_root=tmp_path / "data",
         )
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="No security codes were selected"):
         update_dataset(
             "stock_daily",
             start="2024-01-01",
-            symbols=["sh.600000"],
-            pool="all",
-            _client=client,
-            _data_root=tmp_path / "data",
+            pool=[],
+            client=client,
+            data_root=tmp_path / "data",
         )
 
     assert client.calls == []
+
+
+def test_update_index_accepts_code_pool_but_rejects_named_pool(tmp_path):
+    client = FakeClient()
+
+    out = update_dataset(
+        "index_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        pool=["sh.000300"],
+        client=client,
+        data_root=tmp_path / "data",
+    )
+
+    assert out["status"].tolist() == ["success"]
+    with pytest.raises(ValueError, match="does not support named pools"):
+        update_dataset(
+            "index_daily",
+            start="2024-01-02",
+            pool="all",
+            client=client,
+            data_root=tmp_path / "other-data",
+        )

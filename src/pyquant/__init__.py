@@ -2,7 +2,10 @@
 
 from pyquant.backtest import run_backtest
 from pyquant.data import (
+    DatasetUpdate,
+    get_dataset,
     load_dataset,
+    load_dataset_catalog,
     load_price,
     standardize_price,
     update_dataset,
@@ -13,11 +16,14 @@ from pyquant.transforms import transform_factor
 from pyquant.universe import build_universe
 
 __all__ = [
+    "DatasetUpdate",
     "build_universe",
     "calc_metrics",
     "ensure_dir",
+    "get_dataset",
     "load_config",
     "load_dataset",
+    "load_dataset_catalog",
     "load_price",
     "run_backtest",
     "save_output",

@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import os
-import select
-import sys
-import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
-from pyquant.data import _get_dataset, _load_dataset_catalog
+from pyquant.data import get_dataset, load_dataset_catalog
 
-_config = _load_dataset_catalog()
+_config = load_dataset_catalog()
 _baostock = _config["sources"]["baostock"]
 _datasets = _config["datasets"]
 
@@ -23,10 +20,25 @@ DAILY_FIELDS = _baostock["fields"]["daily"]
 MINUTE_5_FIELDS = _baostock["fields"]["minute_5"]
 SLICE_COLUMNS = ["code", "start_date", "end_date", "target_path"]
 RESULT_COLUMNS = [*SLICE_COLUMNS, "status", "row_count", "error"]
-DIVIDEND_COLUMNS = ["code", "year", "announce_date", "record_date", "operate_date", "payment_date", "cash_dividend_after_tax"]
+DIVIDEND_COLUMNS = [
+    "code",
+    "year",
+    "announce_date",
+    "record_date",
+    "operate_date",
+    "payment_date",
+    "cash_dividend_after_tax",
+]
 DIVIDEND_QUERY_COLUMNS = ["code", "year"]
 DIVIDEND_RESULT_COLUMNS = ["code", "year", "status", "row_count", "error"]
-PROFIT_COLUMNS = ["code", "year", "quarter", "publish_date", "report_date", "total_shares"]
+PROFIT_COLUMNS = [
+    "code",
+    "year",
+    "quarter",
+    "publish_date",
+    "report_date",
+    "total_shares",
+]
 PROFIT_QUERY_COLUMNS = ["code", "year", "quarter"]
 PROFIT_RESULT_COLUMNS = ["code", "year", "quarter", "status", "row_count", "error"]
 REQUEST_LOG_COLUMNS = _baostock["request_log_columns"]
@@ -116,9 +128,7 @@ def _configured_path(template: str, data_root: str | Path, **values: object) -> 
 
 
 def _dataset_path(name: str, data_root: str | Path, **values: object) -> Path:
-    return _configured_path(
-        _datasets[name]["storage"]["path"], data_root, **values
-    )
+    return _configured_path(_datasets[name]["storage"]["path"], data_root, **values)
 
 
 class BaostockClient:
@@ -137,75 +147,13 @@ class BaostockClient:
             raise RuntimeError(
                 f"BaoStock login failed: {result.error_code} {result.error_msg}"
             )
-        self.bs.common.context.default_socket.settimeout(BAOSTOCK_SOCKET_TIMEOUT_SECONDS)
+        self.bs.common.context.default_socket.settimeout(
+            BAOSTOCK_SOCKET_TIMEOUT_SECONDS
+        )
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.bs.logout()
-
-
-class StdinDownloadControl:
-    """Keyboard control using p=pause, c=continue, q=quit between requests."""
-
-    def __init__(
-        self,
-        pause_key: str = "p",
-        resume_key: str = "c",
-        quit_key: str = "q",
-        poll_timeout: float = 0.0,
-        sleep_seconds: float = 0.2,
-        output: Callable[[str], None] = print,
-    ) -> None:
-        self.pause_key = pause_key
-        self.resume_key = resume_key
-        self.quit_key = quit_key
-        self.poll_timeout = poll_timeout
-        self.sleep_seconds = sleep_seconds
-        self.output = output
-        self.paused = False
-        self.quit_requested = False
-
-    def before_request(self) -> bool:
-        return self._handle_command(block_when_paused=True)
-
-    def after_request(self) -> bool:
-        return self._handle_command(block_when_paused=False)
-
-    def _handle_command(
-        self,
-        block_when_paused: bool,
-    ) -> bool:
-        command = self._read_command(block=False)
-        if command == self.pause_key:
-            self.paused = True
-            self.output(f"Paused. Press '{self.resume_key}' to resume or '{self.quit_key}' to quit.")
-        if command == self.quit_key:
-            self.quit_requested = True
-            self.output("Quit requested. Saving downloaded data.")
-            return False
-
-        while self.paused and block_when_paused:
-            command = self._read_command(block=True)
-            if command == self.resume_key:
-                self.paused = False
-                self.output("Resumed.")
-                return True
-            if command == self.quit_key:
-                self.quit_requested = True
-                self.output("Quit requested. Saving downloaded data.")
-                return False
-            time.sleep(self.sleep_seconds)
-        return True
-
-    def _read_command(self, block: bool) -> str | None:
-        if block:
-            line = sys.stdin.readline()
-            return line.strip()[:1] if line else None
-        ready, _, _ = select.select([sys.stdin], [], [], self.poll_timeout)
-        if not ready:
-            return None
-        line = sys.stdin.readline()
-        return line.strip()[:1] if line else None
 
 
 def init_data_storage(data_root: str | Path = "data") -> DataPaths:
@@ -355,7 +303,10 @@ def missing_baostock_ranges(
     requested_end = pd.Timestamp(end_date)
     ranges = []
     if requested_start < first_date:
-        ranges.append((start_date, min(requested_end, first_date).strftime("%Y-%m-%d")))
+        previous_date = first_date - pd.Timedelta(days=1)
+        ranges.append(
+            (start_date, min(requested_end, previous_date).strftime("%Y-%m-%d"))
+        )
     next_date = last_date + pd.Timedelta(days=1)
     if next_date <= requested_end:
         ranges.append((max(requested_start, next_date).strftime("%Y-%m-%d"), end_date))
@@ -394,7 +345,9 @@ def reset_request_log(
 ) -> None:
     path = Path(request_log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    today_str = (today or date.today()).isoformat() if not isinstance(today, str) else today
+    today_str = (
+        (today or date.today()).isoformat() if not isinstance(today, str) else today
+    )
     if not path.exists():
         pd.DataFrame(columns=REQUEST_LOG_COLUMNS).to_csv(path, index=False)
         return
@@ -446,7 +399,21 @@ def append_request_log(
 def create_download_lock(data_root: str | Path = "data") -> Path:
     paths = init_data_storage(data_root)
     if paths.lock_path.exists():
-        raise RuntimeError(f"BaoStock download lock exists: {paths.lock_path}")
+        message = f"BaoStock download lock exists: {paths.lock_path}"
+        try:
+            owner_pid = int(paths.lock_path.read_text(encoding="utf-8"))
+        except ValueError:
+            raise RuntimeError(message) from None
+        if owner_pid <= 0:
+            raise RuntimeError(message)
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            paths.lock_path.unlink()
+        except PermissionError:
+            raise RuntimeError(message) from None
+        else:
+            raise RuntimeError(message)
     paths.lock_path.write_text(str(os.getpid()), encoding="utf-8")
     return paths.lock_path
 
@@ -477,16 +444,26 @@ def build_download_slices(
                 for first, last in missing_baostock_ranges(target, start_date, end_date)
             )
         elif dataset == "stock" and frequency == "5":
-            for year in range(pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1):
-                first = max(pd.Timestamp(start_date), pd.Timestamp(f"{year}-01-01")).strftime("%Y-%m-%d")
-                last = min(pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")).strftime("%Y-%m-%d")
+            for year in range(
+                pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1
+            ):
+                first = max(
+                    pd.Timestamp(start_date), pd.Timestamp(f"{year}-01-01")
+                ).strftime("%Y-%m-%d")
+                last = min(
+                    pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")
+                ).strftime("%Y-%m-%d")
                 target = minute_5_target_path(code, year, data_root, adjustment)
                 rows.extend(
                     (code, range_start, range_end, str(target))
-                    for range_start, range_end in missing_baostock_ranges(target, first, last)
+                    for range_start, range_end in missing_baostock_ranges(
+                        target, first, last
+                    )
                 )
         else:
-            raise ValueError(f"Unsupported BaoStock dataset/frequency: {dataset}/{frequency}")
+            raise ValueError(
+                f"Unsupported BaoStock dataset/frequency: {dataset}/{frequency}"
+            )
     return pd.DataFrame(rows, columns=SLICE_COLUMNS)
 
 
@@ -496,7 +473,9 @@ def merge_history_data(data: pd.DataFrame, target_path: str | Path) -> pd.DataFr
         return data
     out = pd.concat([pd.read_parquet(path), data], ignore_index=True)
     keys = ["date"] + (["time"] if "time" in out else [])
-    return out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
+    return (
+        out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
+    )
 
 
 def update_dividends(
@@ -506,7 +485,7 @@ def update_dividends(
     data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
-    control: StdinDownloadControl | None = None,
+    checkpoint: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
@@ -530,8 +509,7 @@ def update_dividends(
     pending_queries = []
     remaining = {
         code: sum(
-            (code, year) not in queried
-            for year in range(start_year, end_year + 1)
+            (code, year) not in queried for year in range(start_year, end_year + 1)
         )
         for code in codes
     }
@@ -548,7 +526,7 @@ def update_dividends(
                     return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
                 if request_count_today(paths.request_log_path) >= effective_limit:
                     return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
-                if control is not None and not control.before_request():
+                if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
                 try:
                     data = query_baostock_dividends(code, year, active_client)
@@ -587,17 +565,26 @@ def update_dividends(
                         str(exc),
                     )
                     results.append((code, year, "failed", 0, str(exc)))
-                if control is not None and not control.after_request():
+                if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=DIVIDEND_RESULT_COLUMNS)
             if pending_dividends:
                 new_data = pd.concat(pending_dividends, ignore_index=True)
-                dividends = new_data if dividends is None else pd.concat([dividends, new_data])
-                dividends = dividends.drop_duplicates().sort_values(["code", "year"]).reset_index(drop=True)
+                dividends = (
+                    new_data if dividends is None else pd.concat([dividends, new_data])
+                )
+                dividends = (
+                    dividends.drop_duplicates()
+                    .sort_values(["code", "year"])
+                    .reset_index(drop=True)
+                )
                 atomic_write_parquet(dividends, dividend_path, overwrite=True)
                 pending_dividends.clear()
             if pending_queries:
                 query_cache = pd.concat(
-                    [query_cache, pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS)],
+                    [
+                        query_cache,
+                        pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS),
+                    ],
                     ignore_index=True,
                 ).drop_duplicates()
                 atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
@@ -606,17 +593,24 @@ def update_dividends(
     finally:
         if pending_dividends:
             new_data = pd.concat(pending_dividends, ignore_index=True)
-            dividends = new_data if dividends is None else pd.concat([dividends, new_data])
-            dividends = dividends.drop_duplicates().sort_values(["code", "year"]).reset_index(drop=True)
+            dividends = (
+                new_data if dividends is None else pd.concat([dividends, new_data])
+            )
+            dividends = (
+                dividends.drop_duplicates()
+                .sort_values(["code", "year"])
+                .reset_index(drop=True)
+            )
             atomic_write_parquet(dividends, dividend_path, overwrite=True)
         if pending_queries:
             query_cache = pd.concat(
-                [query_cache, pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS)],
+                [
+                    query_cache,
+                    pd.DataFrame(pending_queries, columns=DIVIDEND_QUERY_COLUMNS),
+                ],
                 ignore_index=True,
             ).drop_duplicates()
             atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-        if getattr(control, "quit_requested", False):
-            control.output("Downloaded data has been saved.")
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
@@ -629,7 +623,7 @@ def update_profit_quarterly(
     data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
-    control: StdinDownloadControl | None = None,
+    checkpoint: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
@@ -657,7 +651,10 @@ def update_profit_quarterly(
         (period.year, period.quarter)
         for period in pd.period_range(start_date, end_date, freq="Q")
     ]
-    remaining = {code: sum((code, *period) not in queried for period in periods) for code in codes}
+    remaining = {
+        code: sum((code, *period) not in queried for period in periods)
+        for code in codes
+    }
     completed = sum(count == 0 for count in remaining.values())
     if progress is not None:
         progress(completed, len(codes))
@@ -671,7 +668,7 @@ def update_profit_quarterly(
                     return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
                 if request_count_today(paths.request_log_path) >= effective_limit:
                     return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
-                if control is not None and not control.before_request():
+                if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
                 try:
                     data = clean_baostock_profit(
@@ -714,18 +711,27 @@ def update_profit_quarterly(
                         str(exc),
                     )
                     results.append((code, year, quarter, "failed", 0, str(exc)))
-                if control is not None and not control.after_request():
+                if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=PROFIT_RESULT_COLUMNS)
             if pending_profits:
                 new_data = pd.concat(pending_profits, ignore_index=True)
-                profits = new_data if profits is None else pd.concat([profits, new_data])
-                profits = profits.drop_duplicates(["code", "year", "quarter"], keep="last")
-                profits = profits.sort_values(["code", "year", "quarter"]).reset_index(drop=True)
+                profits = (
+                    new_data if profits is None else pd.concat([profits, new_data])
+                )
+                profits = profits.drop_duplicates(
+                    ["code", "year", "quarter"], keep="last"
+                )
+                profits = profits.sort_values(["code", "year", "quarter"]).reset_index(
+                    drop=True
+                )
                 atomic_write_parquet(profits, profit_path, overwrite=True)
                 pending_profits.clear()
             if pending_queries:
                 query_cache = pd.concat(
-                    [query_cache, pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS)],
+                    [
+                        query_cache,
+                        pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS),
+                    ],
                     ignore_index=True,
                 ).drop_duplicates()
                 atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
@@ -736,16 +742,19 @@ def update_profit_quarterly(
             new_data = pd.concat(pending_profits, ignore_index=True)
             profits = new_data if profits is None else pd.concat([profits, new_data])
             profits = profits.drop_duplicates(["code", "year", "quarter"], keep="last")
-            profits = profits.sort_values(["code", "year", "quarter"]).reset_index(drop=True)
+            profits = profits.sort_values(["code", "year", "quarter"]).reset_index(
+                drop=True
+            )
             atomic_write_parquet(profits, profit_path, overwrite=True)
         if pending_queries:
             query_cache = pd.concat(
-                [query_cache, pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS)],
+                [
+                    query_cache,
+                    pd.DataFrame(pending_queries, columns=PROFIT_QUERY_COLUMNS),
+                ],
                 ignore_index=True,
             ).drop_duplicates()
             atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-        if getattr(control, "quit_requested", False):
-            control.output("Downloaded data has been saved.")
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
@@ -761,7 +770,7 @@ def update_history_dataset(
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     adjustflag: str | None = None,
     client: Any | None = None,
-    control: StdinDownloadControl | None = None,
+    checkpoint: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
@@ -782,7 +791,7 @@ def update_history_dataset(
             baostock_adjustflag(adjustflag),
             max_requests_per_day,
             client,
-            control,
+            checkpoint,
             total_codes=len(codes),
             progress=progress,
         )
@@ -797,7 +806,7 @@ def run_download_slices(
     adjustflag: str,
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     client: Any | None = None,
-    control: StdinDownloadControl | None = None,
+    checkpoint: Callable[[], bool] | None = None,
     total_codes: int | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
@@ -817,7 +826,7 @@ def run_download_slices(
         for item in slices.itertuples(index=False):
             if request_count_today(paths.request_log_path) >= effective_limit:
                 break
-            if control is not None and not control.before_request():
+            if checkpoint is not None and not checkpoint():
                 break
             try:
                 data = query_baostock_history(
@@ -861,7 +870,7 @@ def run_download_slices(
                     str(exc),
                 )
                 results.append((*item, "failed", 0, str(exc)))
-            if control is not None and not control.after_request():
+            if checkpoint is not None and not checkpoint():
                 break
         return pd.DataFrame(results, columns=RESULT_COLUMNS)
     finally:
@@ -885,63 +894,71 @@ def update_dataset(
     name: str,
     *,
     start: str,
+    pool: str | Iterable[str],
     end: str | None = None,
-    symbols: Collection[str] | None = None,
-    pool: str | None = None,
     pool_date: str | None = None,
     adjustment: str | None = None,
     max_tasks: int | None = None,
-    _client: Any | None = None,
-    _control: StdinDownloadControl | None = None,
-    _progress: Callable[[int, int], None] | None = None,
-    _data_root: str | Path = "data",
+    client: Any | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    data_root: str | Path = "data",
 ) -> pd.DataFrame:
     """Update a named catalog dataset through its current source."""
-    catalog = _load_dataset_catalog()
-    dataset = _get_dataset(catalog, name)
+    catalog = load_dataset_catalog()
+    dataset = get_dataset(catalog, name)
     update = dataset.get("update")
     if update is None:
         raise ValueError(f"Dataset {name!r} is read-only")
     if dataset["source"] != "baostock":
-        raise ValueError(f"Dataset {name!r} has unsupported source {dataset['source']!r}")
+        raise ValueError(
+            f"Dataset {name!r} has unsupported source {dataset['source']!r}"
+        )
     end_date = end or date.today().isoformat()
     if pd.Timestamp(start) > pd.Timestamp(end_date):
         raise ValueError("start must not be after end")
-    if (symbols is None) == (pool is None):
-        raise ValueError("Provide exactly one of symbols or pool")
-    if pool is not None and not update["pool"]:
-        raise ValueError(f"Dataset {name!r} does not support pool selection")
+    if isinstance(pool, str) and not update["pool"]:
+        raise ValueError(f"Dataset {name!r} does not support named pools")
     if adjustment is not None and not update["adjustment"]:
         raise ValueError(f"Dataset {name!r} does not support adjustment")
     if max_tasks is not None and max_tasks <= 0:
         raise ValueError("max_tasks must be positive")
+    if checkpoint is not None and not checkpoint():
+        columns = {
+            "history": RESULT_COLUMNS,
+            "dividend": DIVIDEND_RESULT_COLUMNS,
+            "profit_quarterly": PROFIT_RESULT_COLUMNS,
+        }[update["kind"]]
+        return pd.DataFrame(columns=columns)
 
-    context = None if _client is not None else BaostockClient()
-    client = _client if _client is not None else context.__enter__()
+    context = None if client is not None else BaostockClient()
+    client = client if client is not None else context.__enter__()
     try:
         codes = (
-            [str(symbol) for symbol in symbols]
-            if symbols is not None
-            else resolve_baostock_codes(pool, pool_date or end_date, client)
+            resolve_baostock_codes(pool, pool_date or end_date, client)
+            if isinstance(pool, str)
+            else list(dict.fromkeys(str(symbol) for symbol in pool))
         )
         if not codes:
-            raise ValueError("No symbols were selected")
-        common = {
-            "data_root": _data_root,
-            "max_requests_per_day": BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
-            "client": client,
-            "control": _control,
-            "progress": _progress,
-            "max_tasks": max_tasks,
-        }
+            raise ValueError("No security codes were selected")
+        common = {"client": client}
+        if Path(data_root) != Path("data"):
+            common["data_root"] = data_root
+        if checkpoint is not None:
+            common["checkpoint"] = checkpoint
+        if progress is not None:
+            common["progress"] = progress
+        if max_tasks is not None:
+            common["max_tasks"] = max_tasks
         if update["kind"] == "history":
+            if adjustment is not None:
+                common["adjustflag"] = adjustment
             return update_history_dataset(
                 update["target"],
                 update["frequency"],
                 codes,
                 start,
                 end_date,
-                adjustflag=adjustment,
                 **common,
             )
         if update["kind"] == "dividend":
@@ -953,14 +970,16 @@ def update_dataset(
             )
         if update["kind"] == "profit_quarterly":
             return update_profit_quarterly(codes, start, end_date, **common)
-        raise ValueError(f"Dataset {name!r} has unsupported update kind {update['kind']!r}")
+        raise ValueError(
+            f"Dataset {name!r} has unsupported update kind {update['kind']!r}"
+        )
     finally:
         if context is not None:
             context.__exit__(None, None, None)
 
 
 def resolve_baostock_codes(
-    pool: str | None,
+    pool: str,
     trade_date: str,
     client: Any,
 ) -> list[str]:
@@ -968,7 +987,9 @@ def resolve_baostock_codes(
     if pool == "all":
         data = baostock_result_to_frame(client.bs.query_stock_basic())
         if not {"code", "type"}.issubset(data.columns):
-            raise ValueError(f"BaoStock stock-basic result has unexpected columns: {list(data.columns)}")
+            raise ValueError(
+                f"BaoStock stock-basic result has unexpected columns: {list(data.columns)}"
+            )
         return (
             data.loc[data["type"].astype(str) == "1", "code"]
             .dropna()
@@ -987,11 +1008,17 @@ def resolve_baostock_codes(
         )
     )
     if not {"calendar_date", "is_trading_day"}.issubset(calendar.columns):
-        raise ValueError(f"BaoStock trade calendar has unexpected columns: {list(calendar.columns)}")
-    for day in calendar.loc[calendar["is_trading_day"].astype(str) == "1", "calendar_date"].iloc[::-1]:
+        raise ValueError(
+            f"BaoStock trade calendar has unexpected columns: {list(calendar.columns)}"
+        )
+    for day in calendar.loc[
+        calendar["is_trading_day"].astype(str) == "1", "calendar_date"
+    ].iloc[::-1]:
         data = baostock_result_to_frame(query(str(day)))
         if "code" not in data.columns:
-            raise ValueError(f"BaoStock pool result has no code column: {list(data.columns)}")
+            raise ValueError(
+                f"BaoStock pool result has no code column: {list(data.columns)}"
+            )
         codes = data["code"].dropna().astype(str).drop_duplicates().tolist()
         if codes:
             return codes
@@ -1000,7 +1027,9 @@ def resolve_baostock_codes(
 
 def baostock_result_to_frame(result: Any) -> pd.DataFrame:
     if getattr(result, "error_code", "0") != "0":
-        raise RuntimeError(f"BaoStock query failed: {result.error_code} {result.error_msg}")
+        raise RuntimeError(
+            f"BaoStock query failed: {result.error_code} {result.error_msg}"
+        )
     rows = []
     while result.next():
         rows.append(result.get_row_data())

@@ -70,34 +70,59 @@ shares = load_dataset(
 
 ## 更新数据
 
-所有下载使用统一的数据集命令：
+在 notebook 中调用统一的数据集更新接口：
 
-```bash
-pyquant data-update stock_daily \
-  --pool all \
-  --start-date 2024-01-02 \
-  --end-date 2024-01-03 \
-  --adjustment none
+```python
+from pyquant import update_dataset
+
+job = update_dataset(
+    "stock_daily",
+    start="2024-01-02",
+    end="2024-01-03",
+    pool="all",
+    adjustment="none",
+)
 ```
 
-也可以显式指定证券：
+`update_dataset()` 会立即返回后台任务，notebook 可以继续执行其他单元格。任务状态和
+股票下载进度会在启动单元格中自动覆盖同一行显示，例如 `Updated 120/5231`。状态也可
+直接读取：
 
-```bash
-pyquant data-update index_daily \
-  --symbols sh.000300 \
-  --start-date 2024-01-02 \
-  --end-date 2024-01-03
+```python
+job.state
+job.completed, job.total
 ```
 
-分红和季度总股本同样使用日期范围：
+下载任务支持暂停、继续和正常停止：
 
-```bash
-pyquant data-update dividend --pool all --start-date 2021-01-01
-pyquant data-update stock_profit_quarterly --pool all --start-date 2021-01-01
+```python
+job.pause()
+job.resume()
+job.stop()
+result = job.wait()
 ```
 
-`--end-date` 默认使用当天。`--pool` 支持 `all`、`sz50`、`hs300`、`zz500`，并与
-`--symbols` 二选一。`--max-tasks` 可限制本次最多执行的远端请求任务数。
+`stop()` 会在当前网络请求结束后停止，并执行待写数据保存、下载锁清理和数据源登出；
+它不会强制杀死线程。`wait()` 等待任务结束并返回本次结果，后台下载失败时会重新抛出
+原异常。强制终止 notebook 内核无法保证尚在内存中的数据保存。
 
-下载过程中可使用 `p` 暂停、`c` 继续、`q` 保存并退出。下载器根据已有 parquet 的日期
-范围补齐缺口，并通过查询记录区分“空结果”和“尚未查询”。
+也可以显式指定证券，分红和季度总股本同样使用日期范围：
+
+```python
+index_job = update_dataset(
+    "index_daily",
+    start="2024-01-02",
+    pool=["sh.000300"],
+)
+dividend_job = update_dataset("dividend", start="2021-01-01", pool="all")
+shares_job = update_dataset(
+    "stock_profit_quarterly",
+    start="2021-01-01",
+    pool="all",
+)
+```
+
+`end` 默认使用当天。`pool` 可以是 `all`、`sz50`、`hs300`、`zz500`，也可以是
+BaoStock 证券代码的可迭代对象。代码列表会去重并保持原顺序，适合逐级筛选后只更新剩余
+证券。`max_tasks` 可限制本次最多执行的远端请求任务数。下载器根据每只证券已有 parquet
+的日期范围分别补齐前向和后向缺口，并通过查询记录区分“空结果”和“尚未查询”。
