@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection
+from contextvars import copy_context
 from glob import glob
 from pathlib import Path
 from threading import Condition, Thread
@@ -14,6 +15,7 @@ from pyquant.io import load_config
 
 
 DEFAULT_DATASET_CATALOG = Path(__file__).parents[2] / "configs/datasets.yaml"
+DATASET_CATALOG = load_config(DEFAULT_DATASET_CATALOG)
 PRICE_COLUMNS = ["date", "symbol", "open", "high", "low", "close", "volume", "amount"]
 DEFAULT_PRICE_FIELD_MAP = {
     "trade_date": "date",
@@ -43,7 +45,7 @@ class DatasetUpdate:
         self._progress_printed = False
         self._progress_handle: Any | None = None
         self._error: Exception | None = None
-        self._result: pd.DataFrame | None = None
+        self._result: pd.DataFrame
         try:
             from IPython import get_ipython
             from IPython.display import DisplayHandle
@@ -53,7 +55,8 @@ class DatasetUpdate:
             if get_ipython() is not None:
                 self._progress_handle = DisplayHandle()
                 self._progress_handle.display({"text/plain": "Updated 0/0"}, raw=True)
-        self._thread = Thread(target=self._run, args=(worker,))
+        context = copy_context()
+        self._thread = Thread(target=context.run, args=(self._run, worker))
         self._thread.start()
 
     @property
@@ -102,8 +105,6 @@ class DatasetUpdate:
         with self._condition:
             if self._error is not None:
                 raise self._error
-            if self._result is None:
-                raise RuntimeError("Dataset update finished without a result")
             return self._result
 
     def _run(
@@ -158,13 +159,15 @@ def load_dataset(
     adjustment: str | None = None,
 ) -> pd.DataFrame:
     """Load a catalog dataset with canonical columns."""
-    catalog = load_dataset_catalog()
-    dataset = get_dataset(catalog, name)
+    dataset = get_dataset(name)
     storage = dataset["storage"]
     kind = storage["kind"]
     if kind != "table" and (start is None or end is None):
         raise ValueError(f"Dataset {name!r} requires explicit start and end dates")
-    start_at, end_at = _validate_date_range(start, end)
+    start_at = pd.Timestamp(start) if start is not None else None
+    end_at = pd.Timestamp(end) if end is not None else None
+    if start_at is not None and end_at is not None and start_at > end_at:
+        raise ValueError("start must not be after end")
     adjustment_name = adjustment or "none"
     if "{adjustment}" not in storage["path"] and adjustment is not None:
         raise ValueError(f"Dataset {name!r} does not support adjustment")
@@ -193,38 +196,24 @@ def update_dataset(
     name: str,
     *,
     start: str,
-    pool: str | Iterable[str],
     end: str | None = None,
+    pool: str | Collection[str],
     pool_date: str | None = None,
     adjustment: str | None = None,
     max_tasks: int | None = None,
 ) -> DatasetUpdate:
-    """Start a background update for a named pool or security-code iterable."""
-    if not isinstance(pool, str):
-        pool = tuple(dict.fromkeys(str(symbol) for symbol in pool))
-        if not pool:
-            raise ValueError("pool must contain at least one security code")
-    options: dict[str, Any] = {"start": start, "pool": pool}
-    for key, value in {
-        "end": end,
-        "pool_date": pool_date,
-        "adjustment": adjustment,
-        "max_tasks": max_tasks,
-    }.items():
-        if value is not None:
-            options[key] = value
+    """Start a background update for a named pool or security-code collection."""
+    parameters = locals()
+    from pyquant._data_update import update_dataset as update_source_dataset
 
     def run(
         checkpoint: Callable[[], bool],
         progress: Callable[[int, int], None],
     ) -> pd.DataFrame:
-        from pyquant._data_update import update_dataset as update_source_dataset
-
         return update_source_dataset(
-            name,
+            **parameters,
             checkpoint=checkpoint,
             progress=progress,
-            **options,
         )
 
     return DatasetUpdate(run)
@@ -264,38 +253,13 @@ def standardize_price(
     return out[ordered + extras].sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
-def load_dataset_catalog(
-    path: str | Path = DEFAULT_DATASET_CATALOG,
-) -> dict[str, Any]:
-    """Load and validate the dataset catalog."""
-    catalog = load_config(path)
-    if catalog.get("version") != 1 or not isinstance(catalog.get("datasets"), dict):
-        raise ValueError("Invalid dataset catalog")
-    return catalog
-
-
-def get_dataset(catalog: dict[str, Any], name: str) -> dict[str, Any]:
-    """Return and validate one dataset definition from a catalog."""
+def get_dataset(name: str) -> dict[str, Any]:
+    """Return one built-in dataset definition by name."""
     try:
-        dataset = catalog["datasets"][name]
+        return DATASET_CATALOG["datasets"][name]
     except KeyError as exc:
-        available = ", ".join(sorted(catalog["datasets"]))
+        available = ", ".join(sorted(DATASET_CATALOG["datasets"]))
         raise ValueError(f"Unknown dataset {name!r}; available: {available}") from exc
-    required = {"source", "storage", "columns", "required", "field_map"}
-    missing = sorted(required - set(dataset))
-    if missing:
-        raise ValueError(f"Dataset {name!r} catalog entry missing keys: {missing}")
-    return dataset
-
-
-def _validate_date_range(
-    start: str | None, end: str | None
-) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    start_at = pd.Timestamp(start) if start is not None else None
-    end_at = pd.Timestamp(end) if end is not None else None
-    if start_at is not None and end_at is not None and start_at > end_at:
-        raise ValueError("start must not be after end")
-    return start_at, end_at
 
 
 def _dataset_paths(

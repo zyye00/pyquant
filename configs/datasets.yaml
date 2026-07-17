@@ -23,10 +23,22 @@ sources:
       "2": forward
       "3": none
     fields:
-      daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
-      minute_5: [date, time, code, open, high, low, close, volume, amount, adjustflag]
-    float32_columns: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
-    request_log_columns: [date, time, endpoint, code, frequency, start_date, end_date, status, rows, error_code, error_msg]
+      history:
+        daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
+        minute_5: [date, time, code, open, high, low, close, volume, amount, adjustflag]
+        float32: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
+        result: [code, start_date, end_date, target_path, status, row_count, error]
+      dividend:
+        data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+        query: [code, year]
+        result: [code, year, status, row_count, error]
+        float32: [cash_dividend_after_tax]
+      profit_quarterly:
+        data: [code, year, quarter, publish_date, report_date, total_shares]
+        query: [code, year, quarter]
+        result: [code, year, quarter, status, row_count, error]
+        numeric: [total_shares]
+      request_log: [date, time, endpoint, code, frequency, start_date, end_date, status, error_code, error_msg]
 
 datasets:
   stock_daily:

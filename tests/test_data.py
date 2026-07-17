@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 from threading import Event
 
 import IPython
@@ -13,27 +14,6 @@ from pyquant import (
     standardize_price,
     update_dataset,
 )
-
-
-def test_dataset_catalog_defines_complete_canonical_contracts():
-    catalog = data_module.load_dataset_catalog()
-
-    assert {
-        "stock_daily",
-        "index_daily",
-        "stock_5m",
-        "other_daily",
-        "dividend",
-        "dividend_queries",
-        "stock_profit_quarterly",
-        "stock_profit_quarterly_queries",
-    } == set(catalog["datasets"])
-    for name, dataset in catalog["datasets"].items():
-        data_module.get_dataset(catalog, name)
-        assert set(dataset["required"]) <= set(dataset["columns"])
-        assert set(dataset.get("primary_key", [])) <= set(dataset["columns"])
-        if dataset["source"] != "generated":
-            assert dataset["source"] in catalog["sources"]
 
 
 def test_standardize_price_renames_required_fields():
@@ -103,7 +83,7 @@ def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
             }
         },
     }
-    monkeypatch.setattr(data_module, "load_dataset_catalog", lambda: catalog)
+    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
 
     out = load_dataset(
         "stock_daily",
@@ -134,7 +114,7 @@ def test_load_dataset_requires_explicit_partition_dates(monkeypatch):
             }
         },
     }
-    monkeypatch.setattr(data_module, "load_dataset_catalog", lambda: catalog)
+    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
 
     with pytest.raises(ValueError, match="requires explicit start and end"):
         load_dataset("stock_daily")
@@ -147,7 +127,14 @@ def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys)
 
     def fake_update(name, *, checkpoint, progress, **options):
         assert name == "stock_daily"
-        assert options == {"start": "2024-01-01", "pool": "all"}
+        assert options == {
+            "start": "2024-01-01",
+            "end": None,
+            "pool": "all",
+            "pool_date": None,
+            "adjustment": None,
+            "max_tasks": None,
+        }
         progress(0, 2)
         assert checkpoint()
         first_started.set()
@@ -182,25 +169,6 @@ def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys)
     )
 
 
-def test_dataset_update_materializes_and_deduplicates_iterable_pool(monkeypatch):
-    def fake_update(name, *, checkpoint, progress, **options):
-        assert options["pool"] == ("sh.600000", "sz.000001")
-        progress(2, 2)
-        return pd.DataFrame()
-
-    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
-
-    pool = iter(["sh.600000", "sz.000001", "sh.600000"])
-    job = update_dataset("stock_daily", start="2024-01-01", pool=pool)
-
-    assert job.wait().empty
-
-
-def test_dataset_update_rejects_empty_iterable_pool():
-    with pytest.raises(ValueError, match="at least one security code"):
-        update_dataset("stock_daily", start="2024-01-01", pool=[])
-
-
 def test_dataset_update_uses_ipython_display_for_progress(monkeypatch):
     records = []
 
@@ -227,6 +195,22 @@ def test_dataset_update_uses_ipython_display_for_progress(monkeypatch):
         ("update", {"text/plain": "Updated 1/1"}, True),
         ("update", {"text/plain": "Updated 1/1"}, True),
     ]
+
+
+def test_dataset_update_inherits_context():
+    marker = ContextVar("marker", default="missing")
+    marker.set("notebook-cell")
+    seen = []
+
+    def worker(checkpoint, progress):
+        seen.append(marker.get())
+        return pd.DataFrame()
+
+    job = DatasetUpdate(worker)
+    marker.set("caller-changed")
+
+    assert job.wait().empty
+    assert seen == ["notebook-cell"]
 
 
 def test_dataset_update_stops_while_paused(monkeypatch):

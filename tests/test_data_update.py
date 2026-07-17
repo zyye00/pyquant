@@ -14,7 +14,6 @@ from pyquant._data_update import (
     BaostockClient,
     append_request_log,
     atomic_write_parquet,
-    build_download_slices,
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
@@ -24,7 +23,6 @@ from pyquant._data_update import (
     minute_5_target_path,
     request_count_today,
     resolve_baostock_codes,
-    run_download_slices,
     update_dividends,
     update_dataset,
     update_history_dataset,
@@ -176,59 +174,67 @@ def test_create_download_lock_rejects_active_lock(tmp_path, monkeypatch):
         create_download_lock(root)
 
 
-def test_build_slices_uses_existing_daily_data(tmp_path):
+def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_path):
     target = daily_target_path("sh.600000", "stock", tmp_path / "data")
     atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    progress = []
 
-    slices = build_download_slices(
+    result = update_history_dataset(
         "stock",
         "d",
-        ["sh.600000", "sz.000001"],
+        ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
         tmp_path / "data",
+        10,
+        client=FakeClient(),
+        progress=lambda completed, total: progress.append((completed, total)),
     )
 
-    assert slices[["code", "start_date", "end_date"]].values.tolist() == [
+    assert result[["code", "start_date", "end_date"]].values.tolist() == [
         ["sh.600000", "2024-01-02", "2024-01-02"],
         ["sh.600000", "2024-01-04", "2024-01-05"],
-        ["sz.000001", "2024-01-02", "2024-01-05"],
     ]
-    assert Path(slices.loc[0, "target_path"]).parent.name == "none"
+    assert Path(result.loc[0, "target_path"]).parent.name == "none"
+    assert progress == [(0, 1), (1, 1)]
 
 
-def test_build_slices_adds_only_the_earlier_missing_range(tmp_path):
+def test_update_adds_only_the_earlier_missing_range(tmp_path):
     target = daily_target_path("sh.600000", "stock", tmp_path / "data")
     atomic_write_parquet(
         pd.DataFrame({"date": [date(2014, 1, 2), date(2014, 1, 3)]}), target
     )
 
-    slices = build_download_slices(
+    result = update_history_dataset(
         "stock",
         "d",
         ["sh.600000"],
         "2013-01-01",
         "2014-01-03",
         tmp_path / "data",
+        10,
+        client=FakeClient(),
     )
 
-    assert slices[["start_date", "end_date"]].values.tolist() == [
+    assert result[["start_date", "end_date"]].values.tolist() == [
         ["2013-01-01", "2014-01-01"]
     ]
 
 
-def test_minute_slices_are_partitioned_by_year(tmp_path):
-    slices = build_download_slices(
+def test_minute_updates_are_partitioned_by_year(tmp_path):
+    result = update_history_dataset(
         "stock",
         "5",
         ["sh.600000"],
         "2023-12-29",
         "2024-01-03",
         tmp_path / "data",
+        10,
         "forward",
+        client=FakeClient(),
     )
 
-    assert slices["target_path"].tolist() == [
+    assert result["target_path"].tolist() == [
         str(minute_5_target_path("sh.600000", 2023, tmp_path / "data", "forward")),
         str(minute_5_target_path("sh.600000", 2024, tmp_path / "data", "forward")),
     ]
@@ -264,6 +270,9 @@ def test_update_merges_data_and_skips_covered_range(tmp_path):
 
 def test_update_reports_completed_stock_count(tmp_path):
     progress = []
+    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
+    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 2)]}), target)
+    client = FakeClient()
 
     update_history_dataset(
         "stock",
@@ -273,23 +282,17 @@ def test_update_reports_completed_stock_count(tmp_path):
         "2024-01-02",
         tmp_path / "data",
         10,
-        client=FakeClient(),
+        client=client,
         progress=lambda completed, total: progress.append((completed, total)),
     )
 
     assert progress == [(0, 2), (1, 2), (2, 2)]
+    assert [call[0] for call in client.calls] == ["sz.000001"]
 
 
-def test_run_slices_respects_request_limit_and_pause(tmp_path):
+def test_update_respects_request_limit_without_completing_next_stock(tmp_path):
     paths = init_data_storage(tmp_path / "data")
-    slices = build_download_slices(
-        "stock",
-        "d",
-        ["sh.600000", "sz.000001"],
-        "2024-01-02",
-        "2024-01-02",
-        paths.data_root,
-    )
+    progress = []
     append_request_log(
         paths.request_log_path,
         "endpoint",
@@ -298,17 +301,93 @@ def test_run_slices_respects_request_limit_and_pause(tmp_path):
         "2024-01-02",
         "2024-01-02",
         "success",
-        1,
     )
 
-    limited = run_download_slices(slices, paths, "d", "3", 2, FakeClient())
-    paused = run_download_slices(
-        slices, paths, "d", "3", 10, FakeClient(), StopAfterFirstRequest()
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000", "sz.000001"],
+        "2024-01-02",
+        "2024-01-02",
+        paths.data_root,
+        2,
+        client=FakeClient(),
+        progress=lambda completed, total: progress.append((completed, total)),
     )
 
-    assert limited["status"].tolist() == ["success"]
-    assert paused["status"].tolist() == ["success"]
-    assert request_count_today(paths.request_log_path) == 3
+    assert result["code"].tolist() == ["sh.600000"]
+    assert progress == [(0, 2), (1, 2)]
+    assert request_count_today(paths.request_log_path) == 2
+
+
+def test_update_does_not_complete_partially_updated_stock(tmp_path):
+    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
+    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    progress = []
+
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-05",
+        tmp_path / "data",
+        10,
+        client=FakeClient(),
+        progress=lambda completed, total: progress.append((completed, total)),
+        max_tasks=1,
+    )
+
+    assert len(result) == 1
+    assert progress == [(0, 1)]
+
+
+def test_update_does_not_complete_failed_stock(tmp_path, monkeypatch):
+    progress = []
+
+    def fail(*args):
+        raise RuntimeError("source failed")
+
+    monkeypatch.setattr("pyquant._data_update.query_baostock_history", fail)
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-02",
+        tmp_path / "data",
+        10,
+        client=FakeClient(),
+        progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert result["status"].tolist() == ["failed"]
+    assert progress == [(0, 1)]
+
+
+def test_update_stop_leaves_partially_updated_stock_incomplete(tmp_path):
+    root = tmp_path / "data"
+    target = daily_target_path("sh.600000", "stock", root)
+    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    checks = iter([True, True, True, False])
+    progress = []
+
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-05",
+        root,
+        10,
+        client=FakeClient(),
+        checkpoint=lambda: next(checks),
+        progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert len(result) == 1
+    assert progress == [(0, 1)]
+    assert not init_data_storage(root).lock_path.exists()
 
 
 def test_clean_baostock_data_removes_source_fields_and_casts_types():
@@ -525,10 +604,11 @@ def test_update_profit_saves_when_checkpoint_stops(tmp_path):
 def test_request_log_counts_today(tmp_path):
     log_path = tmp_path / "request_log.csv"
     append_request_log(
-        log_path, "endpoint", "sh.600000", "d", "2024-01-02", "2024-01-03", "success", 1
+        log_path, "endpoint", "sh.600000", "d", "2024-01-02", "2024-01-03", "success"
     )
 
     assert request_count_today(log_path, date.today()) == 1
+    assert "rows" not in pd.read_csv(log_path).columns
     assert request_count_today(log_path, "1999-01-01") == 0
 
 
