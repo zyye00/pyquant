@@ -199,6 +199,35 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
     assert progress == [(0, 1), (1, 1)]
 
 
+def test_history_query_cache_skips_completed_ranges(tmp_path):
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2024-01-02", "2024-01-03"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
+    )
+    client = FakeClient()
+
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-05",
+        root,
+        10,
+        client=client,
+    )
+
+    assert result[["start_date", "end_date"]].values.tolist() == [
+        ["2024-01-04", "2024-01-05"]
+    ]
+    assert client.calls == [("sh.600000", "2024-01-04", "2024-01-05", "d", "3")]
+
+
 def test_update_adds_only_the_earlier_missing_range(tmp_path):
     target = daily_target_path("sh.600000", "stock", tmp_path / "data")
     atomic_write_parquet(
@@ -230,13 +259,12 @@ def test_minute_updates_are_partitioned_by_year(tmp_path):
         "2024-01-03",
         tmp_path / "data",
         10,
-        "forward",
         client=FakeClient(),
     )
 
     assert result["target_path"].tolist() == [
-        str(minute_5_target_path("sh.600000", 2023, tmp_path / "data", "forward")),
-        str(minute_5_target_path("sh.600000", 2024, tmp_path / "data", "forward")),
+        str(minute_5_target_path("sh.600000", 2023, tmp_path / "data")),
+        str(minute_5_target_path("sh.600000", 2024, tmp_path / "data")),
     ]
 
 
@@ -487,8 +515,8 @@ def test_update_dividends_skips_saved_and_empty_code_years(tmp_path):
     query_cache_path = tmp_path / "data" / "raw" / "dividend" / "queries.parquet"
     assert len(pd.read_parquet(dividend_path)) == 1
     assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", 2022],
-        ["sh.600000", 2023],
+        ["sh.600000", "2022-01-01", "2022-12-31"],
+        ["sh.600000", "2023-01-01", "2023-12-31"],
     ]
 
 
@@ -515,10 +543,10 @@ def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
     )
     assert len(pd.read_parquet(profit_path)) == 3
     assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", 2022, 1],
-        ["sh.600000", 2022, 2],
-        ["sh.600000", 2022, 3],
-        ["sh.600000", 2022, 4],
+        ["sh.600000", "2022-01-01", "2022-03-31"],
+        ["sh.600000", "2022-04-01", "2022-06-30"],
+        ["sh.600000", "2022-07-01", "2022-09-30"],
+        ["sh.600000", "2022-10-01", "2022-12-31"],
     ]
 
 
@@ -571,7 +599,7 @@ def test_update_dividends_saves_when_checkpoint_stops(tmp_path):
     assert len(pd.read_parquet(root / "raw" / "dividend" / "data.parquet")) == 1
     assert pd.read_parquet(
         root / "raw" / "dividend" / "queries.parquet"
-    ).values.tolist() == [["sh.600000", 2022]]
+    ).values.tolist() == [["sh.600000", "2022-01-01", "2022-12-31"]]
     assert not lock_path.exists()
 
 
@@ -597,7 +625,7 @@ def test_update_profit_saves_when_checkpoint_stops(tmp_path):
     )
     assert pd.read_parquet(
         root / "raw" / "stock_profit_quarterly" / "queries.parquet"
-    ).values.tolist() == [["sh.600000", 2022, 1]]
+    ).values.tolist() == [["sh.600000", "2022-01-01", "2022-03-31"]]
     assert not lock_path.exists()
 
 
@@ -651,15 +679,6 @@ def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
 def test_update_dataset_validates_options_before_requests(tmp_path):
     client = FakeClient()
 
-    with pytest.raises(ValueError, match="does not support adjustment"):
-        update_dataset(
-            "dividend",
-            start="2022-01-01",
-            pool=["sh.600000"],
-            adjustment="forward",
-            client=client,
-            data_root=tmp_path / "data",
-        )
     with pytest.raises(ValueError, match="No security codes were selected"):
         update_dataset(
             "stock_daily",

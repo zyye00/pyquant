@@ -308,12 +308,23 @@ def _prepare_selection_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
 
 
 def _prepare_dividend_queries(dividend_queries: pd.DataFrame) -> pd.DataFrame:
-    required = {"symbol", "year"}
+    if {"symbol", "year"}.issubset(dividend_queries.columns):
+        out = dividend_queries[["symbol", "year"]].copy()
+        out["symbol"] = out["symbol"].astype(str)
+        out["year"] = pd.to_numeric(out["year"], errors="raise").astype(int)
+        return out.drop_duplicates().sort_values(["symbol", "year"])
+    required = {"symbol", "start", "end"}
     _require_columns(dividend_queries, required, "dividend_queries")
     out = dividend_queries.loc[:, sorted(required)].copy()
     out["symbol"] = out["symbol"].astype(str)
-    out["year"] = pd.to_numeric(out["year"], errors="raise").astype(int)
-    return out.drop_duplicates().sort_values(["symbol", "year"])
+    out["start"] = pd.to_datetime(out["start"], errors="raise")
+    out["end"] = pd.to_datetime(out["end"], errors="raise")
+    out = out.loc[out["start"] <= out["end"]]
+    out = out.loc[
+        out.index.repeat(out["end"].dt.year - out["start"].dt.year + 1)
+    ].copy()
+    out["year"] = out.groupby(level=0).cumcount() + out["start"].dt.year
+    return out[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
 
 
 def _prepare_shares(shares: pd.DataFrame) -> pd.DataFrame:

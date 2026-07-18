@@ -156,7 +156,6 @@ def load_dataset(
     start: str | None = None,
     end: str | None = None,
     symbols: Collection[str] | None = None,
-    adjustment: str | None = None,
 ) -> pd.DataFrame:
     """Load a catalog dataset with canonical columns."""
     dataset = get_dataset(name)
@@ -168,11 +167,7 @@ def load_dataset(
     end_at = pd.Timestamp(end) if end is not None else None
     if start_at is not None and end_at is not None and start_at > end_at:
         raise ValueError("start must not be after end")
-    adjustment_name = adjustment or "none"
-    if "{adjustment}" not in storage["path"] and adjustment is not None:
-        raise ValueError(f"Dataset {name!r} does not support adjustment")
-
-    paths = _dataset_paths(storage, symbols, adjustment_name, start_at, end_at)
+    paths = _dataset_paths(storage, symbols, start_at, end_at)
     if not paths:
         raise FileNotFoundError(f"No files found for dataset {name!r}")
     frames = [
@@ -199,7 +194,6 @@ def update_dataset(
     end: str | None = None,
     pool: str | Collection[str],
     pool_date: str | None = None,
-    adjustment: str | None = None,
     max_tasks: int | None = None,
 ) -> DatasetUpdate:
     """Start a background update for a named pool or security-code collection."""
@@ -265,7 +259,6 @@ def get_dataset(name: str) -> dict[str, Any]:
 def _dataset_paths(
     storage: dict[str, str],
     symbols: Collection[str] | None,
-    adjustment: str,
     start: pd.Timestamp | None,
     end: pd.Timestamp | None,
 ) -> list[Path]:
@@ -282,7 +275,7 @@ def _dataset_paths(
         for symbol in symbol_values
         for year in years
         for path in glob(
-            template.format(adjustment=adjustment, symbol=symbol, year=year)
+            template.format(symbol=symbol, year=year)
         )
     }
     return sorted(paths)

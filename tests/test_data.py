@@ -131,7 +131,6 @@ def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys)
             "end": None,
             "pool": "all",
             "pool_date": None,
-            "adjustment": None,
             "max_tasks": None,
         }
         progress(0, 2)

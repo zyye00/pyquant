@@ -21,8 +21,6 @@ BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _baostock["hard_max_requests_per_day"]
 BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _baostock["safe_max_requests_per_day"]
 BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _baostock["socket_timeout_seconds"]
 BAOSTOCK_STOCK_POOL_QUERIES = _baostock["stock_pool_queries"]
-ADJUSTMENT_FLAGS = _baostock["adjustment_flags"]
-ADJUSTMENT_DIRS = _baostock["adjustment_dirs"]
 
 
 @dataclass(frozen=True)
@@ -36,20 +34,28 @@ class DataPaths:
     @property
     def daily_stock_dir(self) -> Path:
         return _dataset_path(
-            "stock_daily", self.data_root, adjustment="none", symbol="_"
-        ).parents[1]
+            "stock_daily", self.data_root, symbol="_"
+        ).parent
 
     @property
     def daily_index_dir(self) -> Path:
         return _dataset_path(
-            "index_daily", self.data_root, adjustment="none", symbol="_"
-        ).parents[1]
+            "index_daily", self.data_root, symbol="_"
+        ).parent
 
     @property
     def minute_5_stock_dir(self) -> Path:
         return _dataset_path(
-            "stock_5m", self.data_root, adjustment="none", symbol="_", year=2000
-        ).parents[2]
+            "stock_5m", self.data_root, symbol="_", year=2000
+        ).parents[1]
+
+    def history_queries_path(self, dataset: str, frequency: str) -> Path:
+        name = {
+            ("stock", "d"): "stock_daily",
+            ("index", "d"): "index_daily",
+            ("stock", "5"): "stock_5m",
+        }[dataset, frequency]
+        return _configured_path(_datasets[name]["storage"]["query_path"], self.data_root)
 
     @property
     def state_dir(self) -> Path:
@@ -117,10 +123,8 @@ def init_data_storage(data_root: str | Path = "data") -> DataPaths:
     paths = DataPaths(Path(data_root))
     for path in [
         paths.daily_stock_dir,
-        *(paths.daily_stock_dir / name for name in ADJUSTMENT_DIRS.values()),
         paths.daily_index_dir,
         paths.minute_5_stock_dir,
-        *(paths.minute_5_stock_dir / name for name in ADJUSTMENT_DIRS.values()),
         paths.state_dir,
     ]:
         path.mkdir(parents=True, exist_ok=True)
@@ -132,12 +136,10 @@ def daily_target_path(
     code: str,
     dataset: str,
     data_root: str | Path = "data",
-    adjustflag: str | None = None,
 ) -> Path:
     return _dataset_path(
         {"stock": "stock_daily", "index": "index_daily"}[dataset],
         data_root,
-        adjustment=adjustment_dir(adjustflag),
         symbol=code,
     )
 
@@ -146,30 +148,13 @@ def minute_5_target_path(
     code: str,
     year: int,
     data_root: str | Path = "data",
-    adjustflag: str | None = None,
 ) -> Path:
     return _dataset_path(
         "stock_5m",
         data_root,
-        adjustment=adjustment_dir(adjustflag),
         symbol=code,
         year=year,
     )
-
-
-def adjustment_dir(adjustflag: str | None) -> str:
-    return ADJUSTMENT_DIRS[baostock_adjustflag(adjustflag)]
-
-
-def baostock_adjustflag(adjustflag: str | None) -> str:
-    if adjustflag is None:
-        return ADJUSTMENT_FLAGS["none"]
-    if adjustflag in ADJUSTMENT_DIRS:
-        return adjustflag
-    try:
-        return ADJUSTMENT_FLAGS[adjustflag]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported BaoStock adjustment: {adjustflag}") from exc
 
 
 def clean_baostock_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -249,28 +234,42 @@ def missing_baostock_ranges(
     start_date: str,
     end_date: str,
     date_column: str = "date",
+    queried_ranges: Iterable[tuple[str, str]] = (),
 ) -> list[tuple[str, str]]:
-    """Return missing ranges before and after the locally covered dates."""
+    """Return ranges not covered by local data or completed source queries."""
     path = Path(target_path)
-    if not path.exists():
-        return [(start_date, end_date)]
-    existing = pd.read_parquet(path, columns=[date_column])
-    if existing.empty:
-        return [(start_date, end_date)]
-    first_date = pd.to_datetime(existing[date_column]).min()
-    last_date = pd.to_datetime(existing[date_column]).max()
     requested_start = pd.Timestamp(start_date)
     requested_end = pd.Timestamp(end_date)
-    ranges = []
-    if requested_start < first_date:
-        previous_date = first_date - pd.Timedelta(days=1)
-        ranges.append(
-            (start_date, min(requested_end, previous_date).strftime("%Y-%m-%d"))
-        )
-    next_date = last_date + pd.Timedelta(days=1)
-    if next_date <= requested_end:
-        ranges.append((max(requested_start, next_date).strftime("%Y-%m-%d"), end_date))
-    return ranges
+    covered = list(queried_ranges)
+    if path.exists():
+        existing = pd.read_parquet(path, columns=[date_column])
+        if not existing.empty:
+            covered.append(
+                (
+                    str(pd.to_datetime(existing[date_column]).min().date()),
+                    str(pd.to_datetime(existing[date_column]).max().date()),
+                )
+            )
+    cursor = requested_start
+    missing = []
+    for first, last in sorted(
+        (pd.Timestamp(first), pd.Timestamp(last)) for first, last in covered
+    ):
+        if last < cursor:
+            continue
+        if first > requested_end:
+            break
+        if first > cursor:
+            missing.append(
+                (
+                    cursor.strftime("%Y-%m-%d"),
+                    (first - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                )
+            )
+        cursor = max(cursor, last + pd.Timedelta(days=1))
+    if cursor <= requested_end:
+        missing.append((cursor.strftime("%Y-%m-%d"), end_date))
+    return missing
 
 
 def atomic_write_parquet(
@@ -417,6 +416,10 @@ def update_dividends(
         else pd.DataFrame(columns=fields["query"])
     )
     queried = set(query_cache.itertuples(index=False, name=None))
+
+    def query_range(code: str, year: int) -> tuple[str, str, str]:
+        return code, f"{year}-01-01", f"{year}-12-31"
+
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -425,7 +428,8 @@ def update_dividends(
     pending_queries = []
     remaining = {
         code: sum(
-            (code, year) not in queried for year in range(start_year, end_year + 1)
+            query_range(code, year) not in queried
+            for year in range(start_year, end_year + 1)
         )
         for code in codes
     }
@@ -436,7 +440,7 @@ def update_dividends(
     try:
         for code in codes:
             for year in range(start_year, end_year + 1):
-                if (code, year) in queried:
+                if query_range(code, year) in queried:
                     continue
                 if max_tasks is not None and len(results) >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
@@ -449,8 +453,8 @@ def update_dividends(
                     data = clean_baostock_dividends(data, code, year)
                     if not data.empty:
                         pending_dividends.append(data)
-                    pending_queries.append((code, year))
-                    queried.add((code, year))
+                    pending_queries.append(query_range(code, year))
+                    queried.add(query_range(code, year))
                     append_request_log(
                         paths.request_log_path,
                         "query_dividend_data",
@@ -554,6 +558,11 @@ def update_profit_quarterly(
         else pd.DataFrame(columns=fields["query"])
     )
     queried = set(query_cache.itertuples(index=False, name=None))
+
+    def query_range(code: str, year: int, quarter: int) -> tuple[str, str, str]:
+        period = pd.Period(year=year, quarter=quarter, freq="Q")
+        return code, str(period.start_time.date()), str(period.end_time.date())
+
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -565,7 +574,7 @@ def update_profit_quarterly(
         for period in pd.period_range(start_date, end_date, freq="Q")
     ]
     remaining = {
-        code: sum((code, *period) not in queried for period in periods)
+        code: sum(query_range(code, *period) not in queried for period in periods)
         for code in codes
     }
     completed = sum(count == 0 for count in remaining.values())
@@ -575,7 +584,7 @@ def update_profit_quarterly(
     try:
         for code in codes:
             for year, quarter in periods:
-                if (code, year, quarter) in queried:
+                if query_range(code, year, quarter) in queried:
                     continue
                 if max_tasks is not None and len(results) >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
@@ -592,8 +601,8 @@ def update_profit_quarterly(
                     )
                     if not data.empty:
                         pending_profits.append(data)
-                    pending_queries.append((code, year, quarter))
-                    queried.add((code, year, quarter))
+                    pending_queries.append(query_range(code, year, quarter))
+                    queried.add(query_range(code, year, quarter))
                     append_request_log(
                         paths.request_log_path,
                         "query_profit_data",
@@ -679,7 +688,6 @@ def update_history_dataset(
     end_date: str,
     data_root: str | Path = "data",
     max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
-    adjustflag: str | None = None,
     client: Any | None = None,
     checkpoint: Callable[[], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -689,7 +697,12 @@ def update_history_dataset(
     fields = _fields["history"]
     codes = list(codes)
     paths = init_data_storage(data_root)
-    adjustment = baostock_adjustflag(adjustflag)
+    query_cache_path = paths.history_queries_path(dataset, frequency)
+    query_cache = (
+        pd.read_parquet(query_cache_path)
+        if query_cache_path.exists()
+        else pd.DataFrame(columns=fields["query"])
+    )
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -704,12 +717,17 @@ def update_history_dataset(
             if checkpoint is not None and not checkpoint():
                 return pd.DataFrame(results, columns=fields["result"])
             slices = []
+            queried = list(
+                query_cache.loc[
+                    query_cache["code"] == code, ["start", "end"]
+                ].itertuples(index=False, name=None)
+            )
             if frequency == "d":
-                target = daily_target_path(code, dataset, data_root, adjustment)
+                target = daily_target_path(code, dataset, data_root)
                 slices.extend(
                     (first, last, str(target))
                     for first, last in missing_baostock_ranges(
-                        target, start_date, end_date
+                        target, start_date, end_date, queried_ranges=queried
                     )
                 )
             else:
@@ -722,13 +740,11 @@ def update_history_dataset(
                     last = min(
                         pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")
                     ).strftime("%Y-%m-%d")
-                    target = minute_5_target_path(
-                        code, year, data_root, adjustment
-                    )
+                    target = minute_5_target_path(code, year, data_root)
                     slices.extend(
                         (range_start, range_end, str(target))
                         for range_start, range_end in missing_baostock_ranges(
-                            target, first, last
+                            target, first, last, queried_ranges=queried
                         )
                     )
 
@@ -748,11 +764,21 @@ def update_history_dataset(
                         range_end,
                         fields["daily"] if frequency == "d" else fields["minute_5"],
                         frequency,
-                        adjustment,
                         active_client,
                     )
                     data = merge_history_data(clean_baostock_data(data), target_path)
                     atomic_write_parquet(data, target_path, overwrite=True)
+                    query_cache = pd.concat(
+                        [
+                            query_cache,
+                            pd.DataFrame(
+                                [[code, range_start, range_end]],
+                                columns=fields["query"],
+                            ),
+                        ],
+                        ignore_index=True,
+                    ).drop_duplicates()
+                    atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
                     append_request_log(
                         paths.request_log_path,
                         "query_history_k_data_plus",
@@ -829,7 +855,6 @@ def update_dataset(
     pool: str | Collection[str],
     end: str | None = None,
     pool_date: str | None = None,
-    adjustment: str | None = None,
     max_tasks: int | None = None,
     client: Any | None = None,
     checkpoint: Callable[[], bool] | None = None,
@@ -846,8 +871,6 @@ def update_dataset(
         raise ValueError("start must not be after end")
     if isinstance(pool, str) and not update["pool"]:
         raise ValueError(f"Dataset {name!r} does not support named pools")
-    if adjustment is not None and not update["adjustment"]:
-        raise ValueError(f"Dataset {name!r} does not support adjustment")
     if max_tasks is not None and max_tasks <= 0:
         raise ValueError("max_tasks must be positive")
     if checkpoint is not None and not checkpoint():
@@ -873,8 +896,6 @@ def update_dataset(
         if max_tasks is not None:
             common["max_tasks"] = max_tasks
         if update["kind"] == "history":
-            if adjustment is not None:
-                common["adjustflag"] = adjustment
             return update_history_dataset(
                 update["target"],
                 update["frequency"],
@@ -960,7 +981,6 @@ def query_baostock_history(
     end_date: str,
     fields: list[str],
     frequency: str,
-    adjustflag: str,
     client: Any,
 ) -> pd.DataFrame:
     """Query BaoStock history and convert its cursor-like result to DataFrame."""
@@ -970,7 +990,7 @@ def query_baostock_history(
         start_date=start_date,
         end_date=end_date,
         frequency=frequency,
-        adjustflag=adjustflag,
+        adjustflag="3",
     )
     if getattr(result, "error_code", "0") != "0":
         raise RuntimeError(
