@@ -31,7 +31,7 @@ sources:
         query: [code, start, end]
         result: [code, year, quarter, status, row_count, error]
         numeric: [total_shares]
-      request_log: [date, time, endpoint, code, frequency, start_date, end_date, status, error_code, error_msg]
+      request_log: [request_id, date, time, endpoint, code, frequency, start_date, end_date, status, error_code, error_msg]
 
 datasets:
   stock_daily:

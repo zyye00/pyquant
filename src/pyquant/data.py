@@ -270,6 +270,7 @@ def _dataset_paths(
     years: list[int | str] = ["*"]
     if "{year}" in template and start is not None and end is not None:
         years = list(range(start.year, end.year + 1))
+    query_path = storage.get("query_path")
     paths = {
         Path(path)
         for symbol in symbol_values
@@ -277,6 +278,7 @@ def _dataset_paths(
         for path in glob(
             template.format(symbol=symbol, year=year)
         )
+        if query_path is None or Path(path) != Path(query_path)
     }
     return sorted(paths)
 

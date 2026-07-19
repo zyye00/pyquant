@@ -14,6 +14,7 @@ from pyquant._data_update import (
     BaostockClient,
     append_request_log,
     atomic_write_parquet,
+    begin_request_log,
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
@@ -132,6 +133,21 @@ class FakeClient:
             [] if quarter == "2" else [[code, "2022-04-30", "2022-03-31", "123456789"]]
         )
         return FakeResult(["code", "pubDate", "statDate", "totalShare"], rows)
+
+
+class FailingHistoryClient(FakeClient):
+    def query_history_k_data_plus(
+        self, code, fields, start_date, end_date, frequency, adjustflag
+    ):
+        if code != "sz.000002":
+            return super().query_history_k_data_plus(
+                code, fields, start_date, end_date, frequency, adjustflag
+            )
+        self.calls.append((code, start_date, end_date, frequency, adjustflag))
+        result = FakeResult([], [])
+        result.error_code = "100"
+        result.error_msg = "simulated source failure"
+        return result
 
 
 class StopAfterFirstRequest:
@@ -638,6 +654,104 @@ def test_request_log_counts_today(tmp_path):
     assert request_count_today(log_path, date.today()) == 1
     assert "rows" not in pd.read_csv(log_path).columns
     assert request_count_today(log_path, "1999-01-01") == 0
+
+
+def test_history_request_logs_survive_success_failure_and_pending(tmp_path):
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+
+    result = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000", "sz.000001", "sz.000002"],
+        "2024-01-02",
+        "2024-01-02",
+        root,
+        10,
+        client=FailingHistoryClient(),
+    )
+
+    log = pd.read_csv(paths.request_log_path, keep_default_na=False)
+    assert result["status"].tolist() == ["success", "success", "failed"]
+    assert log.columns.tolist() == [
+        "request_id",
+        "date",
+        "time",
+        "endpoint",
+        "code",
+        "frequency",
+        "start_date",
+        "end_date",
+        "status",
+        "error_code",
+        "error_msg",
+    ]
+    assert log["status"].tolist() == ["success", "success", "failed"]
+    assert log["request_id"].str.len().gt(0).all()
+    assert request_count_today(paths.request_log_path) == 3
+
+    begin_request_log(
+        paths.request_log_path,
+        "query_history_k_data_plus",
+        "sh.600519",
+        "d",
+        "2024-01-02",
+        "2024-01-02",
+    )
+
+    assert request_count_today(paths.request_log_path) == 4
+    assert pd.read_csv(paths.request_log_path, keep_default_na=False).iloc[-1][
+        "status"
+    ] == "pending"
+
+
+def test_request_log_normalizes_shifted_legacy_row(tmp_path):
+    log_path = tmp_path / "request_log.csv"
+    today = date.today().isoformat()
+    log_path.write_text(
+        "request_id,date,time,endpoint,code,frequency,start_date,end_date,status,error_code,error_msg\n"
+        f"legacy-id,{today},10:00:00,endpoint,sh.600000,d,2024-01-02,2024-01-03,success,,\n"
+        f"{today},10:01:00,endpoint,sz.000001,d,2024-01-02,2024-01-03,failed,RuntimeError,simulated failure\n",
+        encoding="utf-8",
+    )
+
+    assert request_count_today(log_path) == 2
+
+    log = pd.read_csv(log_path, keep_default_na=False)
+    assert log["date"].tolist() == [today, today]
+    assert log["status"].tolist() == ["success", "failed"]
+    assert log["request_id"].str.len().gt(0).all()
+
+
+def test_request_log_normalizes_legacy_ten_column_header(tmp_path):
+    log_path = tmp_path / "request_log.csv"
+    today = date.today().isoformat()
+    log_path.write_text(
+        "date,time,endpoint,code,frequency,start_date,end_date,status,error_code,error_msg\n"
+        f"{today},10:00:00,endpoint,sh.600000,d,2024-01-02,2024-01-03,success,,\n",
+        encoding="utf-8",
+    )
+
+    assert request_count_today(log_path) == 1
+
+    log = pd.read_csv(log_path, keep_default_na=False)
+    assert log.loc[0, "request_id"]
+    assert log.loc[0, "date"] == today
+
+
+def test_resolve_pool_requests_are_logged_with_fake_client(tmp_path):
+    paths = init_data_storage(tmp_path / "data")
+
+    assert resolve_baostock_codes(
+        "hs300", "2024-01-03", FakeClient(), paths.request_log_path
+    ) == ["sh.600000", "sz.000001"]
+
+    log = pd.read_csv(paths.request_log_path, keep_default_na=False)
+    assert log["endpoint"].tolist() == [
+        "query_trade_dates",
+        "query_hs300_stocks",
+    ]
+    assert log["status"].tolist() == ["success", "success"]
 
 
 def test_validate_request_limit_rejects_values_above_hard_limit():

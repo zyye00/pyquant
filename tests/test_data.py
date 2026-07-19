@@ -100,6 +100,55 @@ def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
     assert out["pe_ttm"].tolist() == [9.0, 10.0]
 
 
+def test_load_partitioned_dataset_excludes_query_metadata(tmp_path, monkeypatch):
+    data_dir = tmp_path / "raw" / "stock_daily"
+    data_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "date": ["2024-01-02"],
+            "close": [10.0],
+            "amount": [100.0],
+            "peTTM": [8.0],
+        }
+    ).to_parquet(data_dir / "sh.600000.parquet", index=False)
+    query_path = data_dir / "queries.parquet"
+    pd.DataFrame(
+        {
+            "code": ["sh.600000", "sh.600001"],
+            "start": ["2024-01-01", "2024-01-01"],
+            "end": ["2024-01-02", "2024-01-02"],
+        }
+    ).to_parquet(query_path, index=False)
+    catalog = {
+        "version": 1,
+        "datasets": {
+            "stock_daily": {
+                "source": "test",
+                "storage": {
+                    "kind": "symbol_files",
+                    "path": str(data_dir / "{symbol}.parquet"),
+                    "query_path": str(query_path),
+                    "symbol_from": "stem",
+                },
+                "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
+                "required": ["date", "symbol", "close", "amount", "pe_ttm"],
+                "primary_key": ["date", "symbol"],
+                "date_column": "date",
+                "date_columns": ["date"],
+                "numeric_columns": ["close", "amount", "pe_ttm"],
+                "field_map": {"peTTM": "pe_ttm"},
+            }
+        },
+    }
+    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
+
+    out = load_dataset("stock_daily", start="2024-01-01", end="2024-01-02")
+
+    assert out[["date", "symbol"]].to_dict("records") == [
+        {"date": pd.Timestamp("2024-01-02"), "symbol": "sh.600000"}
+    ]
+
+
 def test_load_dataset_requires_explicit_partition_dates(monkeypatch):
     catalog = {
         "version": 1,

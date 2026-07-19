@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import os
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from collections.abc import Collection
-from typing import Any, Callable, Iterable
+from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -21,6 +23,10 @@ BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _baostock["hard_max_requests_per_day"]
 BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _baostock["safe_max_requests_per_day"]
 BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _baostock["socket_timeout_seconds"]
 BAOSTOCK_STOCK_POOL_QUERIES = _baostock["stock_pool_queries"]
+_REQUEST_LOG_FIELDS = _fields["request_log"]
+_LEGACY_REQUEST_LOG_FIELDS = [
+    field for field in _REQUEST_LOG_FIELDS if field != "request_id"
+]
 
 
 @dataclass(frozen=True)
@@ -292,10 +298,56 @@ def request_count_today(
 ) -> int:
     reset_request_log(request_log_path, today)
     path = Path(request_log_path)
+    return len(_read_request_log(path))
+
+
+def _read_request_log(request_log_path: str | Path) -> list[dict[str, str]]:
+    """Read legacy request logs into the current schema without dropping rows."""
+    path = Path(request_log_path)
     if not path.exists():
-        return 0
-    log = pd.read_csv(path)
-    return 0 if log.empty else len(log)
+        return []
+    with path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.reader(stream))
+    if not rows:
+        return []
+
+    header, *data_rows = rows
+    if header == _REQUEST_LOG_FIELDS:
+        source_fields = _REQUEST_LOG_FIELDS
+    elif header == _LEGACY_REQUEST_LOG_FIELDS:
+        source_fields = _LEGACY_REQUEST_LOG_FIELDS
+    else:
+        return []
+
+    normalized = []
+    for values in data_rows:
+        if len(values) == len(_REQUEST_LOG_FIELDS):
+            row = dict(zip(_REQUEST_LOG_FIELDS, values, strict=True))
+        elif len(values) == len(_LEGACY_REQUEST_LOG_FIELDS):
+            row = dict(zip(_LEGACY_REQUEST_LOG_FIELDS, values, strict=True))
+        else:
+            continue
+        if source_fields == _LEGACY_REQUEST_LOG_FIELDS:
+            row.pop("request_id", None)
+        row["request_id"] = row.get("request_id") or uuid4().hex
+        normalized.append(
+            {field: str(row.get(field, "")) for field in _REQUEST_LOG_FIELDS}
+        )
+    return normalized
+
+
+def _write_request_log(
+    request_log_path: str | Path,
+    rows: Iterable[dict[str, str]],
+) -> None:
+    path = Path(request_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=_REQUEST_LOG_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary_path, path)
 
 
 def reset_request_log(
@@ -303,20 +355,66 @@ def reset_request_log(
     today: date | str | None = None,
 ) -> None:
     path = Path(request_log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     today_str = (
         (today or date.today()).isoformat() if not isinstance(today, str) else today
     )
-    if not path.exists():
-        pd.DataFrame(columns=_fields["request_log"]).to_csv(path, index=False)
-        return
-    log = pd.read_csv(path)
-    if log.empty or "date" not in log.columns:
-        pd.DataFrame(columns=_fields["request_log"]).to_csv(path, index=False)
-        return
-    today_log = log[log["date"].astype(str) == today_str]
-    if len(today_log) != len(log):
-        today_log.to_csv(path, index=False)
+    _write_request_log(
+        path,
+        (row for row in _read_request_log(path) if row["date"] == today_str),
+    )
+
+
+def begin_request_log(
+    request_log_path: str | Path,
+    endpoint: str,
+    code: str,
+    frequency: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """Persist a pending request before sending it to BaoStock."""
+    path = Path(request_log_path)
+    reset_request_log(path)
+    request_id = uuid4().hex
+    now = datetime.now()
+    rows = _read_request_log(path)
+    rows.append(
+        {
+            "request_id": request_id,
+            "date": now.date().isoformat(),
+            "time": now.strftime("%H:%M:%S"),
+            "endpoint": endpoint,
+            "code": code,
+            "frequency": frequency,
+            "start_date": start_date,
+            "end_date": end_date,
+            "status": "pending",
+            "error_code": "",
+            "error_msg": "",
+        }
+    )
+    _write_request_log(path, rows)
+    return request_id
+
+
+def finish_request_log(
+    request_log_path: str | Path,
+    request_id: str,
+    status: str,
+    error_code: str = "",
+    error_msg: str = "",
+) -> None:
+    """Update the terminal status of a request that was already persisted."""
+    path = Path(request_log_path)
+    rows = _read_request_log(path)
+    for row in reversed(rows):
+        if row["request_id"] == request_id:
+            row["status"] = status
+            row["error_code"] = error_code
+            row["error_msg"] = error_msg
+            _write_request_log(path, rows)
+            return
+    raise RuntimeError(f"Request log entry not found: {request_id}")
 
 
 def append_request_log(
@@ -329,28 +427,13 @@ def append_request_log(
     status: str,
     error_code: str = "",
     error_msg: str = "",
-) -> None:
-    path = Path(request_log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
-    row = pd.DataFrame(
-        [
-            {
-                "date": now.date().isoformat(),
-                "time": now.strftime("%H:%M:%S"),
-                "endpoint": endpoint,
-                "code": code,
-                "frequency": frequency,
-                "start_date": start_date,
-                "end_date": end_date,
-                "status": status,
-                "error_code": error_code,
-                "error_msg": error_msg,
-            }
-        ]
+) -> str:
+    """Record a completed request for compatibility with existing callers."""
+    request_id = begin_request_log(
+        request_log_path, endpoint, code, frequency, start_date, end_date
     )
-    header = not path.exists()
-    row.to_csv(path, mode="a", header=header, index=False)
+    finish_request_log(request_log_path, request_id, status, error_code, error_msg)
+    return request_id
 
 
 def create_download_lock(data_root: str | Path = "data") -> Path:
@@ -448,6 +531,14 @@ def update_dividends(
                     return pd.DataFrame(results, columns=fields["result"])
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
+                request_id = begin_request_log(
+                    paths.request_log_path,
+                    "query_dividend_data",
+                    code,
+                    "dividend",
+                    str(year),
+                    str(year),
+                )
                 try:
                     data = query_baostock_dividends(code, year, active_client)
                     data = clean_baostock_dividends(data, code, year)
@@ -455,15 +546,7 @@ def update_dividends(
                         pending_dividends.append(data)
                     pending_queries.append(query_range(code, year))
                     queried.add(query_range(code, year))
-                    append_request_log(
-                        paths.request_log_path,
-                        "query_dividend_data",
-                        code,
-                        "dividend",
-                        str(year),
-                        str(year),
-                        "success",
-                    )
+                    finish_request_log(paths.request_log_path, request_id, "success")
                     results.append((code, year, "success", len(data), ""))
                     remaining[code] -= 1
                     if remaining[code] == 0:
@@ -471,13 +554,9 @@ def update_dividends(
                         if progress is not None:
                             progress(completed, len(codes))
                 except Exception as exc:
-                    append_request_log(
+                    finish_request_log(
                         paths.request_log_path,
-                        "query_dividend_data",
-                        code,
-                        "dividend",
-                        str(year),
-                        str(year),
+                        request_id,
                         "failed",
                         exc.__class__.__name__,
                         str(exc),
@@ -592,6 +671,14 @@ def update_profit_quarterly(
                     return pd.DataFrame(results, columns=fields["result"])
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
+                request_id = begin_request_log(
+                    paths.request_log_path,
+                    "query_profit_data",
+                    code,
+                    "profit_quarterly",
+                    str(year),
+                    str(quarter),
+                )
                 try:
                     data = clean_baostock_profit(
                         query_baostock_profit(code, year, quarter, active_client),
@@ -603,15 +690,7 @@ def update_profit_quarterly(
                         pending_profits.append(data)
                     pending_queries.append(query_range(code, year, quarter))
                     queried.add(query_range(code, year, quarter))
-                    append_request_log(
-                        paths.request_log_path,
-                        "query_profit_data",
-                        code,
-                        "profit_quarterly",
-                        str(year),
-                        str(quarter),
-                        "success",
-                    )
+                    finish_request_log(paths.request_log_path, request_id, "success")
                     results.append((code, year, quarter, "success", len(data), ""))
                     remaining[code] -= 1
                     if remaining[code] == 0:
@@ -619,13 +698,9 @@ def update_profit_quarterly(
                         if progress is not None:
                             progress(completed, len(codes))
                 except Exception as exc:
-                    append_request_log(
+                    finish_request_log(
                         paths.request_log_path,
-                        "query_profit_data",
-                        code,
-                        "profit_quarterly",
-                        str(year),
-                        str(quarter),
+                        request_id,
                         "failed",
                         exc.__class__.__name__,
                         str(exc),
@@ -757,6 +832,14 @@ def update_history_dataset(
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
                 tasks += 1
+                request_id = begin_request_log(
+                    paths.request_log_path,
+                    "query_history_k_data_plus",
+                    code,
+                    frequency,
+                    range_start,
+                    range_end,
+                )
                 try:
                     data = query_baostock_history(
                         code,
@@ -779,15 +862,7 @@ def update_history_dataset(
                         ignore_index=True,
                     ).drop_duplicates()
                     atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-                    append_request_log(
-                        paths.request_log_path,
-                        "query_history_k_data_plus",
-                        code,
-                        frequency,
-                        range_start,
-                        range_end,
-                        "success",
-                    )
+                    finish_request_log(paths.request_log_path, request_id, "success")
                     results.append(
                         (
                             code,
@@ -801,13 +876,9 @@ def update_history_dataset(
                     )
                 except Exception as exc:
                     code_complete = False
-                    append_request_log(
+                    finish_request_log(
                         paths.request_log_path,
-                        "query_history_k_data_plus",
-                        code,
-                        frequency,
-                        range_start,
-                        range_end,
+                        request_id,
                         "failed",
                         exc.__class__.__name__,
                         str(exc),
@@ -880,7 +951,12 @@ def update_dataset(
     client = client if client is not None else context.__enter__()
     try:
         codes = (
-            resolve_baostock_codes(pool, pool_date or end_date, client)
+            resolve_baostock_codes(
+                pool,
+                pool_date or end_date,
+                client,
+                request_log_path=DataPaths(Path(data_root)).request_log_path,
+            )
             if isinstance(pool, str)
             else list(dict.fromkeys(pool))
         )
@@ -921,10 +997,21 @@ def resolve_baostock_codes(
     pool: str,
     trade_date: str,
     client: Any,
+    request_log_path: str | Path | None = None,
+    max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
 ) -> list[str]:
     """Resolve a pool on its latest available trading day."""
     if pool == "all":
-        data = baostock_result_to_frame(client.bs.query_stock_basic())
+        data = _query_with_request_log(
+            request_log_path,
+            "query_stock_basic",
+            pool,
+            "pool",
+            trade_date,
+            trade_date,
+            lambda: baostock_result_to_frame(client.bs.query_stock_basic()),
+            max_requests_per_day,
+        )
         if not {"code", "type"}.issubset(data.columns):
             raise ValueError(
                 f"BaoStock stock-basic result has unexpected columns: {list(data.columns)}"
@@ -941,10 +1028,18 @@ def resolve_baostock_codes(
     query = getattr(client.bs, BAOSTOCK_STOCK_POOL_QUERIES[pool])
 
     end = pd.Timestamp(trade_date)
-    calendar = baostock_result_to_frame(
-        client.bs.query_trade_dates(
-            (end - pd.Timedelta(days=14)).strftime("%Y-%m-%d"), trade_date
-        )
+    calendar_start = (end - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    calendar = _query_with_request_log(
+        request_log_path,
+        "query_trade_dates",
+        pool,
+        "calendar",
+        calendar_start,
+        trade_date,
+        lambda: baostock_result_to_frame(
+            client.bs.query_trade_dates(calendar_start, trade_date)
+        ),
+        max_requests_per_day,
     )
     if not {"calendar_date", "is_trading_day"}.issubset(calendar.columns):
         raise ValueError(
@@ -953,7 +1048,16 @@ def resolve_baostock_codes(
     for day in calendar.loc[
         calendar["is_trading_day"].astype(str) == "1", "calendar_date"
     ].iloc[::-1]:
-        data = baostock_result_to_frame(query(str(day)))
+        data = _query_with_request_log(
+            request_log_path,
+            BAOSTOCK_STOCK_POOL_QUERIES[pool],
+            pool,
+            "pool",
+            str(day),
+            str(day),
+            lambda: baostock_result_to_frame(query(str(day))),
+            max_requests_per_day,
+        )
         if "code" not in data.columns:
             raise ValueError(
                 f"BaoStock pool result has no code column: {list(data.columns)}"
@@ -962,6 +1066,41 @@ def resolve_baostock_codes(
         if codes:
             return codes
     return []
+
+
+def _query_with_request_log(
+    request_log_path: str | Path | None,
+    endpoint: str,
+    code: str,
+    frequency: str,
+    start_date: str,
+    end_date: str,
+    query: Callable[[], pd.DataFrame],
+    max_requests_per_day: int,
+) -> pd.DataFrame:
+    """Run one source query after durably recording its pending request."""
+    if request_log_path is None:
+        return query()
+    if request_count_today(request_log_path) >= validate_request_limit(
+        max_requests_per_day
+    ):
+        raise RuntimeError("BaoStock request limit reached while resolving stock pool")
+    request_id = begin_request_log(
+        request_log_path, endpoint, code, frequency, start_date, end_date
+    )
+    try:
+        data = query()
+    except Exception as exc:
+        finish_request_log(
+            request_log_path,
+            request_id,
+            "failed",
+            exc.__class__.__name__,
+            str(exc),
+        )
+        raise
+    finish_request_log(request_log_path, request_id, "success")
+    return data
 
 
 def baostock_result_to_frame(result: Any) -> pd.DataFrame:
