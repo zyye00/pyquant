@@ -39,12 +39,14 @@ def select_dividend_low_vol_download_symbols(
     The result is intended to limit dividend and share downloads to securities
     that can satisfy the strategy's dividend-yield lookback at ``as_of_date``.
     """
-    settings = _validate_selection_config(config)
+    _validate_selection_config(config)
     as_of = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
     counts = price_data.loc[price_data["date"].le(as_of)].groupby("symbol").size()
     return sorted(
-        counts.loc[counts.ge(settings["dividend_yield_lookback_days"])].index.tolist()
+        counts.loc[
+            counts.ge(config["selection"]["dividend_yield_lookback_days"])
+        ].index.tolist()
     )
 
 
@@ -57,7 +59,9 @@ def select_dividend_low_vol_constituents(
     config: dict,
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
-    settings = _validate_selection_config(config)
+    _validate_selection_config(config)
+    universe = config["universe"]
+    selection = config["selection"]
     as_of = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
     price_data = price_data[price_data["date"] <= as_of]
@@ -70,7 +74,7 @@ def select_dividend_low_vol_constituents(
     daily = _add_rolling_market_metrics(
         price_data,
         share_data,
-        settings["market_lookback_days"],
+        universe["lookback_days"],
     )
     snapshot = (
         daily.sort_values(["symbol", "date"])
@@ -81,24 +85,24 @@ def select_dividend_low_vol_constituents(
     market_symbols = _top_symbols(
         snapshot,
         "avg_market_cap_240d",
-        settings["market_cap_keep_ratio"],
+        universe["market_cap_keep_ratio"],
     )
     amount_symbols = _top_symbols(
         snapshot,
         "avg_amount_240d",
-        settings["amount_keep_ratio"],
+        universe["amount_keep_ratio"],
     )
     price_history_symbols = set(
         price_data.groupby("symbol")
         .size()
-        .loc[lambda counts: counts.ge(settings["dividend_yield_lookback_days"])]
+        .loc[lambda counts: counts.ge(selection["dividend_yield_lookback_days"])]
         .index
     )
     eligible_symbols = sorted(market_symbols & amount_symbols & price_history_symbols)
     if not eligible_symbols:
         raise ValueError("No symbols passed the market, liquidity, and price-history filters")
 
-    required_years = _continuous_dividend_years(as_of, settings["dividend_years"])
+    required_years = _continuous_dividend_years(as_of, universe["dividend_years"])
     _require_query_coverage(
         query_data,
         eligible_symbols,
@@ -109,10 +113,10 @@ def select_dividend_low_vol_constituents(
         snapshot[snapshot["symbol"].isin(eligible_symbols)].copy(),
         dividend_data,
         as_of,
-        settings["dividend_years"],
+        universe["dividend_years"],
     )
     metrics = metrics[metrics["consecutive_dividends"]].copy()
-    high_payout_count = floor(len(metrics) * settings["payout_exclude_ratio"])
+    high_payout_count = floor(len(metrics) * universe["payout_exclude_ratio"])
     high_payout_symbols = set(
         metrics.dropna(subset=["payout_ratio"])
         .sort_values(["payout_ratio", "symbol"], ascending=[False, True])
@@ -129,28 +133,28 @@ def select_dividend_low_vol_constituents(
         _average_ttm_dividend_yield(
             candidate_price,
             dividend_data[dividend_data["announce_date"] <= as_of],
-            settings["dividend_yield_lookback_days"],
+            selection["dividend_yield_lookback_days"],
         )
     )
     metrics = metrics.dropna(subset=["avg_dividend_yield_3y"])
     metrics = metrics.sort_values(
         ["avg_dividend_yield_3y", "symbol"], ascending=[False, True]
-    ).head(settings["dividend_top_n"])
+    ).head(selection["dividend_top_n"])
     metrics["dividend_yield_rank"] = np.arange(1, len(metrics) + 1)
 
     candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
     metrics["volatility_240d"] = metrics["symbol"].map(
-        _price_volatility(candidate_price, settings["volatility_lookback_days"])
+        _price_volatility(candidate_price, selection["volatility_lookback_days"])
     )
     metrics = metrics.dropna(subset=["volatility_240d"])
-    if len(metrics) < settings["final_n"]:
+    if len(metrics) < selection["final_n"]:
         raise ValueError(
             f"Only {len(metrics)} eligible symbols remain; "
-            f"at least {settings['final_n']} are required"
+            f"at least {selection['final_n']} are required"
         )
     metrics = metrics.sort_values(
         ["volatility_240d", "symbol"], ascending=[True, True]
-    ).head(settings["final_n"])
+    ).head(selection["final_n"])
     metrics["volatility_rank"] = np.arange(1, len(metrics) + 1)
     weight_total = metrics["avg_dividend_yield_3y"].sum()
     if not np.isfinite(weight_total) or weight_total <= 0:
@@ -249,31 +253,18 @@ def calculate_dividend_low_vol_index(
     return out[INDEX_COLUMNS]
 
 
-def _validate_selection_config(config: dict) -> dict:
+def _validate_selection_config(config: dict) -> None:
     try:
         universe = config["universe"]
         selection = config["selection"]
-        settings = {
-            "market_lookback_days": int(universe["lookback_days"]),
-            "market_cap_keep_ratio": float(universe["market_cap_keep_ratio"]),
-            "amount_keep_ratio": float(universe["amount_keep_ratio"]),
-            "dividend_years": int(universe["dividend_years"]),
-            "payout_exclude_ratio": float(universe["payout_exclude_ratio"]),
-            "dividend_yield_lookback_days": int(
-                selection["dividend_yield_lookback_days"]
-            ),
-            "dividend_top_n": int(selection["dividend_top_n"]),
-            "volatility_lookback_days": int(selection["volatility_lookback_days"]),
-            "final_n": int(selection["final_n"]),
-        }
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError) as exc:
         raise ValueError("Invalid dividend-low-volatility selection configuration") from exc
-    if settings["market_lookback_days"] <= 0 or settings["dividend_years"] < 2:
+    if universe["lookback_days"] <= 0 or universe["dividend_years"] < 2:
         raise ValueError("lookback_days must be positive and dividend_years at least 2")
     for name in ["market_cap_keep_ratio", "amount_keep_ratio"]:
-        if not 0 < settings[name] <= 1:
+        if not 0 < universe[name] <= 1:
             raise ValueError("Universe keep ratios must be in (0, 1]")
-    if not 0 <= settings["payout_exclude_ratio"] < 1:
+    if not 0 <= universe["payout_exclude_ratio"] < 1:
         raise ValueError("payout_exclude_ratio must be in [0, 1)")
     for name in [
         "dividend_yield_lookback_days",
@@ -281,11 +272,10 @@ def _validate_selection_config(config: dict) -> dict:
         "volatility_lookback_days",
         "final_n",
     ]:
-        if settings[name] <= 0:
+        if selection[name] <= 0:
             raise ValueError(f"{name} must be positive")
-    if settings["dividend_top_n"] < settings["final_n"]:
+    if selection["dividend_top_n"] < selection["final_n"]:
         raise ValueError("dividend_top_n must not be smaller than final_n")
-    return settings
 
 
 def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
