@@ -483,6 +483,23 @@ def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
     assert out.loc[0, "cash_dividend_after_tax"] == pytest.approx(0.25)
 
 
+def test_clean_baostock_dividends_sums_or_separated_tax_after_cash():
+    out = clean_baostock_dividends(
+        pd.DataFrame(
+            {
+                "code": ["sh.600000", "sh.600001", "sh.600002"],
+                "dividPlanAnnounceDate": ["2022-05-01"] * 3,
+                "dividCashPsAfterTax": ["0.1或0.2", "0.25", "not-a-number"],
+            }
+        ),
+        "sh.600000",
+        2022,
+    )
+
+    assert out["cash_dividend_after_tax"].tolist()[:2] == pytest.approx([0.3, 0.25])
+    assert pd.isna(out.loc[2, "cash_dividend_after_tax"])
+
+
 def test_clean_baostock_profit_keeps_total_shares_and_dates():
     out = clean_baostock_profit(
         pd.DataFrame(

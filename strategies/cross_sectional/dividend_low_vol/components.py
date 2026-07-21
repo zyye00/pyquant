@@ -29,6 +29,25 @@ INDEX_COLUMNS = [
 ]
 
 
+def select_dividend_low_vol_download_symbols(
+    price: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    config: dict,
+) -> list[str]:
+    """Return symbols with enough valid price observations for selection.
+
+    The result is intended to limit dividend and share downloads to securities
+    that can satisfy the strategy's dividend-yield lookback at ``as_of_date``.
+    """
+    settings = _validate_selection_config(config)
+    as_of = pd.Timestamp(as_of_date)
+    price_data = _prepare_price(price)
+    counts = price_data.loc[price_data["date"].le(as_of)].groupby("symbol").size()
+    return sorted(
+        counts.loc[counts.ge(settings["dividend_yield_lookback_days"])].index.tolist()
+    )
+
+
 def select_dividend_low_vol_constituents(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
@@ -69,14 +88,17 @@ def select_dividend_low_vol_constituents(
         "avg_amount_240d",
         settings["amount_keep_ratio"],
     )
-    eligible_symbols = sorted(market_symbols & amount_symbols)
-    if not eligible_symbols:
-        raise ValueError("No symbols passed the market-cap and liquidity filters")
-
-    required_years = range(
-        as_of.year - settings["dividend_years"],
-        as_of.year + 1,
+    price_history_symbols = set(
+        price_data.groupby("symbol")
+        .size()
+        .loc[lambda counts: counts.ge(settings["dividend_yield_lookback_days"])]
+        .index
     )
+    eligible_symbols = sorted(market_symbols & amount_symbols & price_history_symbols)
+    if not eligible_symbols:
+        raise ValueError("No symbols passed the market, liquidity, and price-history filters")
+
+    required_years = _continuous_dividend_years(as_of, settings["dividend_years"])
     _require_query_coverage(
         query_data,
         eligible_symbols,
@@ -399,8 +421,7 @@ def _add_dividend_metrics(
     trailing = visible[
         visible["announce_date"] > as_of - pd.Timedelta(days=365)
     ].groupby("symbol")["cash_dividend_after_tax"].sum()
-    continuous_start = as_of.year - dividend_years + (1 if as_of.month == 12 else 0)
-    continuous_years = range(continuous_start, continuous_start + dividend_years)
+    continuous_years = _continuous_dividend_years(as_of, dividend_years)
     metrics["consecutive_dividends"] = metrics["symbol"].map(
         lambda symbol: all(
             annual.get((symbol, year), 0.0) > 0 for year in continuous_years
@@ -423,6 +444,16 @@ def _add_dividend_metrics(
     )
     metrics["payout_ratio"] = metrics["dividend_yield_ttm"] * metrics["pe_ttm"]
     return metrics
+
+
+def _current_year_is_available(as_of: pd.Timestamp) -> bool:
+    """Treat December 21 onward as the month-end annual-data cutoff."""
+    return as_of.month == 12 and as_of.day >= 21
+
+
+def _continuous_dividend_years(as_of: pd.Timestamp, dividend_years: int) -> range:
+    start = as_of.year - dividend_years + _current_year_is_available(as_of)
+    return range(start, start + dividend_years)
 
 
 def _average_ttm_dividend_yield(

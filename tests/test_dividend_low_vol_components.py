@@ -25,6 +25,7 @@ CONSTITUENT_COLUMNS = COMPONENTS.CONSTITUENT_COLUMNS
 INDEX_COLUMNS = COMPONENTS.INDEX_COLUMNS
 calculate_index = COMPONENTS.calculate_dividend_low_vol_index
 select_constituents = COMPONENTS.select_dividend_low_vol_constituents
+select_download_symbols = COMPONENTS.select_dividend_low_vol_download_symbols
 
 
 def make_config(
@@ -140,6 +141,29 @@ def empty_index_dividends() -> pd.DataFrame:
     return pd.DataFrame(
         columns=["symbol", "payment_date", "cash_dividend_after_tax"]
     )
+
+
+def test_download_symbols_require_720_valid_prices_by_as_of_date():
+    dates = pd.bdate_range("2021-01-01", periods=7)
+    price = make_price(
+        ["QUALIFIED", "SHORT", "FUTURE"],
+        dates=dates,
+        closes={
+            "QUALIFIED": [10.0] * 7,
+            "SHORT": [10.0] * 5 + [None, 10.0],
+            "FUTURE": [None] * 6 + [10.0],
+        },
+    )
+    original = price.copy(deep=True)
+
+    out = select_download_symbols(
+        price,
+        dates[5],
+        make_config(dividend_yield_lookback_days=6),
+    )
+
+    assert out == ["QUALIFIED"]
+    pd.testing.assert_frame_equal(price, original)
 
 
 def test_full_75_then_50_selection_order_and_weights():
@@ -317,6 +341,44 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     assert out.loc["A", "avg_dividend_yield_3y"] == pytest.approx(0.1)
 
 
+@pytest.mark.parametrize(
+    ("as_of", "expected_years"),
+    [
+        ("2013-12-20", [2010, 2011, 2012]),
+        ("2013-12-21", [2011, 2012, 2013]),
+    ],
+)
+def test_december_annual_dividend_cutoff(as_of, expected_years):
+    assert COMPONENTS._current_year_is_available(pd.Timestamp(as_of)) == as_of.endswith(
+        "12-21"
+    )
+    assert list(COMPONENTS._continuous_dividend_years(pd.Timestamp(as_of), 3)) == expected_years
+    metrics = pd.DataFrame(
+        {"symbol": ["A"], "close": [10.0], "pe_ttm": [10.0]}
+    )
+    dividends = pd.DataFrame(
+        {
+            "symbol": ["A"] * 4,
+            "year": [2010, 2011, 2012, 2013],
+            "announce_date": pd.to_datetime(
+                ["2010-06-01", "2011-06-01", "2012-06-01", "2013-06-01"]
+            ),
+            "cash_dividend_after_tax": [1.0, 1.0, 1.0, 0.0],
+        }
+    )
+
+    out = COMPONENTS._add_dividend_metrics(
+        metrics,
+        dividends,
+        pd.Timestamp(as_of),
+        3,
+    )
+
+    assert bool(out.loc[0, "consecutive_dividends"]) == (
+        expected_years == [2010, 2011, 2012]
+    )
+
+
 def test_missing_query_coverage_and_insufficient_history_raise():
     inputs = [make_price(["A"]), make_dividends(["A"]), make_shares(["A"])]
     config = make_config(dividend_top_n=1, final_n=1)
@@ -325,14 +387,14 @@ def test_missing_query_coverage_and_insufficient_history_raise():
         select_constituents(
             inputs[0],
             inputs[1],
-            make_queries(["A"], range(2021, 2024)),
+            make_queries(["A"], range(2021, 2023)),
             inputs[2],
             "2024-11-29",
             config,
         )
 
     short_price = inputs[0].groupby("symbol").tail(5)
-    with pytest.raises(ValueError, match="Only 0 eligible symbols remain"):
+    with pytest.raises(ValueError, match="price-history filters"):
         select_constituents(
             short_price,
             inputs[1],
@@ -341,6 +403,28 @@ def test_missing_query_coverage_and_insufficient_history_raise():
             "2024-11-29",
             config,
         )
+
+
+def test_query_coverage_is_checked_after_price_history_filter():
+    dates = pd.bdate_range("2024-11-18", periods=6)
+    price = pd.concat(
+        [
+            make_price(["QUALIFIED"], dates=dates),
+            make_price(["SHORT"], dates=dates[:5]),
+        ],
+        ignore_index=True,
+    )
+
+    out = select_constituents(
+        price,
+        make_dividends(["QUALIFIED", "SHORT"]),
+        make_queries(["QUALIFIED"], range(2021, 2024)),
+        make_shares(["QUALIFIED", "SHORT"]),
+        "2024-11-29",
+        make_config(dividend_top_n=1, final_n=1),
+    )
+
+    assert out.index.tolist() == ["QUALIFIED"]
 
 
 def test_duplicate_price_key_and_invalid_config_raise():

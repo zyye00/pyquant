@@ -198,9 +198,22 @@ def clean_baostock_dividends(
     out["year"] = year
     for column in ["announce_date", "record_date", "operate_date", "payment_date"]:
         out[column] = pd.to_datetime(out[column], errors="coerce").dt.date
+    out["cash_dividend_after_tax"] = out["cash_dividend_after_tax"].map(
+        _parse_baostock_cash_dividend
+    )
     for column in fields["float32"]:
-        out[column] = pd.to_numeric(out[column], errors="coerce").astype("float32")
+        out[column] = out[column].astype("float32")
     return out[fields["data"]]
+
+
+def _parse_baostock_cash_dividend(value: object) -> float:
+    """Sum BaoStock tax-after cash amounts joined by the Chinese `or` marker."""
+    if pd.isna(value):
+        return float("nan")
+    try:
+        return sum(float(part.strip()) for part in str(value).split("或"))
+    except ValueError:
+        return float("nan")
 
 
 def clean_baostock_profit(
