@@ -172,16 +172,12 @@ def calculate_dividend_low_vol_index(
     constituents: pd.DataFrame,
     effective_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
-    price_base_value: float = 1000.0,
-    total_return_base_value: float = 1000.0,
 ) -> pd.DataFrame:
-    """Calculate one fixed-constituent price and total-return index segment."""
+    """Calculate one unit-based fixed-constituent index segment."""
     effective = pd.Timestamp(effective_date)
     end = pd.Timestamp(end_date)
     if effective > end:
         raise ValueError("effective_date must not be after end_date")
-    if price_base_value <= 0 or total_return_base_value <= 0:
-        raise ValueError("Index base values must be positive")
     members = _prepare_constituents(constituents)
     price_data = _prepare_index_price(price)
     query_data = _prepare_dividend_queries(dividend_queries)
@@ -243,14 +239,101 @@ def calculate_dividend_low_vol_index(
             "price_return": price_return,
             "total_return": total_return,
             "dividend_cash": dividend_cash,
-            "price_index": price_base_value
-            * portfolio_value.div(portfolio_value.iloc[0]),
-            "total_return_index": total_return_base_value
-            * (1.0 + total_return).cumprod(),
+            "price_index": portfolio_value.div(portfolio_value.iloc[0]),
+            "total_return_index": (1.0 + total_return).cumprod(),
         },
         index=calendar,
     )
     return out[INDEX_COLUMNS]
+
+
+def calculate_dividend_low_vol_rebalanced_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    config: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Calculate annually rebalanced price and total-return indices.
+
+    Constituents are selected at each December's second-Friday close and take
+    effect on the next available price-calendar date.
+    """
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    price_data = _prepare_index_price(price)
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(start, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    schedule = _annual_rebalance_schedule(calendar, start, end)
+    if not schedule:
+        raise ValueError("No annual rebalance effective date falls within the period")
+
+    index_segments = []
+    constituent_snapshots = []
+    for position, (as_of_date, effective_date) in enumerate(schedule):
+        constituents = select_dividend_low_vol_constituents(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            as_of_date,
+            config,
+        )
+        constituent_snapshots.append(
+            constituents.reset_index()
+            .assign(effective_date=effective_date)
+            .set_index(["effective_date", "symbol"])
+        )
+        segment_end = (
+            schedule[position + 1][1] if position + 1 < len(schedule) else end
+        )
+        segment = calculate_dividend_low_vol_index(
+            price,
+            dividends,
+            dividend_queries,
+            constituents,
+            effective_date,
+            segment_end,
+        )
+        if index_segments:
+            segment["price_index"] = (
+                index_segments[-1]["price_index"].iloc[-1]
+                * (1.0 + segment["price_return"]).cumprod()
+            )
+            segment["total_return_index"] = (
+                index_segments[-1]["total_return_index"].iloc[-1]
+                * (1.0 + segment["total_return"]).cumprod()
+            )
+            segment = segment.iloc[1:]
+        index_segments.append(segment)
+    return (
+        pd.concat(index_segments),
+        pd.concat(constituent_snapshots).sort_index(),
+    )
+
+
+def _annual_rebalance_schedule(
+    calendar: pd.Index,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    schedule = []
+    for year in range(start.year, end.year + 1):
+        as_of_date = pd.date_range(
+            f"{year}-12-01", periods=2, freq="W-FRI"
+        )[1]
+        position = calendar.searchsorted(as_of_date, side="right")
+        if position < len(calendar):
+            schedule.append((as_of_date, calendar[position]))
+    return schedule
 
 
 def _validate_selection_config(config: dict) -> None:
