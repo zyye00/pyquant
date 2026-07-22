@@ -450,7 +450,7 @@ def test_clean_baostock_data_removes_source_fields_and_casts_types():
 
     assert out.columns.tolist() == ["date", "open", "volume", "amount", "isST"]
     assert len(out) == 1
-    assert isinstance(out.loc[0, "date"], date)
+    assert pd.api.types.is_datetime64_any_dtype(out["date"])
     assert str(out["isST"].dtype) == "boolean"
 
 
@@ -479,7 +479,8 @@ def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
         "payment_date",
         "cash_dividend_after_tax",
     ]
-    assert out.loc[0, "operate_date"] == date(2022, 5, 11)
+    assert pd.api.types.is_datetime64_any_dtype(out["operate_date"])
+    assert out.loc[0, "operate_date"] == pd.Timestamp("2022-05-11")
     assert out.loc[0, "cash_dividend_after_tax"] == pytest.approx(0.25)
 
 
@@ -523,7 +524,8 @@ def test_clean_baostock_profit_keeps_total_shares_and_dates():
         "report_date",
         "total_shares",
     ]
-    assert out.loc[0, "report_date"] == date(2022, 3, 31)
+    assert pd.api.types.is_datetime64_any_dtype(out["report_date"])
+    assert out.loc[0, "report_date"] == pd.Timestamp("2022-03-31")
     assert out.loc[0, "total_shares"] == pytest.approx(123456789)
 
 

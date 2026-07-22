@@ -126,11 +126,15 @@ def make_dividends(
             }
             for year, value in zip(years, symbol_values, strict=True)
         )
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    out["announce_date"] = pd.to_datetime(out["announce_date"])
+    return out
 
 
 def make_index_price(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
-    return pd.DataFrame(rows, columns=["date", "symbol", "close"])
+    out = pd.DataFrame(rows, columns=["date", "symbol", "close"])
+    out["date"] = pd.to_datetime(out["date"])
+    return out
 
 
 def make_index_queries(symbols: list[str]) -> pd.DataFrame:
@@ -322,7 +326,7 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     shares = pd.DataFrame(
         {
             "symbol": ["A", "A"],
-            "publish_date": ["2023-01-01", "2024-12-15"],
+            "publish_date": pd.to_datetime(["2023-01-01", "2024-12-15"]),
             "total_shares": [100.0, 1_000.0],
         }
     )
@@ -349,9 +353,6 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     ],
 )
 def test_december_annual_dividend_cutoff(as_of, expected_years):
-    assert COMPONENTS._current_year_is_available(pd.Timestamp(as_of)) == as_of.endswith(
-        "12-21"
-    )
     assert list(COMPONENTS._continuous_dividend_years(pd.Timestamp(as_of), 3)) == expected_years
     metrics = pd.DataFrame(
         {"symbol": ["A"], "close": [10.0], "pe_ttm": [10.0]}
@@ -533,7 +534,7 @@ def test_total_return_credits_payment_and_moves_weekend_payment_forward():
     dividends = pd.DataFrame(
         {
             "symbol": ["A", "A"],
-            "payment_date": ["2024-01-06", "2024-01-09"],
+            "payment_date": pd.to_datetime(["2024-01-06", "2024-01-09"]),
             "cash_dividend_after_tax": [1.0, 1.0],
         }
     )
@@ -643,7 +644,7 @@ def test_index_validates_coverage_effective_prices_and_duplicate_events():
     duplicated_dividends = pd.DataFrame(
         {
             "symbol": ["A", "A"],
-            "payment_date": ["2024-01-03", "2024-01-03"],
+            "payment_date": pd.to_datetime(["2024-01-03", "2024-01-03"]),
             "cash_dividend_after_tax": [1.0, 1.0],
         }
     )

@@ -6,7 +6,7 @@ from pyquant import build_universe
 def test_build_universe_filters_dates_and_symbols():
     price = pd.DataFrame(
         {
-            "date": ["2024-01-02", "2024-01-02", "2024-01-03"],
+            "date": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-03"]),
             "symbol": ["A", "B", "A"],
             "close": [1, 2, 3],
         }

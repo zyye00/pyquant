@@ -40,9 +40,9 @@ def select_dividend_low_vol_download_symbols(
     that can satisfy the strategy's dividend-yield lookback at ``as_of_date``.
     """
     _validate_selection_config(config)
-    as_of = pd.Timestamp(as_of_date)
+    as_of_date = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
-    counts = price_data.loc[price_data["date"].le(as_of)].groupby("symbol").size()
+    counts = price_data.loc[price_data["date"].le(as_of_date)].groupby("symbol").size()
     return sorted(
         counts.loc[
             counts.ge(config["selection"]["dividend_yield_lookback_days"])
@@ -62,22 +62,22 @@ def select_dividend_low_vol_constituents(
     _validate_selection_config(config)
     universe = config["universe"]
     selection = config["selection"]
-    as_of = pd.Timestamp(as_of_date)
+    as_of_date = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
-    price_data = price_data[price_data["date"] <= as_of]
+    price_data = price_data[price_data["date"] <= as_of_date]
     if price_data.empty:
-        raise ValueError(f"No price data is available on or before {as_of.date()}")
+        raise ValueError(f"No price data is available on or before {as_of_date.date()}")
     dividend_data = _prepare_selection_dividends(dividends)
     query_data = _prepare_dividend_queries(dividend_queries)
     share_data = _prepare_shares(shares)
 
-    daily = _add_rolling_market_metrics(
+    snapshot = _add_rolling_market_metrics(
         price_data,
         share_data,
         universe["lookback_days"],
     )
     snapshot = (
-        daily.sort_values(["symbol", "date"])
+        snapshot.sort_values(["symbol", "date"])
         .groupby("symbol", sort=False)
         .tail(1)
         .dropna(subset=["avg_market_cap_240d", "avg_amount_240d"])
@@ -102,17 +102,17 @@ def select_dividend_low_vol_constituents(
     if not eligible_symbols:
         raise ValueError("No symbols passed the market, liquidity, and price-history filters")
 
-    required_years = _continuous_dividend_years(as_of, universe["dividend_years"])
+    required_years = _continuous_dividend_years(as_of_date, universe["dividend_years"])
     _require_query_coverage(
         query_data,
         eligible_symbols,
         required_years,
-        f"selection at {as_of.date()}",
+        f"selection at {as_of_date.date()}",
     )
     metrics = _add_dividend_metrics(
         snapshot[snapshot["symbol"].isin(eligible_symbols)].copy(),
         dividend_data,
-        as_of,
+        as_of_date,
         universe["dividend_years"],
     )
     metrics = metrics[metrics["consecutive_dividends"]].copy()
@@ -132,7 +132,7 @@ def select_dividend_low_vol_constituents(
     metrics["avg_dividend_yield_3y"] = metrics["symbol"].map(
         _average_ttm_dividend_yield(
             candidate_price,
-            dividend_data[dividend_data["announce_date"] <= as_of],
+            dividend_data[dividend_data["announce_date"] <= as_of_date],
             selection["dividend_yield_lookback_days"],
         )
     )
@@ -160,7 +160,7 @@ def select_dividend_low_vol_constituents(
     if not np.isfinite(weight_total) or weight_total <= 0:
         raise ValueError("Selected dividend yields must sum to a positive value")
     metrics["weight"] = metrics["avg_dividend_yield_3y"] / weight_total
-    metrics["as_of_date"] = as_of
+    metrics["as_of_date"] = as_of_date
     metrics["price_date"] = metrics["date"]
     return metrics.set_index("symbol")[CONSTITUENT_COLUMNS]
 
@@ -282,14 +282,8 @@ def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
     required = {"date", "symbol", "close", "amount", "pe_ttm"}
     _require_columns(price, required, "price")
     out = price.loc[:, sorted(required)].copy()
-    out["date"] = pd.to_datetime(out["date"], errors="raise")
-    if out["symbol"].isna().any():
-        raise ValueError("price.symbol must not contain missing values")
-    out["symbol"] = out["symbol"].astype(str)
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
-    for column in ["close", "amount", "pe_ttm"]:
-        out[column] = pd.to_numeric(out[column], errors="coerce")
     out = out[out["close"].gt(0) & out["amount"].ge(0)]
     return out.sort_values(["symbol", "date"]).reset_index(drop=True)
 
@@ -298,9 +292,6 @@ def _prepare_index_price(price: pd.DataFrame) -> pd.DataFrame:
     required = {"date", "symbol", "close"}
     _require_columns(price, required, "price")
     out = price.loc[:, sorted(required)].copy()
-    out["date"] = pd.to_datetime(out["date"], errors="raise")
-    out["symbol"] = out["symbol"].astype(str)
-    out["close"] = pd.to_numeric(out["close"], errors="coerce")
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
     return out.dropna(subset=["close"]).sort_values(["date", "symbol"])
@@ -310,27 +301,16 @@ def _prepare_selection_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "year", "announce_date", "cash_dividend_after_tax"}
     _require_columns(dividends, required, "dividends")
     out = dividends.loc[:, sorted(required)].copy()
-    out["symbol"] = out["symbol"].astype(str)
-    out["year"] = pd.to_numeric(out["year"], errors="raise").astype(int)
-    out["announce_date"] = pd.to_datetime(out["announce_date"], errors="coerce")
-    out["cash_dividend_after_tax"] = pd.to_numeric(
-        out["cash_dividend_after_tax"], errors="coerce"
-    )
     return out.dropna(subset=["announce_date", "cash_dividend_after_tax"])
 
 
 def _prepare_dividend_queries(dividend_queries: pd.DataFrame) -> pd.DataFrame:
     if {"symbol", "year"}.issubset(dividend_queries.columns):
         out = dividend_queries[["symbol", "year"]].copy()
-        out["symbol"] = out["symbol"].astype(str)
-        out["year"] = pd.to_numeric(out["year"], errors="raise").astype(int)
         return out.drop_duplicates().sort_values(["symbol", "year"])
     required = {"symbol", "start", "end"}
     _require_columns(dividend_queries, required, "dividend_queries")
     out = dividend_queries.loc[:, sorted(required)].copy()
-    out["symbol"] = out["symbol"].astype(str)
-    out["start"] = pd.to_datetime(out["start"], errors="raise")
-    out["end"] = pd.to_datetime(out["end"], errors="raise")
     out = out.loc[out["start"] <= out["end"]]
     out = out.loc[
         out.index.repeat(out["end"].dt.year - out["start"].dt.year + 1)
@@ -344,11 +324,7 @@ def _prepare_shares(shares: pd.DataFrame) -> pd.DataFrame:
     _require_columns(shares, required, "shares")
     columns = sorted(required | ({"report_date"} & set(shares.columns)))
     out = shares.loc[:, columns].copy()
-    out["symbol"] = out["symbol"].astype(str)
-    out["publish_date"] = pd.to_datetime(out["publish_date"], errors="coerce")
-    out["total_shares"] = pd.to_numeric(out["total_shares"], errors="coerce")
     if "report_date" in out:
-        out["report_date"] = pd.to_datetime(out["report_date"], errors="coerce")
         out = out.sort_values(["symbol", "publish_date", "report_date"])
     out = out.dropna(subset=["publish_date", "total_shares"])
     out = out[out["total_shares"] > 0]
@@ -436,13 +412,8 @@ def _add_dividend_metrics(
     return metrics
 
 
-def _current_year_is_available(as_of: pd.Timestamp) -> bool:
-    """Treat December 21 onward as the month-end annual-data cutoff."""
-    return as_of.month == 12 and as_of.day >= 21
-
-
 def _continuous_dividend_years(as_of: pd.Timestamp, dividend_years: int) -> range:
-    start = as_of.year - dividend_years + _current_year_is_available(as_of)
+    start = as_of.year - dividend_years + (as_of.month == 12 and as_of.day >= 21)
     return range(start, start + dividend_years)
 
 
@@ -509,11 +480,6 @@ def _index_dividend_cash(
     if dividends.duplicated(event_key).any():
         raise ValueError(f"dividends contain duplicate event keys: {event_key}")
     events = dividends.loc[:, sorted(required)].copy()
-    events["symbol"] = events["symbol"].astype(str)
-    events["payment_date"] = pd.to_datetime(events["payment_date"], errors="coerce")
-    events["cash_dividend_after_tax"] = pd.to_numeric(
-        events["cash_dividend_after_tax"], errors="coerce"
-    )
     events = events[
         events["symbol"].isin(normalized_shares.index)
         & events["payment_date"].gt(effective)

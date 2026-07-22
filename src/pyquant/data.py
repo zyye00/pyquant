@@ -305,7 +305,9 @@ def _read_dataset_file(
         date_column,
     )
     if source_date in data:
-        values = pd.to_datetime(data[source_date], errors="coerce")
+        values = data[source_date]
+        if not pd.api.types.is_datetime64_any_dtype(values):
+            values = pd.to_datetime(values, errors="coerce")
         if start is not None:
             data = data[values >= start]
             values = values.loc[data.index]
@@ -329,7 +331,7 @@ def _canonicalize_dataset(data: pd.DataFrame, dataset: dict[str, Any]) -> pd.Dat
             raise ValueError("Dataset symbol must not contain missing values")
         out["symbol"] = out["symbol"].astype(str)
     for column in dataset.get("date_columns", []):
-        if column in out:
+        if column in out and not pd.api.types.is_datetime64_any_dtype(out[column]):
             out[column] = pd.to_datetime(out[column], errors="coerce")
     for column in dataset.get("numeric_columns", []):
         if column in out:

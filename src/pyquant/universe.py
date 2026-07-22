@@ -17,8 +17,6 @@ def build_universe(
         raise ValueError(f"Missing required price columns: {sorted(missing)}")
 
     df = price.loc[:, ["date", "symbol"]].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df["symbol"] = df["symbol"].astype(str)
 
     if symbols is not None:
         df = df[df["symbol"].isin([str(symbol) for symbol in symbols])]

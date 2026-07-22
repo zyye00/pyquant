@@ -164,7 +164,7 @@ def clean_baostock_data(data: pd.DataFrame) -> pd.DataFrame:
     out = data.copy()
     if "tradestatus" in out:
         out = out.loc[out["tradestatus"].astype(str) == "1"].copy()
-    out["date"] = pd.to_datetime(out["date"]).dt.date
+    out["date"] = pd.to_datetime(out["date"])
     for column in set(_fields["history"]["float32"]) & set(out.columns):
         out[column] = pd.to_numeric(out[column], errors="coerce").astype("float32")
     if "amount" in out:
@@ -197,7 +197,7 @@ def clean_baostock_dividends(
     out["code"] = out["code"].fillna(code).astype(str)
     out["year"] = year
     for column in ["announce_date", "record_date", "operate_date", "payment_date"]:
-        out[column] = pd.to_datetime(out[column], errors="coerce").dt.date
+        out[column] = pd.to_datetime(out[column], errors="coerce")
     out["cash_dividend_after_tax"] = out["cash_dividend_after_tax"].map(
         _parse_baostock_cash_dividend
     )
@@ -238,7 +238,7 @@ def clean_baostock_profit(
     out["year"] = year
     out["quarter"] = quarter
     for column in ["publish_date", "report_date"]:
-        out[column] = pd.to_datetime(out[column], errors="coerce").dt.date
+        out[column] = pd.to_datetime(out[column], errors="coerce")
     for column in fields["numeric"]:
         out[column] = pd.to_numeric(out[column], errors="coerce")
     return out[fields["data"]]
@@ -389,7 +389,9 @@ def remove_download_lock(data_root: Path = Path("data")) -> None:
 def merge_history_data(data: pd.DataFrame, target_path: Path) -> pd.DataFrame:
     if not target_path.exists():
         return data
-    out = pd.concat([pd.read_parquet(target_path), data], ignore_index=True)
+    existing = pd.read_parquet(target_path)
+    existing["date"] = pd.to_datetime(existing["date"], errors="raise")
+    out = pd.concat([existing, data], ignore_index=True)
     keys = ["date"] + (["time"] if "time" in out else [])
     return (
         out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
