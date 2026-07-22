@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -464,6 +465,25 @@ def test_strategy_config_contains_original_index_parameters_only():
         "final_n": 50,
         "volatility_lookback_days": 240,
     }
+    assert config["data"] == {
+        "start_date": "2013-12-16",
+        "end_date": "2023-06-16",
+        "pool": "all",
+    }
+
+
+def test_notebooks_split_downloads_from_calculation():
+    notebooks = {
+        name: json.loads((STRATEGY_DIR / name).read_text(encoding="utf-8"))
+        for name in ["download.ipynb", "run.ipynb"]
+    }
+    for notebook in notebooks.values():
+        for cell in notebook["cells"]:
+            if cell["cell_type"] == "code":
+                compile("".join(cell["source"]), "notebook_cell", "exec")
+
+    assert "update_dataset" in str(notebooks["download.ipynb"])
+    assert "update_dataset" not in str(notebooks["run.ipynb"])
 
 
 def test_fixed_quantity_price_index_and_suspension_forward_fill():

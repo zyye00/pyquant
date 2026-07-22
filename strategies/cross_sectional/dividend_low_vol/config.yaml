@@ -2,6 +2,11 @@ strategy:
   name: dividend_low_vol
   type: cross_sectional
 
+data:
+  start_date: "2013-12-16"
+  end_date: "2023-06-16"
+  pool: all
+
 universe:
   lookback_days: 240
   market_cap_keep_ratio: 0.8
