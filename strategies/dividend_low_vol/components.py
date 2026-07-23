@@ -5,7 +5,10 @@ from math import floor
 import numpy as np
 import pandas as pd
 
-from pyquant import build_dividend_low_vol_universe
+from pyquant import (
+    build_dividend_low_vol_universe,
+    prepare_dividend_low_vol_universe_inputs,
+)
 
 
 CONSTITUENT_COLUMNS = [
@@ -59,6 +62,7 @@ def select_dividend_low_vol_constituents(
     shares: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
+    prepared: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
     _validate_selection_config(config)
@@ -75,6 +79,7 @@ def select_dividend_low_vol_constituents(
         as_of_date,
         config["universe"],
         selection["dividend_yield_lookback_days"],
+        prepared,
     ).reset_index()
 
     candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
@@ -121,6 +126,7 @@ def calculate_dividend_low_vol_index(
     constituents: pd.DataFrame,
     effective_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
+    prepared: dict | None = None,
 ) -> pd.DataFrame:
     """Calculate one unit-based fixed-constituent index segment."""
     effective = pd.Timestamp(effective_date)
@@ -128,17 +134,16 @@ def calculate_dividend_low_vol_index(
     if effective > end:
         raise ValueError("effective_date must not be after end_date")
     members = _prepare_constituents(constituents)
-    price_data = _prepare_index_price(price)
-    query_data = _prepare_dividend_queries(dividend_queries)
+    prepared = prepared or _prepare_index_inputs(price, dividends, dividend_queries)
+    price_data = prepared["price"]
     symbols = members.index.tolist()
-    _require_query_coverage(
-        query_data,
+    _require_query_coverage_from_set(
+        prepared["query_coverage"],
         symbols,
         range(effective.year - 1, end.year + 1),
         f"index period {effective.date()} to {end.date()}",
     )
 
-    member_price = price_data[price_data["symbol"].isin(symbols)]
     calendar = pd.Index(
         price_data.loc[price_data["date"].between(effective, end), "date"]
         .drop_duplicates()
@@ -148,14 +153,9 @@ def calculate_dividend_low_vol_index(
     if effective not in calendar:
         raise ValueError(f"effective_date is not present in the price calendar: {effective.date()}")
     prices = (
-        member_price[member_price["date"].le(end)]
-        .pivot(index="date", columns="symbol", values="close")
+        prepared["prices"]
         .reindex(columns=symbols)
-        .reindex(
-            price_data.loc[price_data["date"].le(end), "date"]
-            .drop_duplicates()
-            .sort_values()
-        )
+        .loc[:end]
         .ffill()
         .reindex(calendar)
     )
@@ -170,7 +170,7 @@ def calculate_dividend_low_vol_index(
     portfolio_value = prices.mul(normalized_shares, axis="columns").sum(axis=1)
 
     dividend_cash = _index_dividend_cash(
-        dividends,
+        prepared["dividend_events"],
         normalized_shares,
         calendar,
         effective,
@@ -288,6 +288,10 @@ def _calculate_dividend_low_vol_rebalanced_index(
     config: dict,
     schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    prepared = prepare_dividend_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
     index_segments = []
     constituent_snapshots = []
     for position, (as_of_date, effective_date) in enumerate(schedule):
@@ -298,6 +302,7 @@ def _calculate_dividend_low_vol_rebalanced_index(
             shares,
             as_of_date,
             config,
+            prepared,
         )
         constituent_snapshots.append(
             constituents.reset_index()
@@ -314,6 +319,7 @@ def _calculate_dividend_low_vol_rebalanced_index(
             constituents,
             effective_date,
             segment_end,
+            index_inputs,
         )
         if index_segments:
             segment["price_index"] = (
@@ -403,6 +409,33 @@ def _prepare_index_price(price: pd.DataFrame) -> pd.DataFrame:
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
     return out.dropna(subset=["close"]).sort_values(["date", "symbol"])
+
+
+def _prepare_index_inputs(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+) -> dict:
+    price_data = _prepare_index_price(price)
+    required = {"symbol", "payment_date", "cash_dividend_after_tax"}
+    _require_columns(dividends, required, "dividends")
+    event_key = [
+        column
+        for column in [
+            "symbol", "year", "announce_date", "record_date", "operate_date",
+            "payment_date", "cash_dividend_after_tax",
+        ]
+        if column in dividends
+    ]
+    if dividends.duplicated(event_key).any():
+        raise ValueError(f"dividends contain duplicate event keys: {event_key}")
+    events = dividends.loc[:, sorted(required)].copy()
+    return {
+        "price": price_data,
+        "prices": price_data.pivot(index="date", columns="symbol", values="close"),
+        "dividend_events": events,
+        "query_coverage": set(_prepare_dividend_queries(dividend_queries).itertuples(index=False, name=None)),
+    }
 
 
 def _prepare_selection_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
@@ -582,29 +615,11 @@ def _index_dividend_cash(
     effective: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.Series:
-    required = {"symbol", "payment_date", "cash_dividend_after_tax"}
-    _require_columns(dividends, required, "dividends")
-    event_key = [
-        column
-        for column in [
-            "symbol",
-            "year",
-            "announce_date",
-            "record_date",
-            "operate_date",
-            "payment_date",
-            "cash_dividend_after_tax",
-        ]
-        if column in dividends
-    ]
-    if dividends.duplicated(event_key).any():
-        raise ValueError(f"dividends contain duplicate event keys: {event_key}")
-    events = dividends.loc[:, sorted(required)].copy()
-    events = events[
-        events["symbol"].isin(normalized_shares.index)
-        & events["payment_date"].gt(effective)
-        & events["payment_date"].le(end)
-        & events["cash_dividend_after_tax"].gt(0)
+    events = dividends.loc[
+        dividends["symbol"].isin(normalized_shares.index)
+        & dividends["payment_date"].gt(effective)
+        & dividends["payment_date"].le(end)
+        & dividends["cash_dividend_after_tax"].gt(0)
     ]
     cash = pd.Series(0.0, index=calendar, name="dividend_cash")
     for event in events.itertuples(index=False):
@@ -625,6 +640,22 @@ def _require_query_coverage(
     completed = set(queries.itertuples(index=False, name=None))
     required = {(symbol, year) for symbol in symbols for year in years}
     missing = sorted(required - completed)
+    if missing:
+        raise ValueError(
+            f"Dividend query coverage missing for {len(missing)} symbol-years "
+            f"during {context}; examples: {missing[:5]}"
+        )
+
+
+def _require_query_coverage_from_set(
+    completed: set[tuple],
+    symbols: list[str],
+    years: range,
+    context: str,
+) -> None:
+    missing = sorted(
+        {(symbol, year) for symbol in symbols for year in years} - completed
+    )
     if missing:
         raise ValueError(
             f"Dividend query coverage missing for {len(missing)} symbol-years "

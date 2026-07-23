@@ -41,6 +41,7 @@ def build_dividend_low_vol_universe(
     as_of_date: str | pd.Timestamp,
     config: dict,
     price_history_lookback_days: int,
+    prepared: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Build the point-in-time dividend low-volatility universe.
 
@@ -49,15 +50,18 @@ def build_dividend_low_vol_universe(
     """
     _validate_dividend_low_vol_config(config, price_history_lookback_days)
     as_of_date = pd.Timestamp(as_of_date)
-    price_data = _prepare_dividend_low_vol_price(price)
+    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    price_data = prepared["price"]
     price_data = price_data[price_data["date"].le(as_of_date)]
     if price_data.empty:
         raise ValueError(f"No price data is available on or before {as_of_date.date()}")
-    dividend_data = _prepare_dividend_low_vol_dividends(dividends)
-    query_data = _prepare_dividend_low_vol_queries(dividend_queries)
-    share_data = _prepare_dividend_low_vol_shares(shares)
+    dividend_data = prepared["dividends"]
+    query_data = prepared["dividend_queries"]
+    market_data = prepared["market_data"]
     snapshot = _dividend_low_vol_market_snapshot(
-        price_data, share_data, as_of_date, config["lookback_days"]
+        price_data, market_data, as_of_date, config["lookback_days"]
     )
     symbols = sorted(
         _top_dividend_low_vol_symbols(
@@ -67,10 +71,11 @@ def build_dividend_low_vol_universe(
             snapshot, "avg_amount_240d", config["amount_keep_ratio"]
         )
         & set(
-            price_data.groupby("symbol")
-            .size()
-            .loc[lambda counts: counts.ge(price_history_lookback_days)]
-            .index
+            prepared["price_counts"].loc[
+                lambda data: data["date"].eq(as_of_date)
+                & data["observation_count"].ge(price_history_lookback_days),
+                "symbol",
+            ]
         )
     )
     if not symbols:
@@ -98,6 +103,35 @@ def build_dividend_low_vol_universe(
         & metrics["dividend_growth_slope"].ge(0)
         & ~metrics["symbol"].isin(high_payout)
     ].set_index("symbol")
+
+
+def prepare_dividend_low_vol_universe_inputs(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Prepare reusable inputs for repeated dividend low-volatility selections."""
+    price_data = _prepare_dividend_low_vol_price(price)
+    share_data = _prepare_dividend_low_vol_shares(shares)
+    market_data = pd.merge_asof(
+        price_data.sort_values(["date", "symbol"]),
+        share_data.sort_values(["publish_date", "symbol"]),
+        left_on="date",
+        right_on="publish_date",
+        by="symbol",
+        direction="backward",
+    )
+    market_data["total_market_cap"] = market_data["close"] * market_data["total_shares"]
+    price_counts = price_data[["date", "symbol"]].copy()
+    price_counts["observation_count"] = price_counts.groupby("symbol").cumcount() + 1
+    return {
+        "price": price_data,
+        "dividends": _prepare_dividend_low_vol_dividends(dividends),
+        "dividend_queries": _prepare_dividend_low_vol_queries(dividend_queries),
+        "market_data": market_data,
+        "price_counts": price_counts,
+    }
 
 
 def _validate_dividend_low_vol_config(config: dict, price_history_days: int) -> None:
@@ -164,7 +198,7 @@ def _prepare_dividend_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
 
 def _dividend_low_vol_market_snapshot(
     price: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
     lookback_days: int,
 ) -> pd.DataFrame:
@@ -179,16 +213,7 @@ def _dividend_low_vol_market_snapshot(
     snapshot = price[price["date"].eq(as_of_date)].copy()
     if snapshot.empty:
         raise ValueError(f"No price data is available on {as_of_date.date()}")
-    merged = pd.merge_asof(
-        price[price["date"].isin(dates)].sort_values(["date", "symbol"]),
-        shares.sort_values(["publish_date", "symbol"]),
-        left_on="date",
-        right_on="publish_date",
-        by="symbol",
-        direction="backward",
-    )
-    merged["total_market_cap"] = merged["close"] * merged["total_shares"]
-    average = merged.groupby("symbol", as_index=False).agg(
+    average = market_data[market_data["date"].isin(dates)].groupby("symbol", as_index=False).agg(
         avg_market_cap_240d=("total_market_cap", "mean"),
         avg_amount_240d=("amount", "mean"),
     )
