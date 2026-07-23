@@ -25,6 +25,9 @@ CONSTITUENT_COLUMNS = COMPONENTS.CONSTITUENT_COLUMNS
 INDEX_COLUMNS = COMPONENTS.INDEX_COLUMNS
 calculate_index = COMPONENTS.calculate_dividend_low_vol_index
 calculate_rebalanced_index = COMPONENTS.calculate_dividend_low_vol_rebalanced_index
+calculate_monthly_rebalanced_index = (
+    COMPONENTS.calculate_dividend_low_vol_monthly_rebalanced_index
+)
 select_constituents = COMPONENTS.select_dividend_low_vol_constituents
 select_download_symbols = COMPONENTS.select_dividend_low_vol_download_symbols
 
@@ -562,7 +565,7 @@ def test_strategy_config_contains_original_index_parameters_only():
 def test_notebooks_split_downloads_from_calculation():
     notebooks = {
         name: json.loads((STRATEGY_DIR / name).read_text(encoding="utf-8"))
-        for name in ["download.ipynb", "run.ipynb"]
+        for name in ["download.ipynb", "strategy_1_monthly_rebalance.ipynb"]
     }
     for notebook in notebooks.values():
         for cell in notebook["cells"]:
@@ -570,10 +573,42 @@ def test_notebooks_split_downloads_from_calculation():
                 compile("".join(cell["source"]), "notebook_cell", "exec")
 
     assert "update_dataset" in str(notebooks["download.ipynb"])
-    assert "update_dataset" not in str(notebooks["run.ipynb"])
+    strategy_notebook = str(notebooks["strategy_1_monthly_rebalance.ipynb"])
+    assert "update_dataset" not in strategy_notebook
     assert "csindex_daily" in str(notebooks["download.ipynb"])
-    assert "csindex_daily" in str(notebooks["run.ipynb"])
+    assert "csindex_daily" in strategy_notebook
+    assert "calculate_dividend_low_vol_monthly_rebalanced_index" in strategy_notebook
     assert "official_index_job.wait()" in str(notebooks["download.ipynb"])
+
+
+def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
+    symbols = [f"S{index:03d}" for index in range(3)]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    config = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        volatility_lookback_days=4,
+        final_n=2,
+    )
+    strategy_config = {"universe": config["universe"], "strategy_1": config["selection"]}
+    dividends = make_dividends(symbols)
+    dividends["payment_date"] = pd.NaT
+
+    index, constituents = calculate_monthly_rebalanced_index(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+    )
+
+    assert index.index.min() == pd.Timestamp("2024-02-01")
+    assert constituents.index.get_level_values("effective_date").min() == pd.Timestamp(
+        "2024-02-01"
+    )
 
 
 def test_fixed_quantity_price_index_and_suspension_forward_fill():

@@ -19,3 +19,9 @@ selection:
   dividend_top_n: 75
   final_n: 50
   volatility_lookback_days: 240
+
+strategy_1:
+  dividend_yield_lookback_days: 720
+  dividend_top_n: 150
+  final_n: 50
+  volatility_lookback_days: 20

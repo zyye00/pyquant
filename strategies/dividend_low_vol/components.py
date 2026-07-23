@@ -5,6 +5,8 @@ from math import floor
 import numpy as np
 import pandas as pd
 
+from pyquant import build_dividend_low_vol_universe
+
 
 CONSTITUENT_COLUMNS = [
     "as_of_date",
@@ -60,68 +62,20 @@ def select_dividend_low_vol_constituents(
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
     _validate_selection_config(config)
-    universe = config["universe"]
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
     price_data = _prepare_price(price)
     price_data = price_data[price_data["date"] <= as_of_date]
-    if price_data.empty:
-        raise ValueError(f"No price data is available on or before {as_of_date.date()}")
     dividend_data = _prepare_selection_dividends(dividends)
-    query_data = _prepare_dividend_queries(dividend_queries)
-    share_data = _prepare_shares(shares)
-
-    snapshot = _market_snapshot(
+    metrics = build_dividend_low_vol_universe(
         price_data,
-        share_data,
+        dividends,
+        dividend_queries,
+        shares,
         as_of_date,
-        universe["lookback_days"],
-    )
-    market_symbols = _top_symbols(
-        snapshot,
-        "avg_market_cap_240d",
-        universe["market_cap_keep_ratio"],
-    )
-    amount_symbols = _top_symbols(
-        snapshot,
-        "avg_amount_240d",
-        universe["amount_keep_ratio"],
-    )
-    price_history_symbols = set(
-        price_data.groupby("symbol")
-        .size()
-        .loc[lambda counts: counts.ge(selection["dividend_yield_lookback_days"])]
-        .index
-    )
-    eligible_symbols = sorted(market_symbols & amount_symbols & price_history_symbols)
-    if not eligible_symbols:
-        raise ValueError("No symbols passed the market, liquidity, and price-history filters")
-
-    required_years = _continuous_dividend_years(as_of_date, universe["dividend_years"])
-    _require_query_coverage(
-        query_data,
-        eligible_symbols,
-        required_years,
-        f"selection at {as_of_date.date()}",
-    )
-    metrics = _add_dividend_metrics(
-        snapshot[snapshot["symbol"].isin(eligible_symbols)].copy(),
-        dividend_data,
-        as_of_date,
-        universe["dividend_years"],
-    )
-    metrics = metrics[metrics["consecutive_dividends"]].copy()
-    high_payout_count = floor(len(metrics) * universe["payout_exclude_ratio"])
-    high_payout_symbols = set(
-        metrics.dropna(subset=["payout_ratio"])
-        .sort_values(["payout_ratio", "symbol"], ascending=[False, True])
-        .head(high_payout_count)["symbol"]
-    )
-    metrics = metrics[
-        metrics["payout_ratio"].ge(0)
-        & metrics["dividend_growth_slope"].ge(0)
-        & ~metrics["symbol"].isin(high_payout_symbols)
-    ].copy()
+        config["universe"],
+        selection["dividend_yield_lookback_days"],
+    ).reset_index()
 
     candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
     metrics["avg_dividend_yield_3y"] = metrics["symbol"].map(
@@ -271,6 +225,69 @@ def calculate_dividend_low_vol_rebalanced_index(
     if not schedule:
         raise ValueError("No annual rebalance effective date falls within the period")
 
+    return _calculate_dividend_low_vol_rebalanced_index(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        end,
+        config,
+        schedule,
+    )
+
+
+def calculate_dividend_low_vol_monthly_rebalanced_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    config: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Calculate the strategy 1 monthly-rebalanced total-return index."""
+    try:
+        strategy_config = {
+            "universe": config["universe"],
+            "selection": config["strategy_1"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Missing strategy_1 configuration") from exc
+    _validate_selection_config(strategy_config)
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    price_data = _prepare_index_price(price)
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(start, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    schedule = _monthly_rebalance_schedule(calendar)
+    if not schedule:
+        raise ValueError("No monthly rebalance effective date falls within the period")
+    return _calculate_dividend_low_vol_rebalanced_index(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        end,
+        strategy_config,
+        schedule,
+    )
+
+
+def _calculate_dividend_low_vol_rebalanced_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    end_date: pd.Timestamp,
+    config: dict,
+    schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     index_segments = []
     constituent_snapshots = []
     for position, (as_of_date, effective_date) in enumerate(schedule):
@@ -288,7 +305,7 @@ def calculate_dividend_low_vol_rebalanced_index(
             .set_index(["effective_date", "symbol"])
         )
         segment_end = (
-            schedule[position + 1][1] if position + 1 < len(schedule) else end
+            schedule[position + 1][1] if position + 1 < len(schedule) else end_date
         )
         segment = calculate_dividend_low_vol_index(
             price,
@@ -325,6 +342,18 @@ def _annual_rebalance_schedule(
         as_of_date = pd.date_range(
             f"{year}-12-01", periods=2, freq="W-FRI"
         )[1]
+        position = calendar.searchsorted(as_of_date, side="right")
+        if position < len(calendar):
+            schedule.append((as_of_date, calendar[position]))
+    return schedule
+
+
+def _monthly_rebalance_schedule(
+    calendar: pd.Index,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    month_ends = pd.Series(calendar, index=calendar).groupby(calendar.to_period("M")).max()
+    schedule = []
+    for as_of_date in month_ends:
         position = calendar.searchsorted(as_of_date, side="right")
         if position < len(calendar):
             schedule.append((as_of_date, calendar[position]))
