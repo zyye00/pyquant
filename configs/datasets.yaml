@@ -32,6 +32,11 @@ sources:
         result: [code, year, quarter, status, row_count, error]
         numeric: [total_shares]
       request_log: [date, time, endpoint, code, frequency, start_date, end_date]
+  akshare:
+    csindex_daily:
+      codes: [H30269, H20269]
+      fields: [日期, 指数代码, 收盘]
+      result: [code, start_date, end_date, target_path, status, row_count, error]
 
 datasets:
   stock_daily:
@@ -67,6 +72,22 @@ datasets:
     numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
     field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
     update: {kind: history, target: index, frequency: d, pool: false}
+
+  csindex_daily:
+    description: Daily official CSI Dividend Low Volatility index prices.
+    source: akshare
+    storage:
+      kind: symbol_files
+      path: data/raw/csindex_daily/{symbol}.parquet
+      symbol_from: stem
+    columns: [date, symbol, close]
+    required: [date, symbol, close]
+    primary_key: [date, symbol]
+    date_column: date
+    date_columns: [date]
+    numeric_columns: [close]
+    field_map: {日期: date, 指数代码: symbol, 收盘: close}
+    update: {kind: csindex_history, pool: false}
 
   stock_5m:
     description: Five-minute stock prices partitioned by symbol and year.

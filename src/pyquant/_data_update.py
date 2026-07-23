@@ -15,8 +15,10 @@ import pandas as pd
 from pyquant.data import DATASET_CATALOG, get_dataset
 
 _baostock = DATASET_CATALOG["sources"]["baostock"]
+_akshare = DATASET_CATALOG["sources"]["akshare"]
 _datasets = DATASET_CATALOG["datasets"]
 _fields = _baostock["fields"]
+_csindex = _akshare["csindex_daily"]
 
 BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _baostock["hard_max_requests_per_day"]
 BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _baostock["safe_max_requests_per_day"]
@@ -396,6 +398,81 @@ def merge_history_data(data: pd.DataFrame, target_path: Path) -> pd.DataFrame:
     return (
         out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
     )
+
+
+def clean_csindex_history(data: pd.DataFrame, code: str) -> pd.DataFrame:
+    """Select AKShare CSI index fields and convert them to catalog columns."""
+    missing = sorted(set(_csindex["fields"]) - set(data))
+    if missing:
+        raise ValueError(f"AKShare CSI result missing required columns: {missing}")
+    data = data.loc[:, _csindex["fields"]].rename(
+        columns=_datasets["csindex_daily"]["field_map"]
+    ).copy()
+    data["date"] = pd.to_datetime(data["date"], errors="raise")
+    data["symbol"] = data["symbol"].fillna(code).astype(str)
+    data["close"] = pd.to_numeric(data["close"], errors="coerce")
+    return data
+
+
+def query_csindex_history(
+    code: str,
+    start_date: str,
+    end_date: str,
+    client: Any | None = None,
+) -> pd.DataFrame:
+    """Download CSI daily history from AKShare."""
+    if client is None:
+        try:
+            import akshare as client
+        except ImportError as exc:
+            raise ImportError("AKShare download requires package 'akshare'.") from exc
+    return client.stock_zh_index_hist_csindex(
+        symbol=code,
+        start_date=pd.Timestamp(start_date).strftime("%Y%m%d"),
+        end_date=pd.Timestamp(end_date).strftime("%Y%m%d"),
+    )
+
+
+def update_csindex_daily(
+    codes: Iterable[str],
+    start_date: str,
+    end_date: str,
+    data_root: Path = Path("data"),
+    client: Any | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
+) -> pd.DataFrame:
+    """Download the configured official CSI Dividend Low Volatility indices."""
+    codes = list(codes)
+    unsupported = sorted(set(codes) - set(_csindex["codes"]))
+    if unsupported:
+        raise ValueError(f"Unsupported CSI index codes: {unsupported}")
+    if progress is not None:
+        progress(0, len(codes))
+    results = []
+    completed = 0
+    for code in codes:
+        if max_tasks is not None and completed >= max_tasks:
+            break
+        if checkpoint is not None and not checkpoint():
+            break
+        target_path = _dataset_path("csindex_daily", data_root, symbol=code)
+        try:
+            data = query_csindex_history(code, start_date, end_date, client)
+            data = merge_history_data(clean_csindex_history(data, code), target_path)
+            atomic_write_parquet(data, target_path, overwrite=True)
+            results.append(
+                (code, start_date, end_date, str(target_path), "success", len(data), "")
+            )
+        except Exception as exc:
+            results.append(
+                (code, start_date, end_date, str(target_path), "failed", 0, str(exc))
+            )
+        completed += 1
+        if progress is not None:
+            progress(completed, len(codes))
+    return pd.DataFrame(results, columns=_csindex["result"])
 
 
 def update_dividends(
@@ -843,6 +920,24 @@ def update_dataset(
         raise ValueError(f"Dataset {name!r} does not support named pools")
     if max_tasks is not None and max_tasks <= 0:
         raise ValueError("max_tasks must be positive")
+    if dataset["source"] == "akshare":
+        if isinstance(pool, str):
+            raise ValueError(f"Dataset {name!r} does not support named pools")
+        codes = list(dict.fromkeys(pool))
+        if not codes:
+            raise ValueError("No security codes were selected")
+        return update_csindex_daily(
+            codes,
+            start,
+            end_date,
+            data_root,
+            client,
+            checkpoint,
+            progress,
+            max_tasks,
+        )
+    if dataset["source"] != "baostock":
+        raise ValueError(f"Dataset {name!r} has unsupported source {dataset['source']!r}")
     if checkpoint is not None and not checkpoint():
         return pd.DataFrame(columns=_fields[update["kind"]]["result"])
 

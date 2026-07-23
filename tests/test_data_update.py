@@ -17,6 +17,7 @@ from pyquant._data_update import (
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
+    clean_csindex_history,
     create_download_lock,
     daily_target_path,
     init_data_storage,
@@ -25,6 +26,7 @@ from pyquant._data_update import (
     resolve_baostock_codes,
     update_dividends,
     update_dataset,
+    update_csindex_daily,
     update_history_dataset,
     update_profit_quarterly,
     validate_request_limit,
@@ -156,6 +158,22 @@ class StopAfterFirstRequest:
     def __call__(self):
         self.calls += 1
         return self.calls == 1
+
+
+class FakeAkshare:
+    def __init__(self):
+        self.calls = []
+
+    def stock_zh_index_hist_csindex(self, symbol, start_date, end_date):
+        self.calls.append((symbol, start_date, end_date))
+        return pd.DataFrame(
+            {
+                "日期": ["2024-01-02"],
+                "指数代码": [symbol],
+                "收盘": [1_234.5],
+                "指数中文全称": ["ignored"],
+            }
+        )
 
 
 def test_init_data_storage_has_no_task_state(tmp_path):
@@ -802,3 +820,75 @@ def test_update_index_accepts_code_pool_but_rejects_named_pool(tmp_path):
             client=client,
             data_root=tmp_path / "other-data",
         )
+
+
+def test_clean_csindex_history_selects_documented_fields():
+    data = clean_csindex_history(
+        pd.DataFrame(
+            {
+                "日期": ["2024-01-02"],
+                "指数代码": ["H30269"],
+                "收盘": ["1234.5"],
+                "指数中文全称": ["ignored"],
+            }
+        ),
+        "H30269",
+    )
+
+    assert data.columns.tolist() == ["date", "symbol", "close"]
+    assert pd.api.types.is_datetime64_any_dtype(data["date"])
+    assert data["symbol"].tolist() == ["H30269"]
+    assert data["close"].tolist() == [1234.5]
+
+
+def test_update_csindex_daily_formats_dates_and_writes_one_file_per_code(tmp_path):
+    client = FakeAkshare()
+
+    out = update_csindex_daily(
+        ["H30269", "H20269"],
+        "2024-01-02",
+        "2024-01-03",
+        data_root=tmp_path / "data",
+        client=client,
+    )
+
+    assert client.calls == [
+        ("H30269", "20240102", "20240103"),
+        ("H20269", "20240102", "20240103"),
+    ]
+    assert out["status"].tolist() == ["success", "success"]
+    for code in ["H30269", "H20269"]:
+        data = pd.read_parquet(tmp_path / "data" / "raw" / "csindex_daily" / f"{code}.parquet")
+        assert data["symbol"].tolist() == [code]
+
+
+def test_update_csindex_daily_rejects_unknown_code_before_request(tmp_path):
+    client = FakeAkshare()
+
+    with pytest.raises(ValueError, match="Unsupported CSI index codes"):
+        update_csindex_daily(
+            ["H00000"],
+            "2024-01-02",
+            "2024-01-03",
+            data_root=tmp_path / "data",
+            client=client,
+        )
+
+    assert client.calls == []
+
+
+def test_update_csindex_daily_rejects_malformed_source_response(tmp_path):
+    class MissingCloseAkshare:
+        def stock_zh_index_hist_csindex(self, symbol, start_date, end_date):
+            return pd.DataFrame({"日期": ["2024-01-02"], "指数代码": [symbol]})
+
+    out = update_csindex_daily(
+        ["H30269"],
+        "2024-01-02",
+        "2024-01-03",
+        data_root=tmp_path / "data",
+        client=MissingCloseAkshare(),
+    )
+
+    assert out["status"].tolist() == ["failed"]
+    assert "missing required columns" in out.loc[0, "error"]

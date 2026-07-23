@@ -234,6 +234,88 @@ def test_market_cap_and_amount_top_80_percent_use_symbol_tie_order():
     assert set(out.index) == {"A", "B", "C", "D"}
 
 
+def test_market_snapshot_uses_common_dates_and_exact_date_population():
+    dates = pd.bdate_range("2024-11-25", periods=5)
+    price = pd.DataFrame(
+        [
+            *(
+                {
+                    "date": date,
+                    "symbol": "A",
+                    "close": 10.0,
+                    "amount": amount,
+                    "pe_ttm": 10.0,
+                }
+                for date, amount in zip(
+                    dates,
+                    [999.0, 10.0, 20.0, None, 40.0],
+                    strict=True,
+                )
+            ),
+            *(
+                {
+                    "date": date,
+                    "symbol": "B",
+                    "close": 20.0,
+                    "amount": amount,
+                    "pe_ttm": 10.0,
+                }
+                for date, amount in [(dates[0], 1_000.0), (dates[1], 100.0), (dates[4], 300.0)]
+            ),
+            *(
+                {
+                    "date": date,
+                    "symbol": "C",
+                    "close": 30.0,
+                    "amount": 500.0,
+                    "pe_ttm": 10.0,
+                }
+                for date in dates[1:]
+            ),
+            *(
+                {
+                    "date": date,
+                    "symbol": "OFF_DATE",
+                    "close": 40.0,
+                    "amount": 600.0,
+                    "pe_ttm": 10.0,
+                }
+                for date in dates[:-1]
+            ),
+        ]
+    )
+    shares = make_shares(["A", "B"], {"A": 100.0, "B": 200.0})
+
+    snapshot = COMPONENTS._market_snapshot(
+        COMPONENTS._prepare_price(price),
+        COMPONENTS._prepare_shares(shares),
+        dates[-1],
+        4,
+    ).set_index("symbol")
+
+    assert snapshot.index.tolist() == ["A", "B", "C"]
+    assert snapshot.loc["A", "avg_amount_240d"] == pytest.approx(70.0 / 3.0)
+    assert snapshot.loc["B", "avg_amount_240d"] == pytest.approx(200.0)
+    assert snapshot.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
+    assert snapshot.loc["B", "avg_market_cap_240d"] == pytest.approx(4_000.0)
+    assert pd.isna(snapshot.loc["C", "avg_market_cap_240d"])
+    assert COMPONENTS._top_symbols(
+        snapshot.reset_index(), "avg_market_cap_240d", 2 / 3
+    ) == {"A", "B"}
+
+
+def test_market_snapshot_requires_a_full_market_calendar_window():
+    price = make_price(["A"], dates=pd.bdate_range("2024-11-25", periods=3))
+
+    with pytest.raises(ValueError, match="Only 3 market dates are available"):
+        COMPONENTS._market_snapshot(
+            COMPONENTS._prepare_price(price),
+            COMPONENTS._prepare_shares(make_shares(["A"])),
+            pd.Timestamp("2024-11-27"),
+            4,
+        )
+
+
 def test_payout_filters_negative_and_highest_five_percent_after_continuity():
     symbols = [f"S{index:02d}" for index in range(21)]
     pe_ttm = {symbol: 10.0 for symbol in symbols}
@@ -423,7 +505,7 @@ def test_query_coverage_is_checked_after_price_history_filter():
         make_dividends(["QUALIFIED", "SHORT"]),
         make_queries(["QUALIFIED"], range(2021, 2024)),
         make_shares(["QUALIFIED", "SHORT"]),
-        "2024-11-29",
+        dates[-1],
         make_config(dividend_top_n=1, final_n=1),
     )
 
@@ -484,6 +566,9 @@ def test_notebooks_split_downloads_from_calculation():
 
     assert "update_dataset" in str(notebooks["download.ipynb"])
     assert "update_dataset" not in str(notebooks["run.ipynb"])
+    assert "csindex_daily" in str(notebooks["download.ipynb"])
+    assert "csindex_daily" in str(notebooks["run.ipynb"])
+    assert "official_index_job.wait()" in str(notebooks["download.ipynb"])
 
 
 def test_fixed_quantity_price_index_and_suspension_forward_fill():

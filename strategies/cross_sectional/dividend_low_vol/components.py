@@ -71,16 +71,11 @@ def select_dividend_low_vol_constituents(
     query_data = _prepare_dividend_queries(dividend_queries)
     share_data = _prepare_shares(shares)
 
-    snapshot = _add_rolling_market_metrics(
+    snapshot = _market_snapshot(
         price_data,
         share_data,
+        as_of_date,
         universe["lookback_days"],
-    )
-    snapshot = (
-        snapshot.sort_values(["symbol", "date"])
-        .groupby("symbol", sort=False)
-        .tail(1)
-        .dropna(subset=["avg_market_cap_240d", "avg_amount_240d"])
     )
     market_symbols = _top_symbols(
         snapshot,
@@ -367,7 +362,8 @@ def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
     out = price.loc[:, sorted(required)].copy()
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
-    out = out[out["close"].gt(0) & out["amount"].ge(0)]
+    out.loc[out["amount"].lt(0), "amount"] = np.nan
+    out = out[out["close"].gt(0)]
     return out.sort_values(["symbol", "date"]).reset_index(drop=True)
 
 
@@ -432,31 +428,43 @@ def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _add_rolling_market_metrics(
+def _market_snapshot(
     price: pd.DataFrame,
     shares: pd.DataFrame,
+    as_of_date: pd.Timestamp,
     lookback_days: int,
 ) -> pd.DataFrame:
-    daily = pd.merge_asof(
-        price.sort_values(["date", "symbol"]),
+    dates = (
+        price.loc[price["date"].le(as_of_date), "date"]
+        .drop_duplicates()
+        .sort_values()
+        .tail(lookback_days)
+    )
+    if len(dates) < lookback_days:
+        raise ValueError(
+            f"Only {len(dates)} market dates are available; "
+            f"at least {lookback_days} are required"
+        )
+    snapshot = price[price["date"].eq(as_of_date)].copy()
+    if snapshot.empty:
+        raise ValueError(f"No price data is available on {as_of_date.date()}")
+    price = pd.merge_asof(
+        price[price["date"].isin(dates)].sort_values(["date", "symbol"]),
         shares.sort_values(["publish_date", "symbol"]),
         left_on="date",
         right_on="publish_date",
         by="symbol",
         direction="backward",
-    ).sort_values(["symbol", "date"])
-    daily["total_market_cap"] = daily["close"] * daily["total_shares"]
-    for source, target in [
-        ("total_market_cap", "avg_market_cap_240d"),
-        ("amount", "avg_amount_240d"),
-    ]:
-        daily[target] = (
-            daily.groupby("symbol", sort=False)[source]
-            .rolling(lookback_days, min_periods=lookback_days)
-            .mean()
-            .reset_index(level=0, drop=True)
+    )
+    price["total_market_cap"] = price["close"] * price["total_shares"]
+    price = (
+        price.groupby("symbol", as_index=False)
+        .agg(
+            avg_market_cap_240d=("total_market_cap", "mean"),
+            avg_amount_240d=("amount", "mean"),
         )
-    return daily
+    )
+    return snapshot.merge(price, on="symbol", how="left")
 
 
 def _add_dividend_metrics(
