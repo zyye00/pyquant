@@ -12,7 +12,6 @@ from pyquant.io import load_config
 STRATEGY_DIR = (
     Path(__file__).parents[1]
     / "strategies"
-    / "cross_sectional"
     / "dividend_low_vol"
 )
 SPEC = importlib.util.spec_from_file_location(
@@ -80,14 +79,16 @@ def make_price(
                     "pe_ttm": (pe_ttm or {}).get(symbol, 10.0),
                 }
             )
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    out["date"] = pd.to_datetime(out["date"]).astype("datetime64[ms]")
+    return out
 
 
 def make_shares(
     symbols: list[str],
     values: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    return pd.DataFrame(
+    out = pd.DataFrame(
         {
             "symbol": symbols,
             "publish_date": pd.Timestamp("2023-01-01"),
@@ -97,6 +98,8 @@ def make_shares(
             ],
         }
     )
+    out["publish_date"] = pd.to_datetime(out["publish_date"]).astype("datetime64[ms]")
+    return out
 
 
 def make_queries(
@@ -284,6 +287,7 @@ def test_market_snapshot_uses_common_dates_and_exact_date_population():
             ),
         ]
     )
+    price["date"] = pd.to_datetime(price["date"]).astype("datetime64[ms]")
     shares = make_shares(["A", "B"], {"A": 100.0, "B": 200.0})
 
     snapshot = COMPONENTS._market_snapshot(
@@ -414,6 +418,7 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
             "total_shares": [100.0, 1_000.0],
         }
     )
+    shares["publish_date"] = pd.to_datetime(shares["publish_date"]).astype("datetime64[ms]")
 
     out = select_constituents(
         make_price(["A"]),
