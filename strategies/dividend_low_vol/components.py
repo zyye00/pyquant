@@ -358,12 +358,7 @@ def _monthly_rebalance_schedule(
     calendar: pd.Index,
 ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     month_ends = pd.Series(calendar, index=calendar).groupby(calendar.to_period("M")).max()
-    schedule = []
-    for as_of_date in month_ends:
-        position = calendar.searchsorted(as_of_date, side="right")
-        if position < len(calendar):
-            schedule.append((as_of_date, calendar[position]))
-    return schedule
+    return [(rebalance_date, rebalance_date) for rebalance_date in month_ends]
 
 
 def _validate_selection_config(config: dict) -> None:

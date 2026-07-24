@@ -556,7 +556,7 @@ def test_strategy_config_contains_original_index_parameters_only():
         "volatility_lookback_days": 240,
     }
     assert config["data"] == {
-        "start_date": "2013-12-16",
+        "start_date": "2014-01-30",
         "end_date": "2023-06-16",
         "pool": "all",
     }
@@ -605,9 +605,9 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
         strategy_config,
     )
 
-    assert index.index.min() == pd.Timestamp("2024-02-01")
+    assert index.index.min() == pd.Timestamp("2024-01-31")
     assert constituents.index.get_level_values("effective_date").min() == pd.Timestamp(
-        "2024-02-01"
+        "2024-01-31"
     )
 
 

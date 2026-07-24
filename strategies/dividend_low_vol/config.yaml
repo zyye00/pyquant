@@ -3,7 +3,7 @@ strategy:
   type: cross_sectional
 
 data:
-  start_date: "2013-12-16"
+  start_date: "2014-01-30"
   end_date: "2023-06-16"
   pool: all
 
