@@ -268,7 +268,7 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
     schedule = _monthly_rebalance_schedule(calendar)
     if not schedule:
         raise ValueError("No monthly rebalance effective date falls within the period")
-    return _calculate_dividend_low_vol_rebalanced_index(
+    return _calculate_dividend_low_vol_monthly_index(
         price,
         dividends,
         dividend_queries,
@@ -277,6 +277,82 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
         strategy_config,
         schedule,
     )
+
+
+def _calculate_dividend_low_vol_monthly_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    end_date: pd.Timestamp,
+    config: dict,
+    schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    prepared = prepare_dividend_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
+    rebalance_dates = pd.Index([date for date, _ in schedule], name="date")
+    constituent_snapshots = []
+    returns = pd.Series(0.0, index=rebalance_dates, name="total_return")
+    price_returns = returns.rename("price_return").copy()
+    dividend_cash = returns.rename("dividend_cash").copy()
+
+    for position, rebalance_date in enumerate(rebalance_dates):
+        constituents = select_dividend_low_vol_constituents(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            rebalance_date,
+            config,
+            prepared,
+        )
+        constituent_snapshots.append(
+            constituents.reset_index()
+            .assign(effective_date=rebalance_date)
+            .set_index(["effective_date", "symbol"])
+        )
+        if position + 1 == len(rebalance_dates):
+            continue
+        next_rebalance_date = rebalance_dates[position + 1]
+        prices = (
+            index_inputs["prices"]
+            .reindex(columns=constituents.index)
+            .loc[:next_rebalance_date]
+            .ffill()
+            .loc[[rebalance_date, next_rebalance_date]]
+        )
+        missing = prices.loc[rebalance_date][prices.loc[rebalance_date].isna()].index.tolist()
+        if missing:
+            raise ValueError(
+                "No price is available on or before rebalance_date for "
+                f"{len(missing)} constituents; examples: {missing[:5]}"
+            )
+        normalized_shares = constituents["weight"] / prices.loc[rebalance_date]
+        end_value = prices.loc[next_rebalance_date].mul(normalized_shares).sum()
+        cash = _monthly_dividend_cash(
+            index_inputs["dividend_events"],
+            normalized_shares,
+            rebalance_date,
+            next_rebalance_date,
+        )
+        price_returns.loc[next_rebalance_date] = end_value - 1.0
+        dividend_cash.loc[next_rebalance_date] = cash
+        returns.loc[next_rebalance_date] = end_value + cash - 1.0
+
+    price_index = (1.0 + price_returns).cumprod()
+    total_return_index = (1.0 + returns).cumprod()
+    index = pd.DataFrame(
+        {
+            "price_return": price_returns,
+            "total_return": returns,
+            "dividend_cash": dividend_cash,
+            "price_index": price_index,
+            "total_return_index": total_return_index,
+        }
+    )
+    return index[INDEX_COLUMNS], pd.concat(constituent_snapshots).sort_index()
 
 
 def _calculate_dividend_low_vol_rebalanced_index(
@@ -624,6 +700,26 @@ def _index_dividend_cash(
                 normalized_shares[event.symbol] * event.cash_dividend_after_tax
             )
     return cash
+
+
+def _monthly_dividend_cash(
+    dividends: pd.DataFrame,
+    normalized_shares: pd.Series,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> float:
+    events = dividends.loc[
+        dividends["symbol"].isin(normalized_shares.index)
+        & dividends["payment_date"].gt(start)
+        & dividends["payment_date"].le(end)
+        & dividends["cash_dividend_after_tax"].gt(0)
+    ]
+    return float(
+        events.assign(
+            cash=lambda data: data["symbol"].map(normalized_shares)
+            * data["cash_dividend_after_tax"]
+        )["cash"].sum()
+    )
 
 
 def _require_query_coverage(

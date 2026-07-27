@@ -594,6 +594,7 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
     strategy_config = {"universe": config["universe"], "strategy_1": config["selection"]}
     dividends = make_dividends(symbols)
     dividends["payment_date"] = pd.NaT
+    dividends.loc[dividends.index[0], "payment_date"] = pd.Timestamp("2024-02-15")
 
     index, constituents = calculate_monthly_rebalanced_index(
         make_price(symbols, dates=dates),
@@ -609,6 +610,8 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
     assert constituents.index.get_level_values("effective_date").min() == pd.Timestamp(
         "2024-01-31"
     )
+    assert index.index.equals(pd.Index(index.index.unique(), name="date"))
+    assert index.loc[pd.Timestamp("2024-02-29"), "dividend_cash"] == pytest.approx(0.05)
 
 
 def test_fixed_quantity_price_index_and_suspension_forward_fill():
