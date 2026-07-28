@@ -247,29 +247,17 @@ def clean_baostock_profit(
 
 
 def missing_baostock_ranges(
-    target_path: Path,
     start_date: str,
     end_date: str,
-    date_column: str = "date",
     queried_ranges: Iterable[tuple[str, str]] = (),
 ) -> list[tuple[str, str]]:
-    """Return ranges not covered by local data or completed source queries."""
+    """Return ranges not covered by completed source queries."""
     requested_start = pd.Timestamp(start_date)
     requested_end = pd.Timestamp(end_date)
-    covered = list(queried_ranges)
-    if target_path.exists():
-        existing = pd.read_parquet(target_path, columns=[date_column])
-        if not existing.empty:
-            covered.append(
-                (
-                    str(pd.to_datetime(existing[date_column]).min().date()),
-                    str(pd.to_datetime(existing[date_column]).max().date()),
-                )
-            )
     cursor = requested_start
     missing = []
     for first, last in sorted(
-        (pd.Timestamp(first), pd.Timestamp(last)) for first, last in covered
+        (pd.Timestamp(first), pd.Timestamp(last)) for first, last in queried_ranges
     ):
         if last < cursor:
             continue
@@ -298,6 +286,13 @@ def atomic_write_parquet(
     tmp_path = target_path.with_name(f"{target_path.name}.tmp")
     data.to_parquet(tmp_path, index=False, compression="zstd")
     os.replace(tmp_path, target_path)
+
+
+def _read_query_cache(path: Path, columns: list[str]) -> pd.DataFrame:
+    data = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=columns)
+    data["start"] = pd.to_datetime(data["start"])
+    data["end"] = pd.to_datetime(data["end"])
+    return data
 
 
 def request_count_today(
@@ -493,15 +488,11 @@ def update_dividends(
     dividend_path = paths.dividend_path
     query_cache_path = paths.dividend_queries_path
     dividends = pd.read_parquet(dividend_path) if dividend_path.exists() else None
-    query_cache = (
-        pd.read_parquet(query_cache_path)
-        if query_cache_path.exists()
-        else pd.DataFrame(columns=fields["query"])
-    )
+    query_cache = _read_query_cache(query_cache_path, fields["query"])
     queried = set(query_cache.itertuples(index=False, name=None))
 
-    def query_range(code: str, year: int) -> tuple[str, str, str]:
-        return code, f"{year}-01-01", f"{year}-12-31"
+    def query_range(code: str, year: int) -> tuple[str, pd.Timestamp, pd.Timestamp]:
+        return code, pd.Timestamp(f"{year}-01-01"), pd.Timestamp(f"{year}-12-31")
 
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
@@ -539,21 +530,18 @@ def update_dividends(
                     str(year),
                     str(year),
                 )
-                try:
-                    data = query_baostock_dividends(code, year, active_client)
-                    data = clean_baostock_dividends(data, code, year)
-                    if not data.empty:
-                        pending_dividends.append(data)
-                    pending_queries.append(query_range(code, year))
-                    queried.add(query_range(code, year))
-                    results.append((code, year, "success", len(data), ""))
-                    remaining[code] -= 1
-                    if remaining[code] == 0:
-                        completed += 1
-                        if progress is not None:
-                            progress(completed, len(codes))
-                except Exception as exc:
-                    results.append((code, year, "failed", 0, str(exc)))
+                data = query_baostock_dividends(code, year, active_client)
+                data = clean_baostock_dividends(data, code, year)
+                if not data.empty:
+                    pending_dividends.append(data)
+                pending_queries.append(query_range(code, year))
+                queried.add(query_range(code, year))
+                results.append((code, year, "success", len(data), ""))
+                remaining[code] -= 1
+                if remaining[code] == 0:
+                    completed += 1
+                    if progress is not None:
+                        progress(completed, len(codes))
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
             if pending_dividends:
@@ -623,16 +611,14 @@ def update_profit_quarterly(
     profit_path = paths.profit_path
     query_cache_path = paths.profit_queries_path
     profits = pd.read_parquet(profit_path) if profit_path.exists() else None
-    query_cache = (
-        pd.read_parquet(query_cache_path)
-        if query_cache_path.exists()
-        else pd.DataFrame(columns=fields["query"])
-    )
+    query_cache = _read_query_cache(query_cache_path, fields["query"])
     queried = set(query_cache.itertuples(index=False, name=None))
 
-    def query_range(code: str, year: int, quarter: int) -> tuple[str, str, str]:
+    def query_range(
+        code: str, year: int, quarter: int
+    ) -> tuple[str, pd.Timestamp, pd.Timestamp]:
         period = pd.Period(year=year, quarter=quarter, freq="Q")
-        return code, str(period.start_time.date()), str(period.end_time.date())
+        return code, period.start_time.normalize(), period.end_time.normalize()
 
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
@@ -671,25 +657,22 @@ def update_profit_quarterly(
                     str(year),
                     str(quarter),
                 )
-                try:
-                    data = clean_baostock_profit(
-                        query_baostock_profit(code, year, quarter, active_client),
-                        code,
-                        year,
-                        quarter,
-                    )
-                    if not data.empty:
-                        pending_profits.append(data)
-                    pending_queries.append(query_range(code, year, quarter))
-                    queried.add(query_range(code, year, quarter))
-                    results.append((code, year, quarter, "success", len(data), ""))
-                    remaining[code] -= 1
-                    if remaining[code] == 0:
-                        completed += 1
-                        if progress is not None:
-                            progress(completed, len(codes))
-                except Exception as exc:
-                    results.append((code, year, quarter, "failed", 0, str(exc)))
+                data = clean_baostock_profit(
+                    query_baostock_profit(code, year, quarter, active_client),
+                    code,
+                    year,
+                    quarter,
+                )
+                if not data.empty:
+                    pending_profits.append(data)
+                pending_queries.append(query_range(code, year, quarter))
+                queried.add(query_range(code, year, quarter))
+                results.append((code, year, quarter, "success", len(data), ""))
+                remaining[code] -= 1
+                if remaining[code] == 0:
+                    completed += 1
+                    if progress is not None:
+                        progress(completed, len(codes))
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
             if pending_profits:
@@ -757,11 +740,7 @@ def update_history_dataset(
     codes = list(codes)
     paths = init_data_storage(data_root)
     query_cache_path = paths.history_queries_path(dataset, frequency)
-    query_cache = (
-        pd.read_parquet(query_cache_path)
-        if query_cache_path.exists()
-        else pd.DataFrame(columns=fields["query"])
-    )
+    query_cache = _read_query_cache(query_cache_path, fields["query"])
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -786,7 +765,7 @@ def update_history_dataset(
                 slices.extend(
                     (first, last, target)
                     for first, last in missing_baostock_ranges(
-                        target, start_date, end_date, queried_ranges=queried
+                        start_date, end_date, queried_ranges=queried
                     )
                 )
             else:
@@ -803,11 +782,10 @@ def update_history_dataset(
                     slices.extend(
                         (range_start, range_end, target)
                         for range_start, range_end in missing_baostock_ranges(
-                            target, first, last, queried_ranges=queried
+                            first, last, queried_ranges=queried
                         )
                     )
 
-            code_complete = True
             for range_start, range_end, target_path in slices:
                 if max_tasks is not None and tasks >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
@@ -824,58 +802,43 @@ def update_history_dataset(
                     range_start,
                     range_end,
                 )
-                try:
-                    data = query_baostock_history(
+                data = query_baostock_history(
+                    code,
+                    range_start,
+                    range_end,
+                    fields["daily"] if frequency == "d" else fields["minute_5"],
+                    frequency,
+                    active_client,
+                )
+                data = merge_history_data(clean_baostock_data(data), target_path)
+                atomic_write_parquet(data, target_path, overwrite=True)
+                query_cache = pd.concat(
+                    [
+                        query_cache,
+                        pd.DataFrame(
+                            [[code, pd.Timestamp(range_start), pd.Timestamp(range_end)]],
+                            columns=fields["query"],
+                        ),
+                    ],
+                    ignore_index=True,
+                ).drop_duplicates()
+                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+                results.append(
+                    (
                         code,
                         range_start,
                         range_end,
-                        fields["daily"] if frequency == "d" else fields["minute_5"],
-                        frequency,
-                        active_client,
+                        str(target_path),
+                        "success",
+                        len(data),
+                        "",
                     )
-                    data = merge_history_data(clean_baostock_data(data), target_path)
-                    atomic_write_parquet(data, target_path, overwrite=True)
-                    query_cache = pd.concat(
-                        [
-                            query_cache,
-                            pd.DataFrame(
-                                [[code, range_start, range_end]],
-                                columns=fields["query"],
-                            ),
-                        ],
-                        ignore_index=True,
-                    ).drop_duplicates()
-                    atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-                    results.append(
-                        (
-                            code,
-                            range_start,
-                            range_end,
-                            str(target_path),
-                            "success",
-                            len(data),
-                            "",
-                        )
-                    )
-                except Exception as exc:
-                    code_complete = False
-                    results.append(
-                        (
-                            code,
-                            range_start,
-                            range_end,
-                            str(target_path),
-                            "failed",
-                            0,
-                            str(exc),
-                        )
-                    )
+                )
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
-            if code_complete:
-                completed += 1
-                if progress is not None:
-                    progress(completed, len(codes))
+            completed += 1
+            if progress is not None:
+                progress(completed, len(codes))
         return pd.DataFrame(results, columns=fields["result"])
     finally:
         remove_download_lock(data_root)
@@ -1080,7 +1043,10 @@ def _query_with_request_log(
     ):
         raise RuntimeError("BaoStock request limit reached while resolving stock pool")
     append_request_log(request_log_path, endpoint, code, frequency, start_date, end_date)
-    return query()
+    try:
+        return query()
+    except Exception as exc:
+        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
 
 
 def baostock_result_to_frame(result: Any) -> pd.DataFrame:
@@ -1103,27 +1069,32 @@ def query_baostock_history(
     client: Any,
 ) -> pd.DataFrame:
     """Query BaoStock history and convert its cursor-like result to DataFrame."""
-    result = client.bs.query_history_k_data_plus(
-        code,
-        ",".join(fields),
-        start_date=start_date,
-        end_date=end_date,
-        frequency=frequency,
-        adjustflag="3",
-    )
-    if getattr(result, "error_code", "0") != "0":
-        raise RuntimeError(
-            f"BaoStock query failed: {result.error_code} {result.error_msg}"
+    try:
+        result = client.bs.query_history_k_data_plus(
+            code,
+            ",".join(fields),
+            start_date=start_date,
+            end_date=end_date,
+            frequency=frequency,
+            adjustflag="3",
         )
-
-    return baostock_result_to_frame(result)
+        if getattr(result, "error_code", "0") != "0":
+            raise RuntimeError(
+                f"BaoStock query failed: {result.error_code} {result.error_msg}"
+            )
+        return baostock_result_to_frame(result)
+    except Exception as exc:
+        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
 
 
 def query_baostock_dividends(code: str, year: int, client: Any) -> pd.DataFrame:
     """Query BaoStock dividends by operating year."""
-    return baostock_result_to_frame(
-        client.bs.query_dividend_data(code, str(year), yearType="operate")
-    )
+    try:
+        return baostock_result_to_frame(
+            client.bs.query_dividend_data(code, str(year), yearType="operate")
+        )
+    except Exception as exc:
+        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
 
 
 def query_baostock_profit(
@@ -1133,6 +1104,9 @@ def query_baostock_profit(
     client: Any,
 ) -> pd.DataFrame:
     """Query BaoStock quarterly profit data."""
-    return baostock_result_to_frame(
-        client.bs.query_profit_data(code, str(year), str(quarter))
-    )
+    try:
+        return baostock_result_to_frame(
+            client.bs.query_profit_data(code, str(year), str(quarter))
+        )
+    except Exception as exc:
+        raise RuntimeError(f"BaoStock request failed: {exc}") from exc

@@ -151,6 +151,26 @@ class FailingHistoryClient(FakeClient):
         return result
 
 
+class FailingRequestHistoryClient(FakeClient):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def query_history_k_data_plus(
+        self, code, fields, start_date, end_date, frequency, adjustflag
+    ):
+        self.calls.append((code, start_date, end_date, frequency, adjustflag))
+        raise self.error
+
+
+class EmptyHistoryClient(FakeClient):
+    def query_history_k_data_plus(
+        self, code, fields, start_date, end_date, frequency, adjustflag
+    ):
+        self.calls.append((code, start_date, end_date, frequency, adjustflag))
+        return FakeResult(fields.split(","), [])
+
+
 class StopAfterFirstRequest:
     def __init__(self):
         self.calls = 0
@@ -208,8 +228,17 @@ def test_create_download_lock_rejects_active_lock(tmp_path, monkeypatch):
 
 
 def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_path):
-    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    target = daily_target_path("sh.600000", "stock", root)
     atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2024-01-03", "2024-01-03"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
+    )
     progress = []
 
     result = update_history_dataset(
@@ -218,7 +247,7 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
-        tmp_path / "data",
+        root,
         10,
         client=FakeClient(),
         progress=lambda completed, total: progress.append((completed, total)),
@@ -237,7 +266,13 @@ def test_history_query_cache_skips_completed_ranges(tmp_path):
     paths = init_data_storage(root)
     atomic_write_parquet(
         pd.DataFrame(
-            [["sh.600000", "2024-01-02", "2024-01-03"]],
+            [
+                [
+                    "sh.600000",
+                    pd.Timestamp("2024-01-02"),
+                    pd.Timestamp("2024-01-03"),
+                ]
+            ],
             columns=["code", "start", "end"],
         ),
         paths.history_queries_path("stock", "d"),
@@ -259,12 +294,24 @@ def test_history_query_cache_skips_completed_ranges(tmp_path):
         ["2024-01-04", "2024-01-05"]
     ]
     assert client.calls == [("sh.600000", "2024-01-04", "2024-01-05", "d", "3")]
+    cache = pd.read_parquet(paths.history_queries_path("stock", "d"))
+    assert pd.api.types.is_datetime64_any_dtype(cache["start"])
+    assert pd.api.types.is_datetime64_any_dtype(cache["end"])
 
 
-def test_update_adds_only_the_earlier_missing_range(tmp_path):
-    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
+def test_local_min_max_does_not_hide_query_cache_gap(tmp_path):
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    target = daily_target_path("sh.600000", "stock", root)
     atomic_write_parquet(
-        pd.DataFrame({"date": [date(2014, 1, 2), date(2014, 1, 3)]}), target
+        pd.DataFrame({"date": [date(2013, 1, 1), date(2014, 1, 3)]}), target
+    )
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2014-01-02", "2014-01-03"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
     )
 
     result = update_history_dataset(
@@ -273,7 +320,7 @@ def test_update_adds_only_the_earlier_missing_range(tmp_path):
         ["sh.600000"],
         "2013-01-01",
         "2014-01-03",
-        tmp_path / "data",
+        root,
         10,
         client=FakeClient(),
     )
@@ -329,10 +376,47 @@ def test_update_merges_data_and_skips_covered_range(tmp_path):
     assert len(client.calls) == 1
 
 
+def test_update_caches_successful_empty_history_query(tmp_path):
+    root = tmp_path / "data"
+    client = EmptyHistoryClient()
+
+    first = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-02",
+        root,
+        10,
+        client=client,
+    )
+    second = update_history_dataset(
+        "stock",
+        "d",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-02",
+        root,
+        10,
+        client=client,
+    )
+
+    assert first[["status", "row_count"]].values.tolist() == [["success", 0]]
+    assert second.empty
+    assert len(client.calls) == 1
+
+
 def test_update_reports_completed_stock_count(tmp_path):
     progress = []
-    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
-    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 2)]}), target)
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2024-01-02", "2024-01-02"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
+    )
     client = FakeClient()
 
     update_history_dataset(
@@ -341,7 +425,7 @@ def test_update_reports_completed_stock_count(tmp_path):
         ["sh.600000", "sz.000001"],
         "2024-01-02",
         "2024-01-02",
-        tmp_path / "data",
+        root,
         10,
         client=client,
         progress=lambda completed, total: progress.append((completed, total)),
@@ -381,8 +465,15 @@ def test_update_respects_request_limit_without_completing_next_stock(tmp_path):
 
 
 def test_update_does_not_complete_partially_updated_stock(tmp_path):
-    target = daily_target_path("sh.600000", "stock", tmp_path / "data")
-    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2024-01-03", "2024-01-03"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
+    )
     progress = []
 
     result = update_history_dataset(
@@ -391,7 +482,7 @@ def test_update_does_not_complete_partially_updated_stock(tmp_path):
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
-        tmp_path / "data",
+        root,
         10,
         client=FakeClient(),
         progress=lambda completed, total: progress.append((completed, total)),
@@ -402,33 +493,97 @@ def test_update_does_not_complete_partially_updated_stock(tmp_path):
     assert progress == [(0, 1)]
 
 
-def test_update_does_not_complete_failed_stock(tmp_path, monkeypatch):
+def test_runtime_error_stops_history_update_and_releases_lock(tmp_path, monkeypatch):
+    root = tmp_path / "data"
     progress = []
+    calls = []
 
-    def fail(*args):
+    def fail(code, *args):
+        calls.append(code)
         raise RuntimeError("source failed")
 
     monkeypatch.setattr("pyquant._data_update.query_baostock_history", fail)
-    result = update_history_dataset(
-        "stock",
-        "d",
-        ["sh.600000"],
-        "2024-01-02",
-        "2024-01-02",
-        tmp_path / "data",
-        10,
-        client=FakeClient(),
-        progress=lambda completed, total: progress.append((completed, total)),
-    )
+    with pytest.raises(RuntimeError, match="source failed"):
+        update_history_dataset(
+            "stock",
+            "d",
+            ["sh.600000", "sz.000001"],
+            "2024-01-02",
+            "2024-01-02",
+            root,
+            10,
+            client=FakeClient(),
+            progress=lambda completed, total: progress.append((completed, total)),
+        )
 
-    assert result["status"].tolist() == ["failed"]
-    assert progress == [(0, 1)]
+    assert calls == ["sh.600000"]
+    assert progress == [(0, 2)]
+    assert not init_data_storage(root).lock_path.exists()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("socket closed"), ValueError("invalid source response")],
+)
+def test_request_error_stops_history_update_and_releases_lock(tmp_path, error):
+    root = tmp_path / "data"
+    client = FailingRequestHistoryClient(error)
+
+    with pytest.raises(RuntimeError, match=f"BaoStock request failed: {error}"):
+        update_history_dataset(
+            "stock",
+            "d",
+            ["sh.600000", "sz.000001"],
+            "2024-01-02",
+            "2024-01-02",
+            root,
+            10,
+            client=client,
+        )
+
+    assert [call[0] for call in client.calls] == ["sh.600000"]
+    assert not init_data_storage(root).lock_path.exists()
+
+
+def test_query_cache_write_failure_stops_history_update(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    client = FakeClient()
+
+    def fail_query_cache(data, target_path, overwrite=False):
+        if target_path.name == "queries.parquet":
+            raise OSError("query cache write failed")
+        atomic_write_parquet(data, target_path, overwrite)
+
+    monkeypatch.setattr(
+        "pyquant._data_update.atomic_write_parquet",
+        fail_query_cache,
+    )
+    with pytest.raises(OSError, match="query cache write failed"):
+        update_history_dataset(
+            "stock",
+            "d",
+            ["sh.600000", "sz.000001"],
+            "2024-01-02",
+            "2024-01-02",
+            root,
+            10,
+            client=client,
+        )
+
+    assert [call[0] for call in client.calls] == ["sh.600000"]
+    assert not init_data_storage(root).lock_path.exists()
 
 
 def test_update_stop_leaves_partially_updated_stock_incomplete(tmp_path):
     root = tmp_path / "data"
-    target = daily_target_path("sh.600000", "stock", root)
-    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
+    paths = init_data_storage(root)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [["sh.600000", "2024-01-03", "2024-01-03"]],
+            columns=["code", "start", "end"],
+        ),
+        paths.history_queries_path("stock", "d"),
+    )
     checks = iter([True, True, True, False])
     progress = []
 
@@ -566,8 +721,8 @@ def test_update_dividends_skips_saved_and_empty_code_years(tmp_path):
     query_cache_path = tmp_path / "data" / "raw" / "dividend" / "queries.parquet"
     assert len(pd.read_parquet(dividend_path)) == 1
     assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", "2022-01-01", "2022-12-31"],
-        ["sh.600000", "2023-01-01", "2023-12-31"],
+        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-12-31")],
+        ["sh.600000", pd.Timestamp("2023-01-01"), pd.Timestamp("2023-12-31")],
     ]
 
 
@@ -594,10 +749,10 @@ def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
     )
     assert len(pd.read_parquet(profit_path)) == 3
     assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", "2022-01-01", "2022-03-31"],
-        ["sh.600000", "2022-04-01", "2022-06-30"],
-        ["sh.600000", "2022-07-01", "2022-09-30"],
-        ["sh.600000", "2022-10-01", "2022-12-31"],
+        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-03-31")],
+        ["sh.600000", pd.Timestamp("2022-04-01"), pd.Timestamp("2022-06-30")],
+        ["sh.600000", pd.Timestamp("2022-07-01"), pd.Timestamp("2022-09-30")],
+        ["sh.600000", pd.Timestamp("2022-10-01"), pd.Timestamp("2022-12-31")],
     ]
 
 
@@ -650,7 +805,9 @@ def test_update_dividends_saves_when_checkpoint_stops(tmp_path):
     assert len(pd.read_parquet(root / "raw" / "dividend" / "data.parquet")) == 1
     assert pd.read_parquet(
         root / "raw" / "dividend" / "queries.parquet"
-    ).values.tolist() == [["sh.600000", "2022-01-01", "2022-12-31"]]
+    ).values.tolist() == [
+        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-12-31")]
+    ]
     assert not lock_path.exists()
 
 
@@ -676,7 +833,9 @@ def test_update_profit_saves_when_checkpoint_stops(tmp_path):
     )
     assert pd.read_parquet(
         root / "raw" / "stock_profit_quarterly" / "queries.parquet"
-    ).values.tolist() == [["sh.600000", "2022-01-01", "2022-03-31"]]
+    ).values.tolist() == [
+        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-03-31")]
+    ]
     assert not lock_path.exists()
 
 
@@ -691,23 +850,23 @@ def test_request_log_counts_today(tmp_path):
     assert request_count_today(log_path, date(1999, 1, 1)) == 0
 
 
-def test_history_request_log_records_sent_requests(tmp_path):
+def test_history_request_log_records_requests_before_runtime_error(tmp_path):
     root = tmp_path / "data"
     paths = init_data_storage(root)
 
-    result = update_history_dataset(
-        "stock",
-        "d",
-        ["sh.600000", "sz.000001", "sz.000002"],
-        "2024-01-02",
-        "2024-01-02",
-        root,
-        10,
-        client=FailingHistoryClient(),
-    )
+    with pytest.raises(RuntimeError, match="simulated source failure"):
+        update_history_dataset(
+            "stock",
+            "d",
+            ["sh.600000", "sz.000001", "sz.000002"],
+            "2024-01-02",
+            "2024-01-02",
+            root,
+            10,
+            client=FailingHistoryClient(),
+        )
 
     log = pd.read_csv(paths.request_log_path, keep_default_na=False)
-    assert result["status"].tolist() == ["success", "success", "failed"]
     assert log.columns.tolist() == [
         "date",
         "time",
@@ -718,6 +877,10 @@ def test_history_request_log_records_sent_requests(tmp_path):
         "end_date",
     ]
     assert request_count_today(paths.request_log_path) == 3
+    assert pd.read_parquet(paths.history_queries_path("stock", "d"))["code"].tolist() == [
+        "sh.600000",
+        "sz.000001",
+    ]
 
     append_request_log(
         paths.request_log_path,
@@ -797,6 +960,23 @@ def test_update_dataset_validates_options_before_requests(tmp_path):
         )
 
     assert client.calls == []
+
+
+def test_update_dataset_preserves_worker_error(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("local storage failed")
+
+    monkeypatch.setattr("pyquant._data_update.update_history_dataset", fail)
+
+    with pytest.raises(OSError, match="local storage failed"):
+        update_dataset(
+            "stock_daily",
+            start="2024-01-01",
+            end="2024-01-02",
+            pool=["sh.600000"],
+            client=FakeClient(),
+            data_root=tmp_path / "data",
+        )
 
 
 def test_update_index_accepts_code_pool_but_rejects_named_pool(tmp_path):

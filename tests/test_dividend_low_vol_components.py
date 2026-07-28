@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from pyquant import build_dividend_low_vol_universe
 from pyquant.io import load_config
 
 
@@ -240,7 +241,28 @@ def test_market_cap_and_amount_top_80_percent_use_symbol_tie_order():
     assert set(out.index) == {"A", "B", "C", "D"}
 
 
-def test_market_snapshot_uses_common_dates_and_exact_date_population():
+def test_percentage_rankings_exclude_missing_metrics_before_counting():
+    symbols = ["A", "B", "C", "D"]
+    price = make_price(
+        symbols,
+        amounts={"A": 400.0, "B": 300.0, "C": 200.0, "D": 100.0},
+    )
+    config = make_config(market_cap_keep_ratio=0.5, amount_keep_ratio=0.5)
+
+    out = build_dividend_low_vol_universe(
+        price,
+        make_dividends(symbols),
+        make_queries(symbols),
+        make_shares(["A", "B", "C"], {"A": 400.0, "B": 300.0, "C": 200.0}),
+        "2024-11-29",
+        config["universe"],
+        price_history_lookback_days=1,
+    )
+
+    assert out.index.tolist() == ["A"]
+
+
+def test_public_universe_uses_common_dates_and_exact_date_population():
     dates = pd.bdate_range("2024-11-25", periods=5)
     price = pd.DataFrame(
         [
@@ -293,33 +315,45 @@ def test_market_snapshot_uses_common_dates_and_exact_date_population():
     price["date"] = pd.to_datetime(price["date"]).astype("datetime64[ms]")
     shares = make_shares(["A", "B"], {"A": 100.0, "B": 200.0})
 
-    snapshot = COMPONENTS._market_snapshot(
-        COMPONENTS._prepare_price(price),
-        COMPONENTS._prepare_shares(shares),
+    snapshot = build_dividend_low_vol_universe(
+        price,
+        make_dividends(["A", "B"]),
+        make_queries(["A", "B"]),
+        shares,
         dates[-1],
-        4,
-    ).set_index("symbol")
+        {
+            "lookback_days": 4,
+            "market_cap_keep_ratio": 1.0,
+            "amount_keep_ratio": 1.0,
+            "dividend_years": 3,
+            "payout_exclude_ratio": 0.0,
+        },
+        price_history_lookback_days=1,
+    )
 
-    assert snapshot.index.tolist() == ["A", "B", "C"]
+    assert snapshot.index.tolist() == ["A", "B"]
     assert snapshot.loc["A", "avg_amount_240d"] == pytest.approx(70.0 / 3.0)
     assert snapshot.loc["B", "avg_amount_240d"] == pytest.approx(200.0)
     assert snapshot.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
     assert snapshot.loc["B", "avg_market_cap_240d"] == pytest.approx(4_000.0)
-    assert pd.isna(snapshot.loc["C", "avg_market_cap_240d"])
-    assert COMPONENTS._top_symbols(
-        snapshot.reset_index(), "avg_market_cap_240d", 2 / 3
-    ) == {"A", "B"}
-
-
-def test_market_snapshot_requires_a_full_market_calendar_window():
+def test_public_universe_requires_a_full_market_calendar_window():
     price = make_price(["A"], dates=pd.bdate_range("2024-11-25", periods=3))
 
     with pytest.raises(ValueError, match="Only 3 market dates are available"):
-        COMPONENTS._market_snapshot(
-            COMPONENTS._prepare_price(price),
-            COMPONENTS._prepare_shares(make_shares(["A"])),
+        build_dividend_low_vol_universe(
+            price,
+            make_dividends(["A"]),
+            make_queries(["A"]),
+            make_shares(["A"]),
             pd.Timestamp("2024-11-27"),
-            4,
+            {
+                "lookback_days": 4,
+                "market_cap_keep_ratio": 1.0,
+                "amount_keep_ratio": 1.0,
+                "dividend_years": 3,
+                "payout_exclude_ratio": 0.0,
+            },
+            price_history_lookback_days=1,
         )
 
 
@@ -349,6 +383,26 @@ def test_payout_filters_negative_and_highest_five_percent_after_continuity():
     assert "S00" not in out.index
     assert "S19" not in out.index
     assert "S20" not in out.index
+
+
+def test_payout_percentage_excludes_missing_values_before_counting():
+    symbols = [f"S{index:02d}" for index in range(40)]
+    pe_ttm = {"S37": 90.0, "S38": 100.0, "S39": float("nan")}
+    config = make_config(payout_exclude_ratio=0.05)
+
+    out = build_dividend_low_vol_universe(
+        make_price(symbols, pe_ttm=pe_ttm),
+        make_dividends(symbols),
+        make_queries(symbols),
+        make_shares(symbols),
+        "2024-11-29",
+        config["universe"],
+        price_history_lookback_days=1,
+    )
+
+    assert "S37" in out.index
+    assert "S38" not in out.index
+    assert "S39" not in out.index
 
 
 def test_negative_dividend_growth_is_removed_and_zero_growth_is_kept():
@@ -438,17 +492,21 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
 
 
 @pytest.mark.parametrize(
-    ("as_of", "expected_years"),
-    [
-        ("2013-12-20", [2010, 2011, 2012]),
-        ("2013-12-21", [2011, 2012, 2013]),
-    ],
+    ("as_of", "is_eligible"),
+    [("2013-12-20", True), ("2013-12-21", False)],
 )
-def test_december_annual_dividend_cutoff(as_of, expected_years):
-    assert list(COMPONENTS._continuous_dividend_years(pd.Timestamp(as_of), 3)) == expected_years
-    metrics = pd.DataFrame(
-        {"symbol": ["A"], "close": [10.0], "pe_ttm": [10.0]}
+def test_public_universe_applies_december_annual_dividend_cutoff(as_of, is_eligible):
+    as_of_date = pd.Timestamp(as_of)
+    price = pd.DataFrame(
+        {
+            "date": [as_of_date],
+            "symbol": ["A"],
+            "close": [10.0],
+            "amount": [1_000.0],
+            "pe_ttm": [10.0],
+        }
     )
+    price["date"] = pd.to_datetime(price["date"]).astype("datetime64[ms]")
     dividends = pd.DataFrame(
         {
             "symbol": ["A"] * 4,
@@ -459,17 +517,25 @@ def test_december_annual_dividend_cutoff(as_of, expected_years):
             "cash_dividend_after_tax": [1.0, 1.0, 1.0, 0.0],
         }
     )
-
-    out = COMPONENTS._add_dividend_metrics(
-        metrics,
+    shares = make_shares(["A"])
+    shares["publish_date"] = pd.Timestamp("2009-01-01").as_unit("ms")
+    out = build_dividend_low_vol_universe(
+        price,
         dividends,
-        pd.Timestamp(as_of),
-        3,
+        make_queries(["A"], range(2010, 2014)),
+        shares,
+        as_of_date,
+        {
+            "lookback_days": 1,
+            "market_cap_keep_ratio": 1.0,
+            "amount_keep_ratio": 1.0,
+            "dividend_years": 3,
+            "payout_exclude_ratio": 0.0,
+        },
+        price_history_lookback_days=1,
     )
 
-    assert bool(out.loc[0, "consecutive_dividends"]) == (
-        expected_years == [2010, 2011, 2012]
-    )
+    assert ("A" in out.index) is is_eligible
 
 
 def test_missing_query_coverage_and_insufficient_history_raise():
@@ -557,7 +623,7 @@ def test_strategy_config_contains_original_index_parameters_only():
     }
     assert config["data"] == {
         "start_date": "2014-01-30",
-        "end_date": "2023-06-16",
+        "end_date": "2023-06-30",
         "pool": "all",
     }
 

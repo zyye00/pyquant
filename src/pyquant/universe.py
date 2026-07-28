@@ -93,10 +93,8 @@ def build_dividend_low_vol_universe(
         config["dividend_years"],
     )
     metrics = metrics[metrics["consecutive_dividends"]].copy()
-    high_payout = set(
-        metrics.dropna(subset=["payout_ratio"])
-        .sort_values(["payout_ratio", "symbol"], ascending=[False, True])
-        .head(floor(len(metrics) * config["payout_exclude_ratio"]))["symbol"]
+    high_payout = _top_dividend_low_vol_symbols(
+        metrics, "payout_ratio", config["payout_exclude_ratio"]
     )
     return metrics.loc[
         metrics["payout_ratio"].ge(0)
@@ -270,6 +268,7 @@ def _require_dividend_low_vol_query_coverage(
 def _top_dividend_low_vol_symbols(
     data: pd.DataFrame, column: str, keep_ratio: float
 ) -> set[str]:
+    data = data.dropna(subset=[column])
     return set(
         data.sort_values([column, "symbol"], ascending=[False, True])
         .head(floor(len(data) * keep_ratio))["symbol"]

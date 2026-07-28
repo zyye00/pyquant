@@ -1,7 +1,5 @@
 """Original dividend low-volatility index components."""
 
-from math import floor
-
 import numpy as np
 import pandas as pd
 
@@ -531,18 +529,6 @@ def _prepare_dividend_queries(dividend_queries: pd.DataFrame) -> pd.DataFrame:
     return out[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
 
 
-def _prepare_shares(shares: pd.DataFrame) -> pd.DataFrame:
-    required = {"symbol", "publish_date", "total_shares"}
-    _require_columns(shares, required, "shares")
-    columns = sorted(required | ({"report_date"} & set(shares.columns)))
-    out = shares.loc[:, columns].copy()
-    if "report_date" in out:
-        out = out.sort_values(["symbol", "publish_date", "report_date"])
-    out = out.dropna(subset=["publish_date", "total_shares"])
-    out = out[out["total_shares"] > 0]
-    return out.drop_duplicates(["symbol", "publish_date"], keep="last")
-
-
 def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
     out = constituents.copy()
     if out.index.name != "symbol":
@@ -559,86 +545,6 @@ def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
     if not np.isclose(out["weight"].sum(), 1.0):
         raise ValueError("constituent weights must sum to 1")
     return out
-
-
-def _market_snapshot(
-    price: pd.DataFrame,
-    shares: pd.DataFrame,
-    as_of_date: pd.Timestamp,
-    lookback_days: int,
-) -> pd.DataFrame:
-    dates = (
-        price.loc[price["date"].le(as_of_date), "date"]
-        .drop_duplicates()
-        .sort_values()
-        .tail(lookback_days)
-    )
-    if len(dates) < lookback_days:
-        raise ValueError(
-            f"Only {len(dates)} market dates are available; "
-            f"at least {lookback_days} are required"
-        )
-    snapshot = price[price["date"].eq(as_of_date)].copy()
-    if snapshot.empty:
-        raise ValueError(f"No price data is available on {as_of_date.date()}")
-    price = pd.merge_asof(
-        price[price["date"].isin(dates)].sort_values(["date", "symbol"]),
-        shares.sort_values(["publish_date", "symbol"]),
-        left_on="date",
-        right_on="publish_date",
-        by="symbol",
-        direction="backward",
-    )
-    price["total_market_cap"] = price["close"] * price["total_shares"]
-    price = (
-        price.groupby("symbol", as_index=False)
-        .agg(
-            avg_market_cap_240d=("total_market_cap", "mean"),
-            avg_amount_240d=("amount", "mean"),
-        )
-    )
-    return snapshot.merge(price, on="symbol", how="left")
-
-
-def _add_dividend_metrics(
-    metrics: pd.DataFrame,
-    dividends: pd.DataFrame,
-    as_of: pd.Timestamp,
-    dividend_years: int,
-) -> pd.DataFrame:
-    visible = dividends[dividends["announce_date"] <= as_of]
-    annual = visible.groupby(["symbol", "year"])["cash_dividend_after_tax"].sum()
-    trailing = visible[
-        visible["announce_date"] > as_of - pd.Timedelta(days=365)
-    ].groupby("symbol")["cash_dividend_after_tax"].sum()
-    continuous_years = _continuous_dividend_years(as_of, dividend_years)
-    metrics["consecutive_dividends"] = metrics["symbol"].map(
-        lambda symbol: all(
-            annual.get((symbol, year), 0.0) > 0 for year in continuous_years
-        )
-    )
-
-    def growth(symbol: str) -> float:
-        current_announced = annual.get((symbol, as_of.year), 0.0) > 0
-        first_year = as_of.year - dividend_years + (1 if current_announced else 0)
-        values = [
-            annual.get((symbol, year), 0.0)
-            for year in range(first_year, first_year + dividend_years)
-        ]
-        slope = float(np.polyfit(np.arange(dividend_years), values, 1)[0])
-        return 0.0 if np.isclose(slope, 0.0, atol=1e-12) else slope
-
-    metrics["dividend_growth_slope"] = metrics["symbol"].map(growth)
-    metrics["dividend_yield_ttm"] = metrics["symbol"].map(trailing).fillna(0.0).div(
-        metrics["close"]
-    )
-    metrics["payout_ratio"] = metrics["dividend_yield_ttm"] * metrics["pe_ttm"]
-    return metrics
-
-
-def _continuous_dividend_years(as_of: pd.Timestamp, dividend_years: int) -> range:
-    start = as_of.year - dividend_years + (as_of.month == 12 and as_of.day >= 21)
-    return range(start, start + dividend_years)
 
 
 def _average_ttm_dividend_yield(
@@ -722,22 +628,6 @@ def _monthly_dividend_cash(
     )
 
 
-def _require_query_coverage(
-    queries: pd.DataFrame,
-    symbols: list[str],
-    years: range,
-    context: str,
-) -> None:
-    completed = set(queries.itertuples(index=False, name=None))
-    required = {(symbol, year) for symbol in symbols for year in years}
-    missing = sorted(required - completed)
-    if missing:
-        raise ValueError(
-            f"Dividend query coverage missing for {len(missing)} symbol-years "
-            f"during {context}; examples: {missing[:5]}"
-        )
-
-
 def _require_query_coverage_from_set(
     completed: set[tuple],
     symbols: list[str],
@@ -752,15 +642,6 @@ def _require_query_coverage_from_set(
             f"Dividend query coverage missing for {len(missing)} symbol-years "
             f"during {context}; examples: {missing[:5]}"
         )
-
-
-def _top_symbols(data: pd.DataFrame, column: str, keep_ratio: float) -> set[str]:
-    count = floor(len(data) * keep_ratio)
-    return set(
-        data.sort_values([column, "symbol"], ascending=[False, True])
-        .head(count)["symbol"]
-        .tolist()
-    )
 
 
 def _require_columns(data: pd.DataFrame, required: set[str], name: str) -> None:
