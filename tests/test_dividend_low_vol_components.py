@@ -680,6 +680,89 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
     assert index.loc[pd.Timestamp("2024-02-29"), "dividend_cash"] == pytest.approx(0.05)
 
 
+def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(monkeypatch):
+    symbols = ["A", "B", "C"]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    config = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        volatility_lookback_days=4,
+        final_n=2,
+    )
+    strategy_config = {
+        "universe": config["universe"],
+        "strategy_1": {**config["selection"], "transaction_cost_rate": 0.001},
+    }
+    dividends = make_dividends(symbols)
+    dividends["payment_date"] = pd.NaT
+
+    def select_constituents(*args):
+        as_of_date = pd.Timestamp(args[4])
+        symbol = "A" if as_of_date.month == 1 else "B"
+        return pd.DataFrame({"weight": [1.0]}, index=pd.Index([symbol], name="symbol"))
+
+    monkeypatch.setattr(
+        COMPONENTS, "select_dividend_low_vol_constituents", select_constituents
+    )
+    index, _ = calculate_monthly_rebalanced_index(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+    )
+
+    assert index.loc[pd.Timestamp("2024-01-31"), "transaction_cost"] == 0.0
+    assert index.loc[pd.Timestamp("2024-02-29"), "turnover"] == 1.0
+    assert index.loc[pd.Timestamp("2024-02-29"), "transaction_cost"] == 0.001
+    assert index.loc[pd.Timestamp("2024-02-29"), "total_return"] == pytest.approx(-0.001)
+
+
+def test_monthly_rebalance_includes_dividend_cash_in_turnover(monkeypatch):
+    symbols = ["A", "B", "C"]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    config = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        volatility_lookback_days=4,
+        final_n=2,
+    )
+    strategy_config = {
+        "universe": config["universe"],
+        "strategy_1": {**config["selection"], "transaction_cost_rate": 0.001},
+    }
+    dividends = make_dividends(symbols)
+    dividends["payment_date"] = pd.NaT
+    dividends.loc[dividends.index[0], "payment_date"] = pd.Timestamp("2024-02-15")
+
+    def select_constituents(*args):
+        return pd.DataFrame({"weight": [1.0]}, index=pd.Index(["A"], name="symbol"))
+
+    monkeypatch.setattr(
+        COMPONENTS, "select_dividend_low_vol_constituents", select_constituents
+    )
+    index, _ = calculate_monthly_rebalanced_index(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+    )
+
+    assert index.loc[pd.Timestamp("2024-02-29"), "turnover"] == pytest.approx(
+        1.0 / 11.0
+    )
+    assert index.loc[pd.Timestamp("2024-02-29"), "transaction_cost"] == pytest.approx(
+        1.0 / 11_000.0
+    )
+
+
 def test_fixed_quantity_price_index_and_suspension_forward_fill():
     price = make_index_price(
         [

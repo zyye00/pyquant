@@ -9,8 +9,10 @@ import pytest
 from pyquant import data as data_module
 from pyquant import (
     DatasetUpdate,
+    get_period_end_dates,
     load_dataset,
     load_price,
+    normalize_query_years,
     standardize_price,
     update_dataset,
 )
@@ -31,6 +33,38 @@ def test_standardize_price_renames_required_fields():
     assert list(out.columns) == ["date", "symbol", "close", "volume"]
     assert out.loc[0, "symbol"] == "1"
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
+
+
+def test_get_period_end_dates_returns_last_available_date():
+    dates = pd.to_datetime(
+        ["2024-01-02", "2024-01-31", "2024-02-01", "2024-02-28"]
+    )
+
+    out = get_period_end_dates(dates)
+
+    assert out.tolist() == [
+        pd.Timestamp("2024-01-31"),
+        pd.Timestamp("2024-02-28"),
+    ]
+
+
+def test_normalize_query_years_expands_ranges():
+    queries = pd.DataFrame(
+        {
+            "symbol": ["A", "B"],
+            "start": pd.to_datetime(["2022-03-01", "2023-01-01"]),
+            "end": pd.to_datetime(["2024-02-01", "2023-12-31"]),
+        }
+    )
+
+    out = normalize_query_years(queries)
+
+    assert out.to_dict("records") == [
+        {"symbol": "A", "year": 2022},
+        {"symbol": "A", "year": 2023},
+        {"symbol": "A", "year": 2024},
+        {"symbol": "B", "year": 2023},
+    ]
 
 
 def test_load_price_csv(tmp_path):

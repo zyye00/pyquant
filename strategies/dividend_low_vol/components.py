@@ -5,7 +5,10 @@ import pandas as pd
 
 from pyquant import (
     build_dividend_low_vol_universe,
+    get_period_end_dates,
+    normalize_query_years,
     prepare_dividend_low_vol_universe_inputs,
+    run_backtest,
 )
 
 
@@ -27,6 +30,15 @@ INDEX_COLUMNS = [
     "price_return",
     "total_return",
     "dividend_cash",
+    "price_index",
+    "total_return_index",
+]
+MONTHLY_INDEX_COLUMNS = [
+    "price_return",
+    "total_return",
+    "dividend_cash",
+    "turnover",
+    "transaction_cost",
     "price_index",
     "total_return_index",
 ]
@@ -66,9 +78,12 @@ def select_dividend_low_vol_constituents(
     _validate_selection_config(config)
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
-    price_data = _prepare_price(price)
+    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    price_data = prepared["price"]
     price_data = price_data[price_data["date"] <= as_of_date]
-    dividend_data = _prepare_selection_dividends(dividends)
+    dividend_data = prepared["dividends"]
     metrics = build_dividend_low_vol_universe(
         price_data,
         dividends,
@@ -252,6 +267,11 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
     except (KeyError, TypeError) as exc:
         raise ValueError("Missing strategy_1 configuration") from exc
     _validate_selection_config(strategy_config)
+    transaction_cost_rate = strategy_config["selection"].get(
+        "transaction_cost_rate", 0.001
+    )
+    if not 0 <= transaction_cost_rate < 1:
+        raise ValueError("transaction_cost_rate must be in [0, 1)")
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
     if start > end:
@@ -263,17 +283,17 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
         .sort_values(),
         name="date",
     )
-    schedule = _monthly_rebalance_schedule(calendar)
-    if not schedule:
+    rebalance_dates = get_period_end_dates(calendar)
+    if rebalance_dates.empty:
         raise ValueError("No monthly rebalance effective date falls within the period")
     return _calculate_dividend_low_vol_monthly_index(
         price,
         dividends,
         dividend_queries,
         shares,
-        end,
         strategy_config,
-        schedule,
+        rebalance_dates,
+        transaction_cost_rate,
     )
 
 
@@ -282,21 +302,18 @@ def _calculate_dividend_low_vol_monthly_index(
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
     shares: pd.DataFrame,
-    end_date: pd.Timestamp,
     config: dict,
-    schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
+    rebalance_dates: pd.DatetimeIndex,
+    transaction_cost_rate: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = prepare_dividend_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
     index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
-    rebalance_dates = pd.Index([date for date, _ in schedule], name="date")
     constituent_snapshots = []
-    returns = pd.Series(0.0, index=rebalance_dates, name="total_return")
-    price_returns = returns.rename("price_return").copy()
-    dividend_cash = returns.rename("dividend_cash").copy()
+    constituent_weights = {}
 
-    for position, rebalance_date in enumerate(rebalance_dates):
+    for rebalance_date in rebalance_dates:
         constituents = select_dividend_low_vol_constituents(
             price,
             dividends,
@@ -306,51 +323,30 @@ def _calculate_dividend_low_vol_monthly_index(
             config,
             prepared,
         )
+        constituent_weights[rebalance_date] = constituents["weight"]
         constituent_snapshots.append(
             constituents.reset_index()
             .assign(effective_date=rebalance_date)
             .set_index(["effective_date", "symbol"])
         )
-        if position + 1 == len(rebalance_dates):
-            continue
-        next_rebalance_date = rebalance_dates[position + 1]
-        prices = (
-            index_inputs["prices"]
-            .reindex(columns=constituents.index)
-            .loc[:next_rebalance_date]
-            .ffill()
-            .loc[[rebalance_date, next_rebalance_date]]
-        )
-        missing = prices.loc[rebalance_date][prices.loc[rebalance_date].isna()].index.tolist()
-        if missing:
-            raise ValueError(
-                "No price is available on or before rebalance_date for "
-                f"{len(missing)} constituents; examples: {missing[:5]}"
-            )
-        normalized_shares = constituents["weight"] / prices.loc[rebalance_date]
-        end_value = prices.loc[next_rebalance_date].mul(normalized_shares).sum()
-        cash = _monthly_dividend_cash(
-            index_inputs["dividend_events"],
-            normalized_shares,
-            rebalance_date,
-            next_rebalance_date,
-        )
-        price_returns.loc[next_rebalance_date] = end_value - 1.0
-        dividend_cash.loc[next_rebalance_date] = cash
-        returns.loc[next_rebalance_date] = end_value + cash - 1.0
-
-    price_index = (1.0 + price_returns).cumprod()
-    total_return_index = (1.0 + returns).cumprod()
-    index = pd.DataFrame(
-        {
-            "price_return": price_returns,
-            "total_return": returns,
-            "dividend_cash": dividend_cash,
-            "price_index": price_index,
-            "total_return_index": total_return_index,
+    target_weights = pd.DataFrame(constituent_weights).T.fillna(0.0)
+    target_weights.index.name = "date"
+    cash_events = index_inputs["dividend_events"].rename(
+        columns={
+            "payment_date": "date",
+            "cash_dividend_after_tax": "cash_per_share",
         }
     )
-    return index[INDEX_COLUMNS], pd.concat(constituent_snapshots).sort_index()
+    cash_events = cash_events.loc[
+        cash_events["date"].notna() & cash_events["cash_per_share"].gt(0)
+    ]
+    index = run_backtest(
+        index_inputs["prices"],
+        target_weights,
+        cash_events[["date", "symbol", "cash_per_share"]],
+        fee_rate=transaction_cost_rate,
+    )
+    return index[MONTHLY_INDEX_COLUMNS], pd.concat(constituent_snapshots).sort_index()
 
 
 def _calculate_dividend_low_vol_rebalanced_index(
@@ -428,13 +424,6 @@ def _annual_rebalance_schedule(
     return schedule
 
 
-def _monthly_rebalance_schedule(
-    calendar: pd.Index,
-) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-    month_ends = pd.Series(calendar, index=calendar).groupby(calendar.to_period("M")).max()
-    return [(rebalance_date, rebalance_date) for rebalance_date in month_ends]
-
-
 def _validate_selection_config(config: dict) -> None:
     try:
         universe = config["universe"]
@@ -503,30 +492,12 @@ def _prepare_index_inputs(
         "price": price_data,
         "prices": price_data.pivot(index="date", columns="symbol", values="close"),
         "dividend_events": events,
-        "query_coverage": set(_prepare_dividend_queries(dividend_queries).itertuples(index=False, name=None)),
+        "query_coverage": set(
+            normalize_query_years(dividend_queries).itertuples(
+                index=False, name=None
+            )
+        ),
     }
-
-
-def _prepare_selection_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
-    required = {"symbol", "year", "announce_date", "cash_dividend_after_tax"}
-    _require_columns(dividends, required, "dividends")
-    out = dividends.loc[:, sorted(required)].copy()
-    return out.dropna(subset=["announce_date", "cash_dividend_after_tax"])
-
-
-def _prepare_dividend_queries(dividend_queries: pd.DataFrame) -> pd.DataFrame:
-    if {"symbol", "year"}.issubset(dividend_queries.columns):
-        out = dividend_queries[["symbol", "year"]].copy()
-        return out.drop_duplicates().sort_values(["symbol", "year"])
-    required = {"symbol", "start", "end"}
-    _require_columns(dividend_queries, required, "dividend_queries")
-    out = dividend_queries.loc[:, sorted(required)].copy()
-    out = out.loc[out["start"] <= out["end"]]
-    out = out.loc[
-        out.index.repeat(out["end"].dt.year - out["start"].dt.year + 1)
-    ].copy()
-    out["year"] = out.groupby(level=0).cumcount() + out["start"].dt.year
-    return out[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
 
 
 def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
@@ -606,26 +577,6 @@ def _index_dividend_cash(
                 normalized_shares[event.symbol] * event.cash_dividend_after_tax
             )
     return cash
-
-
-def _monthly_dividend_cash(
-    dividends: pd.DataFrame,
-    normalized_shares: pd.Series,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> float:
-    events = dividends.loc[
-        dividends["symbol"].isin(normalized_shares.index)
-        & dividends["payment_date"].gt(start)
-        & dividends["payment_date"].le(end)
-        & dividends["cash_dividend_after_tax"].gt(0)
-    ]
-    return float(
-        events.assign(
-            cash=lambda data: data["symbol"].map(normalized_shares)
-            * data["cash_dividend_after_tax"]
-        )["cash"].sum()
-    )
 
 
 def _require_query_coverage_from_set(

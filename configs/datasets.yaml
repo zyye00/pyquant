@@ -89,6 +89,17 @@ datasets:
     field_map: {日期: date, 指数代码: symbol, 收盘: close}
     update: {kind: csindex_history, pool: false}
 
+  index_constituents:
+    description: Changed snapshots of official index constituents from RQData.
+    source: rqdata
+    storage: {kind: table, path: data/raw/index_constituents/H30269.parquet}
+    columns: [effective_date, index_code, symbol]
+    required: [effective_date, index_code, symbol]
+    primary_key: [effective_date, index_code, symbol]
+    date_column: effective_date
+    date_columns: [effective_date]
+    field_map: {}
+
   stock_5m:
     description: Five-minute stock prices partitioned by symbol and year.
     source: baostock

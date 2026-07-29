@@ -25,3 +25,11 @@ strategy_1:
   dividend_top_n: 150
   final_n: 50
   volatility_lookback_days: 20
+  transaction_cost_rate: 0.001
+
+strategy_3:
+  index_code: H30269
+  rqdata_index_code: H30269.XSHG
+  trim_ratio: 0.1
+  band_window_months: 6
+  band_std_multiplier: 1.5

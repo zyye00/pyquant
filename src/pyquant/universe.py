@@ -6,6 +6,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from pyquant.data import normalize_query_years
+
 
 def build_universe(
     price: pd.DataFrame,
@@ -126,7 +128,7 @@ def prepare_dividend_low_vol_universe_inputs(
     return {
         "price": price_data,
         "dividends": _prepare_dividend_low_vol_dividends(dividends),
-        "dividend_queries": _prepare_dividend_low_vol_queries(dividend_queries),
+        "dividend_queries": normalize_query_years(dividend_queries),
         "market_data": market_data,
         "price_counts": price_counts,
     }
@@ -168,18 +170,6 @@ def _prepare_dividend_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame
     return dividends.loc[:, sorted(required)].dropna(
         subset=["announce_date", "cash_dividend_after_tax"]
     )
-
-
-def _prepare_dividend_low_vol_queries(dividend_queries: pd.DataFrame) -> pd.DataFrame:
-    if {"symbol", "year"}.issubset(dividend_queries.columns):
-        return dividend_queries[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
-    required = {"symbol", "start", "end"}
-    _require_dividend_low_vol_columns(dividend_queries, required, "dividend_queries")
-    out = dividend_queries.loc[:, sorted(required)].copy()
-    out = out.loc[out["start"] <= out["end"]]
-    out = out.loc[out.index.repeat(out["end"].dt.year - out["start"].dt.year + 1)].copy()
-    out["year"] = out.groupby(level=0).cumcount() + out["start"].dt.year
-    return out[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
 
 
 def _prepare_dividend_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:

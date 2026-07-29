@@ -247,6 +247,51 @@ def standardize_price(
     return out[ordered + extras].sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
+def get_period_end_dates(
+    dates: Collection[object] | pd.Index,
+    frequency: str = "M",
+) -> pd.DatetimeIndex:
+    """Return the last available date in each calendar period."""
+    name = dates.name if isinstance(dates, pd.Index) else None
+    index = pd.DatetimeIndex(pd.to_datetime(list(dates), errors="coerce"))
+    if index.hasnans:
+        raise ValueError("dates must not contain invalid values")
+    index = index.drop_duplicates().sort_values()
+    if index.empty:
+        return pd.DatetimeIndex([], name=name)
+    period_ends = pd.Series(index, index=index).groupby(index.to_period(frequency)).max()
+    return pd.DatetimeIndex(period_ends.array, name=name)
+
+
+def normalize_query_years(queries: pd.DataFrame) -> pd.DataFrame:
+    """Normalize query coverage to unique ``symbol, year`` rows."""
+    if {"symbol", "year"}.issubset(queries.columns):
+        out = queries[["symbol", "year"]].copy()
+        out["year"] = pd.to_numeric(out["year"], errors="coerce")
+        if out[["symbol", "year"]].isna().any().any():
+            raise ValueError("queries symbol and year must not contain invalid values")
+        out["symbol"] = out["symbol"].astype(str)
+        out["year"] = out["year"].astype(int)
+        return out.drop_duplicates().sort_values(["symbol", "year"])
+
+    required = {"symbol", "start", "end"}
+    missing = sorted(required - set(queries))
+    if missing:
+        raise ValueError(f"queries missing required columns: {missing}")
+    out = queries.loc[:, sorted(required)].copy()
+    out["start"] = pd.to_datetime(out["start"], errors="coerce")
+    out["end"] = pd.to_datetime(out["end"], errors="coerce")
+    if out[["symbol", "start", "end"]].isna().any().any():
+        raise ValueError("queries ranges must not contain invalid values")
+    out["symbol"] = out["symbol"].astype(str)
+    out = out.loc[out["start"].le(out["end"])]
+    out = out.loc[
+        out.index.repeat(out["end"].dt.year - out["start"].dt.year + 1)
+    ].copy()
+    out["year"] = out.groupby(level=0).cumcount() + out["start"].dt.year
+    return out[["symbol", "year"]].drop_duplicates().sort_values(["symbol", "year"])
+
+
 def get_dataset(name: str) -> dict[str, Any]:
     """Return one built-in dataset definition by name."""
     try:
