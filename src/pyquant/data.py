@@ -191,7 +191,7 @@ def load_dataset(
             normalize_symbols=storage.get("normalize_symbols", True),
         )
     else:
-        paths = _dataset_paths(storage, symbols, start_at, end_at)
+        paths = _dataset_paths(storage, symbols)
         if not paths:
             raise FileNotFoundError(f"No files found for dataset {name!r}")
         frames = [
@@ -339,25 +339,17 @@ def get_dataset(name: str) -> dict[str, Any]:
 def _dataset_paths(
     storage: dict[str, str],
     symbols: Collection[str] | None,
-    start: pd.Timestamp | None,
-    end: pd.Timestamp | None,
 ) -> list[Path]:
     template = storage["path"]
     if storage["kind"] == "table":
         path = Path(template)
         return [path] if path.exists() else []
     symbol_values = [str(symbol) for symbol in symbols] if symbols else ["*"]
-    years: list[int | str] = ["*"]
-    if "{year}" in template and start is not None and end is not None:
-        years = list(range(start.year, end.year + 1))
     query_path = storage.get("query_path")
     paths = {
         Path(path)
         for symbol in symbol_values
-        for year in years
-        for path in glob(
-            template.format(symbol=symbol, year=year)
-        )
+        for path in glob(template.format(symbol=symbol))
         if query_path is None or Path(path) != Path(query_path)
     }
     return sorted(paths)

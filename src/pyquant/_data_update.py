@@ -56,20 +56,6 @@ class DataPaths:
         return self.raw_root / "stock_daily"
 
     @property
-    def minute_5_stock_dir(self) -> Path:
-        return _dataset_path(
-            "stock_5m", self.data_root, symbol="_", year=2000
-        ).parents[1]
-
-    def history_queries_path(self, dataset: str, frequency: str) -> Path:
-        if frequency == "d" and dataset in {"stock", "index"}:
-            return self.database_path
-        name = {
-            ("stock", "5"): "stock_5m",
-        }[dataset, frequency]
-        return _configured_path(_datasets[name]["storage"]["query_path"], self.data_root)
-
-    @property
     def database_path(self) -> Path:
         return get_database_path(self.data_root)
 
@@ -106,10 +92,6 @@ def _configured_path(template: str, data_root: Path, **values: object) -> Path:
     return data_root / Path(template.format(**values)).relative_to("data")
 
 
-def _dataset_path(name: str, data_root: Path, **values: object) -> Path:
-    return _configured_path(_datasets[name]["storage"]["path"], data_root, **values)
-
-
 def _normalize_baostock_code(code: object) -> str:
     symbol = normalize_security_symbol(code)
     security_code, exchange = symbol.split(".")
@@ -144,7 +126,6 @@ def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
     """Create DuckDB and the remaining source-specific directories."""
     paths = DataPaths(data_root)
     for path in [
-        paths.minute_5_stock_dir,
         paths.state_dir,
         data_root / "staging/migration",
         data_root / "staging/downloads",
@@ -154,31 +135,6 @@ def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
     initialize_database(paths.database_path)
     reset_request_log(paths.request_log_path)
     return paths
-
-
-def daily_target_path(
-    code: str,
-    dataset: str,
-    data_root: Path = Path("data"),
-) -> Path:
-    return _dataset_path(
-        {"stock": "stock_daily", "index": "index_daily"}[dataset],
-        data_root,
-        symbol=code,
-    )
-
-
-def minute_5_target_path(
-    code: str,
-    year: int,
-    data_root: Path = Path("data"),
-) -> Path:
-    return _dataset_path(
-        "stock_5m",
-        data_root,
-        symbol=code,
-        year=year,
-    )
 
 
 def clean_baostock_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -294,25 +250,6 @@ def missing_baostock_ranges(
     return missing
 
 
-def atomic_write_parquet(
-    data: pd.DataFrame, target_path: Path, overwrite: bool = False
-) -> None:
-    """Write a parquet file through a temporary path, then atomically replace."""
-    if target_path.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists: {target_path}")
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
-    data.to_parquet(tmp_path, index=False, compression="zstd")
-    os.replace(tmp_path, target_path)
-
-
-def _read_query_cache(path: Path, columns: list[str]) -> pd.DataFrame:
-    data = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=columns)
-    data["start"] = pd.to_datetime(data["start"])
-    data["end"] = pd.to_datetime(data["end"])
-    return data
-
-
 def request_count_today(
     request_log_path: Path,
     today: date | None = None,
@@ -399,18 +336,6 @@ def remove_download_lock(data_root: Path = Path("data")) -> None:
     lock_path = DataPaths(data_root).lock_path
     if lock_path.exists():
         lock_path.unlink()
-
-
-def merge_history_data(data: pd.DataFrame, target_path: Path) -> pd.DataFrame:
-    if not target_path.exists():
-        return data
-    existing = pd.read_parquet(target_path)
-    existing["date"] = pd.to_datetime(existing["date"], errors="raise")
-    out = pd.concat([existing, data], ignore_index=True)
-    keys = ["date"] + (["time"] if "time" in out else [])
-    return (
-        out.drop_duplicates(keys, keep="last").sort_values(keys).reset_index(drop=True)
-    )
 
 
 def clean_csindex_history(data: pd.DataFrame, code: str) -> pd.DataFrame:
@@ -690,7 +615,6 @@ def update_profit_quarterly(
 
 def update_history_dataset(
     dataset: str,
-    frequency: str,
     codes: Iterable[str],
     start_date: str,
     end_date: str,
@@ -701,20 +625,11 @@ def update_history_dataset(
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
-    """Check and update each security's locally missing date ranges."""
+    """Check and update each security's locally missing daily ranges."""
     fields = _fields["history"]
     codes = [_normalize_baostock_code(code) for code in codes]
     paths = init_data_storage(data_root)
-    duckdb_daily = frequency == "d" and dataset in {"stock", "index"}
-    connection = connect_database(paths.database_path) if duckdb_daily else None
-    query_cache_path = (
-        None if duckdb_daily else paths.history_queries_path(dataset, frequency)
-    )
-    query_cache = (
-        None
-        if duckdb_daily
-        else _read_query_cache(query_cache_path, fields["query"])
-    )
+    connection = connect_database(paths.database_path)
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -728,55 +643,20 @@ def update_history_dataset(
         for code in codes:
             if checkpoint is not None and not checkpoint():
                 return pd.DataFrame(results, columns=fields["result"])
-            slices = []
             queried = (
-                (
-                    stock_daily_coverage(connection, code)
-                    if dataset == "stock"
-                    else index_daily_coverage(
-                        connection,
-                        code,
-                        BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
-                    )
-                )
-                if duckdb_daily
-                else list(
-                    query_cache.loc[
-                        query_cache["code"] == code, ["start", "end"]
-                    ].itertuples(index=False, name=None)
+                stock_daily_coverage(connection, code)
+                if dataset == "stock"
+                else index_daily_coverage(
+                    connection,
+                    code,
+                    BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
                 )
             )
-            if frequency == "d":
-                target = (
-                    paths.database_path
-                    if duckdb_daily
-                    else daily_target_path(code, dataset, data_root)
-                )
-                slices.extend(
-                    (first, last, target)
-                    for first, last in missing_baostock_ranges(
-                        start_date, end_date, queried_ranges=queried
-                    )
-                )
-            else:
-                for year in range(
-                    pd.Timestamp(start_date).year, pd.Timestamp(end_date).year + 1
-                ):
-                    first = max(
-                        pd.Timestamp(start_date), pd.Timestamp(f"{year}-01-01")
-                    ).strftime("%Y-%m-%d")
-                    last = min(
-                        pd.Timestamp(end_date), pd.Timestamp(f"{year}-12-31")
-                    ).strftime("%Y-%m-%d")
-                    target = minute_5_target_path(code, year, data_root)
-                    slices.extend(
-                        (range_start, range_end, target)
-                        for range_start, range_end in missing_baostock_ranges(
-                            first, last, queried_ranges=queried
-                        )
-                    )
-
-            for range_start, range_end, target_path in slices:
+            for range_start, range_end in missing_baostock_ranges(
+                start_date,
+                end_date,
+                queried_ranges=queried,
+            ):
                 if max_tasks is not None and tasks >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
                 if request_count_today(paths.request_log_path) >= effective_limit:
@@ -788,7 +668,7 @@ def update_history_dataset(
                     paths.request_log_path,
                     "query_history_k_data_plus",
                     code,
-                    frequency,
+                    "d",
                     range_start,
                     range_end,
                 )
@@ -796,57 +676,34 @@ def update_history_dataset(
                     code,
                     range_start,
                     range_end,
-                    fields["daily"] if frequency == "d" else fields["minute_5"],
-                    frequency,
+                    fields["daily"],
+                    "d",
                     active_client,
                 )
                 data = clean_baostock_data(data)
-                if duckdb_daily:
-                    if dataset == "stock":
-                        write_stock_daily_request(
-                            connection,
-                            code,
-                            data,
-                            range_start,
-                            range_end,
-                        )
-                    else:
-                        write_index_daily_request(
-                            connection,
-                            code,
-                            data,
-                            range_start,
-                            range_end,
-                            BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
-                        )
+                if dataset == "stock":
+                    write_stock_daily_request(
+                        connection,
+                        code,
+                        data,
+                        range_start,
+                        range_end,
+                    )
                 else:
-                    data = merge_history_data(data, target_path)
-                    atomic_write_parquet(data, target_path, overwrite=True)
-                    query_cache = pd.concat(
-                        [
-                            query_cache,
-                            pd.DataFrame(
-                                [
-                                    [
-                                        code,
-                                        pd.Timestamp(range_start),
-                                        pd.Timestamp(range_end),
-                                    ]
-                                ],
-                                columns=fields["query"],
-                            ),
-                        ],
-                        ignore_index=True,
-                    ).drop_duplicates()
-                    atomic_write_parquet(
-                        query_cache, query_cache_path, overwrite=True
+                    write_index_daily_request(
+                        connection,
+                        code,
+                        data,
+                        range_start,
+                        range_end,
+                        BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
                     )
                 results.append(
                     (
                         code,
                         range_start,
                         range_end,
-                        str(target_path),
+                        str(paths.database_path),
                         "success",
                         len(data),
                         "",
@@ -859,8 +716,7 @@ def update_history_dataset(
                 progress(completed, len(codes))
         return pd.DataFrame(results, columns=fields["result"])
     finally:
-        if connection is not None:
-            connection.close()
+        connection.close()
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
@@ -951,7 +807,6 @@ def update_dataset(
         if update["kind"] == "history":
             return update_history_dataset(
                 update["target"],
-                update["frequency"],
                 codes,
                 start,
                 end_date,

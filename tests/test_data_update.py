@@ -19,7 +19,6 @@ from pyquant._data_update import (
     clean_csindex_history,
     create_download_lock,
     init_data_storage,
-    minute_5_target_path,
     request_count_today,
     resolve_baostock_codes,
     update_dividends,
@@ -250,7 +249,6 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
@@ -275,7 +273,6 @@ def test_history_query_cache_skips_completed_ranges(tmp_path):
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
@@ -322,7 +319,6 @@ def test_local_min_max_does_not_hide_query_cache_gap(tmp_path):
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2013-01-01",
         "2014-01-03",
@@ -336,29 +332,10 @@ def test_local_min_max_does_not_hide_query_cache_gap(tmp_path):
     ]
 
 
-def test_minute_updates_are_partitioned_by_year(tmp_path):
-    result = update_history_dataset(
-        "stock",
-        "5",
-        ["sh.600000"],
-        "2023-12-29",
-        "2024-01-03",
-        tmp_path / "data",
-        10,
-        client=FakeClient(),
-    )
-
-    assert result["target_path"].tolist() == [
-        str(minute_5_target_path("sh.600000", 2023, tmp_path / "data")),
-        str(minute_5_target_path("sh.600000", 2024, tmp_path / "data")),
-    ]
-
-
 def test_update_merges_data_and_skips_covered_range(tmp_path):
     client = FakeClient()
     first = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
@@ -368,7 +345,6 @@ def test_update_merges_data_and_skips_covered_range(tmp_path):
     )
     second = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
@@ -388,7 +364,6 @@ def test_update_caches_successful_empty_history_query(tmp_path):
 
     first = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
@@ -398,7 +373,6 @@ def test_update_caches_successful_empty_history_query(tmp_path):
     )
     second = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-02",
@@ -420,7 +394,6 @@ def test_update_reports_completed_stock_count(tmp_path):
 
     update_history_dataset(
         "stock",
-        "d",
         ["sh.600000", "sz.000001"],
         "2024-01-02",
         "2024-01-02",
@@ -448,7 +421,6 @@ def test_update_respects_request_limit_without_completing_next_stock(tmp_path):
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000", "sz.000001"],
         "2024-01-02",
         "2024-01-02",
@@ -470,7 +442,6 @@ def test_update_does_not_complete_partially_updated_stock(tmp_path):
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
@@ -498,7 +469,6 @@ def test_runtime_error_stops_history_update_and_releases_lock(tmp_path, monkeypa
     with pytest.raises(RuntimeError, match="source failed"):
         update_history_dataset(
             "stock",
-            "d",
             ["sh.600000", "sz.000001"],
             "2024-01-02",
             "2024-01-02",
@@ -524,7 +494,6 @@ def test_request_error_stops_history_update_and_releases_lock(tmp_path, error):
     with pytest.raises(RuntimeError, match=f"BaoStock request failed: {error}"):
         update_history_dataset(
             "stock",
-            "d",
             ["sh.600000", "sz.000001"],
             "2024-01-02",
             "2024-01-02",
@@ -551,7 +520,6 @@ def test_database_write_failure_stops_history_update(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="database write failed"):
         update_history_dataset(
             "stock",
-            "d",
             ["sh.600000", "sz.000001"],
             "2024-01-02",
             "2024-01-02",
@@ -572,7 +540,6 @@ def test_update_stop_leaves_partially_updated_stock_incomplete(tmp_path):
 
     result = update_history_dataset(
         "stock",
-        "d",
         ["sh.600000"],
         "2024-01-02",
         "2024-01-05",
@@ -858,7 +825,6 @@ def test_history_request_log_records_requests_before_runtime_error(tmp_path):
     with pytest.raises(RuntimeError, match="simulated source failure"):
         update_history_dataset(
             "stock",
-            "d",
             ["sh.600000", "sz.000001", "sz.000002"],
             "2024-01-02",
             "2024-01-02",

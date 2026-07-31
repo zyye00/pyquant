@@ -17,7 +17,6 @@ sources:
     fields:
       history:
         daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
-        minute_5: [date, time, code, open, high, low, close, volume, amount, adjustflag]
         float32: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
         query: [code, start, end]
         result: [code, start_date, end_date, target_path, status, row_count, error]
@@ -53,7 +52,7 @@ datasets:
     date_columns: [date]
     numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
     field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
-    update: {kind: history, target: stock, frequency: d, pool: true}
+    update: {kind: history, target: stock, pool: true}
 
   index_daily:
     description: Daily index prices.
@@ -71,7 +70,7 @@ datasets:
     date_columns: [date]
     numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
     field_map: {code: symbol, pctChg: pct_chg, peTTM: pe_ttm, pbMRQ: pb_mrq, psTTM: ps_ttm, pcfNcfTTM: pcf_ncf_ttm, isST: is_st}
-    update: {kind: history, target: index, frequency: d, pool: false}
+    update: {kind: history, target: index, pool: false}
 
   csindex_daily:
     description: Daily official CSI Dividend Low Volatility index prices.
@@ -102,23 +101,6 @@ datasets:
     date_column: effective_date
     date_columns: [effective_date]
     field_map: {}
-
-  stock_5m:
-    description: Five-minute stock prices partitioned by symbol and year.
-    source: baostock
-    storage:
-      kind: symbol_year_files
-      path: data/raw/stock_5m/{symbol}/{year}.parquet
-      query_path: data/raw/stock_5m/queries.parquet
-      symbol_from: parent
-    columns: [date, time, symbol, open, high, low, close, volume, amount]
-    required: [date, time, symbol, close]
-    primary_key: [date, time, symbol]
-    date_column: date
-    date_columns: [date]
-    numeric_columns: [open, high, low, close, volume, amount]
-    field_map: {code: symbol}
-    update: {kind: history, target: stock, frequency: "5", pool: true}
 
   other_daily:
     description: Existing daily files for securities outside the stock dataset.

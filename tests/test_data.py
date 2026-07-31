@@ -9,6 +9,7 @@ import pytest
 from pyquant import data as data_module
 from pyquant import (
     DatasetUpdate,
+    get_dataset,
     get_period_end_dates,
     load_dataset,
     load_price,
@@ -40,6 +41,11 @@ def test_standardize_price_renames_required_fields():
     assert list(out.columns) == ["date", "symbol", "close", "volume"]
     assert out.loc[0, "symbol"] == "1"
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
+
+
+def test_five_minute_dataset_is_not_available():
+    with pytest.raises(ValueError, match="Unknown dataset 'stock_5m'"):
+        get_dataset("stock_5m")
 
 
 def test_get_period_end_dates_returns_last_available_date():
