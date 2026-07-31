@@ -1,14 +1,7 @@
 import pandas as pd
 import pytest
 
-from pyquant import ensure_dir, load_config, save_output
-
-
-def test_load_config_reads_yaml(tmp_path):
-    path = tmp_path / "config.yaml"
-    path.write_text("a: 1\n", encoding="utf-8")
-
-    assert load_config(path) == {"a": 1}
+from pyquant import ensure_dir, save_output
 
 
 def test_save_output_does_not_overwrite_by_default(tmp_path):

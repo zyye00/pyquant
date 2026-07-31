@@ -10,6 +10,7 @@ from pyquant import (
     prepare_dividend_low_vol_universe_inputs,
     run_backtest,
 )
+from pyquant.universe import DIVIDEND_AFTER_TAX_RATIO
 
 
 CONSTITUENT_COLUMNS = [
@@ -164,13 +165,11 @@ def calculate_dividend_low_vol_index(
         name="date",
     )
     if effective not in calendar:
-        raise ValueError(f"effective_date is not present in the price calendar: {effective.date()}")
+        raise ValueError(
+            f"effective_date is not present in the price calendar: {effective.date()}"
+        )
     prices = (
-        prepared["prices"]
-        .reindex(columns=symbols)
-        .loc[:end]
-        .ffill()
-        .reindex(calendar)
+        prepared["prices"].reindex(columns=symbols).loc[:end].ffill().reindex(calendar)
     )
     missing = prices.loc[effective][prices.loc[effective].isna()].index.tolist()
     if missing:
@@ -337,6 +336,9 @@ def _calculate_dividend_low_vol_monthly_index(
             "cash_dividend_before_tax": "cash_per_share",
         }
     )
+    cash_events["cash_per_share"] = (
+        cash_events["cash_per_share"] * DIVIDEND_AFTER_TAX_RATIO
+    )
     cash_events = cash_events.loc[
         cash_events["date"].notna() & cash_events["cash_per_share"].gt(0)
     ]
@@ -415,9 +417,7 @@ def _annual_rebalance_schedule(
 ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     schedule = []
     for year in range(start.year, end.year + 1):
-        as_of_date = pd.date_range(
-            f"{year}-12-01", periods=2, freq="W-FRI"
-        )[1]
+        as_of_date = pd.date_range(f"{year}-12-01", periods=2, freq="W-FRI")[1]
         position = calendar.searchsorted(as_of_date, side="right")
         if position < len(calendar):
             schedule.append((as_of_date, calendar[position]))
@@ -429,7 +429,9 @@ def _validate_selection_config(config: dict) -> None:
         universe = config["universe"]
         selection = config["selection"]
     except (KeyError, TypeError) as exc:
-        raise ValueError("Invalid dividend-low-volatility selection configuration") from exc
+        raise ValueError(
+            "Invalid dividend-low-volatility selection configuration"
+        ) from exc
     if universe["lookback_days"] <= 0 or universe["dividend_years"] < 2:
         raise ValueError("lookback_days must be positive and dividend_years at least 2")
     for name in ["market_cap_keep_ratio", "amount_keep_ratio"]:
@@ -480,8 +482,13 @@ def _prepare_index_inputs(
     event_key = [
         column
         for column in [
-            "symbol", "year", "announce_date", "record_date", "operate_date",
-            "payment_date", "cash_dividend_before_tax",
+            "symbol",
+            "year",
+            "announce_date",
+            "record_date",
+            "operate_date",
+            "payment_date",
+            "cash_dividend_before_tax",
         ]
         if column in dividends
     ]
@@ -493,9 +500,7 @@ def _prepare_index_inputs(
         "prices": price_data.pivot(index="date", columns="symbol", values="close"),
         "dividend_events": events,
         "query_coverage": set(
-            normalize_query_years(dividend_queries).itertuples(
-                index=False, name=None
-            )
+            normalize_query_years(dividend_queries).itertuples(index=False, name=None)
         ),
     }
 
@@ -531,7 +536,10 @@ def _average_ttm_dividend_yield(
             continue
         events = dividends[dividends["symbol"] == symbol].sort_values("announce_date")
         event_dates = events["announce_date"].to_numpy(dtype="datetime64[ns]")
-        cash = events["cash_dividend_before_tax"].to_numpy(dtype=float)
+        cash = (
+            events["cash_dividend_before_tax"].to_numpy(dtype=float)
+            * DIVIDEND_AFTER_TAX_RATIO
+        )
         cumulative = np.concatenate(([0.0], np.cumsum(cash)))
         dates = history["date"].to_numpy(dtype="datetime64[ns]")
         right = np.searchsorted(event_dates, dates, side="right")
@@ -541,7 +549,9 @@ def _average_ttm_dividend_yield(
             side="right",
         )
         trailing_cash = cumulative[right] - cumulative[left]
-        values[str(symbol)] = float((trailing_cash / history["close"].to_numpy()).mean())
+        values[str(symbol)] = float(
+            (trailing_cash / history["close"].to_numpy()).mean()
+        )
     return values
 
 
@@ -574,7 +584,9 @@ def _index_dividend_cash(
         position = calendar.searchsorted(event.payment_date, side="left")
         if position < len(calendar):
             cash.iloc[position] += (
-                normalized_shares[event.symbol] * event.cash_dividend_before_tax
+                normalized_shares[event.symbol]
+                * event.cash_dividend_before_tax
+                * DIVIDEND_AFTER_TAX_RATIO
             )
     return cash
 

@@ -1,0 +1,106 @@
+stock_daily:
+  description: Daily stock prices and valuation fields.
+  source: baostock
+  storage:
+    kind: duckdb
+    path: data/pyquant.duckdb
+    relation: api.stock_daily
+    requires_dates: true
+  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+  required: [date, symbol, close, amount, pe_ttm]
+  primary_key: [date, symbol]
+  date_column: date
+  date_columns: [date]
+  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+  update: {kind: history, target: stock, pool: true}
+
+index_daily:
+  description: Daily index prices.
+  source: baostock
+  storage:
+    kind: duckdb
+    path: data/pyquant.duckdb
+    relation: api.index_daily
+    requires_dates: true
+    normalize_symbols: false
+  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+  required: [date, symbol, close]
+  primary_key: [date, symbol]
+  date_column: date
+  date_columns: [date]
+  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+  update: {kind: history, target: index, pool: false}
+
+csindex_daily:
+  description: Daily official CSI Dividend Low Volatility index prices.
+  source: akshare
+  storage:
+    kind: duckdb
+    path: data/pyquant.duckdb
+    relation: api.index_daily
+    requires_dates: true
+    normalize_symbols: false
+    allowed_symbols: [H30269, H20269]
+  columns: [date, symbol, close]
+  required: [date, symbol, close]
+  primary_key: [date, symbol]
+  date_column: date
+  date_columns: [date]
+  numeric_columns: [close]
+  update: {kind: csindex_history, pool: false}
+
+index_constituents:
+  description: Changed snapshots of official index constituents from RQData.
+  source: rqdata
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.index_constituents, requires_dates: false, normalize_symbols: true}
+  columns: [effective_date, index_code, symbol]
+  required: [effective_date, index_code, symbol]
+  primary_key: [effective_date, index_code, symbol]
+  date_column: effective_date
+  date_columns: [effective_date]
+  update:
+    kind: index_constituents
+    pool: false
+    source_codes: {H30269: H30269.XSHG}
+
+dividend:
+  description: Announced cash dividends per share.
+  source: baostock
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.dividend, requires_dates: false}
+  columns: [symbol, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
+  required: [symbol, announce_date, cash_dividend_before_tax]
+  primary_key: [symbol, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
+  date_column: announce_date
+  date_columns: [announce_date, record_date, operate_date, payment_date]
+  numeric_columns: [cash_dividend_before_tax]
+  update: {kind: dividend, pool: true}
+
+dividend_queries:
+  description: Completed dividend source queries, including empty results.
+  source: generated
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.dividend_coverage, requires_dates: false}
+  columns: [symbol, year]
+  required: [symbol, year]
+  primary_key: [symbol, year]
+  numeric_columns: [year]
+
+stock_profit_quarterly:
+  description: Quarterly publication dates and total shares.
+  source: baostock
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.share_capital_quarterly, requires_dates: false}
+  columns: [symbol, publish_date, report_date, total_shares]
+  required: [symbol, publish_date, total_shares]
+  primary_key: [symbol, report_date]
+  date_column: publish_date
+  date_columns: [publish_date, report_date]
+  numeric_columns: [total_shares]
+  update: {kind: profit_quarterly, pool: true}
+
+stock_profit_quarterly_queries:
+  description: Completed quarterly profit source queries, including empty results.
+  source: generated
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.share_capital_coverage, requires_dates: false}
+  columns: [symbol, year, quarter]
+  required: [symbol, year, quarter]
+  primary_key: [symbol, year, quarter]
+  numeric_columns: [year, quarter]

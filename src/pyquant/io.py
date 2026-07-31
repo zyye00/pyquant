@@ -1,32 +1,23 @@
-"""Configuration and output helpers."""
+"""Physical table input and output helpers."""
 
 from pathlib import Path
-from typing import Any, Union
 
 import pandas as pd
-import yaml
 
 
-def load_config(path: Union[str, Path]) -> dict[str, Any]:
-    """读取 YAML 配置。"""
-    with Path(path).open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return data or {}
-
-
-def ensure_dir(path: Union[str, Path]) -> Path:
-    """确保目录存在并返回 Path。"""
+def ensure_dir(path: str | Path) -> Path:
+    """Create a directory when needed and return its path."""
     out = Path(path)
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
 def save_output(
-    data: Union[pd.DataFrame, pd.Series],
-    path: Union[str, Path],
+    data: pd.DataFrame | pd.Series,
+    path: str | Path,
     overwrite: bool = False,
 ) -> Path:
-    """按扩展名保存结果，默认不覆盖已有文件。"""
+    """Save a CSV table without overwriting by default."""
     path = Path(path)
     if path.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {path}")
@@ -34,8 +25,6 @@ def save_output(
 
     if path.suffix == ".csv":
         data.to_csv(path)
-    elif path.suffix in {".parquet", ".pq"}:
-        data.to_frame().to_parquet(path) if isinstance(data, pd.Series) else data.to_parquet(path)
     else:
         raise ValueError(f"Unsupported output file type: {path.suffix}")
     return path

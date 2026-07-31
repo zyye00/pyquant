@@ -29,7 +29,6 @@ strategy_1:
 
 strategy_3:
   index_code: H30269
-  rqdata_index_code: H30269.XSHG
   trim_ratio: 0.1
   band_window_months: 6
   band_std_multiplier: 1.5

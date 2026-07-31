@@ -1,4 +1,5 @@
 from contextvars import ContextVar
+from pathlib import Path
 from threading import Event
 
 import IPython
@@ -6,21 +7,19 @@ import IPython.display
 import pandas as pd
 import pytest
 
-from pyquant import data as data_module
 from pyquant import (
-    DatasetUpdate,
-    get_dataset,
+    UpdateJob,
     get_period_end_dates,
     load_dataset,
-    load_price,
     normalize_query_years,
     standardize_price,
     update_dataset,
 )
-from pyquant.database import (
+from pyquant.data import loader as loader_module
+from pyquant.data.catalog import dataset_spec_from_mapping, get_dataset_spec
+from pyquant.data.duckdb import connect_database, initialize_database
+from pyquant.data.store import (
     CSINDEX_DAILY_FIELD_SET_ID,
-    connect_database,
-    initialize_database,
     write_index_daily_request,
     write_stock_daily_request,
 )
@@ -45,13 +44,19 @@ def test_standardize_price_renames_required_fields():
 
 def test_five_minute_dataset_is_not_available():
     with pytest.raises(ValueError, match="Unknown dataset 'stock_5m'"):
-        get_dataset("stock_5m")
+        get_dataset_spec("stock_5m")
+
+
+def patch_catalog(monkeypatch, catalog):
+    monkeypatch.setattr(
+        loader_module,
+        "get_dataset_spec",
+        lambda name: dataset_spec_from_mapping(name, catalog[name]),
+    )
 
 
 def test_get_period_end_dates_returns_last_available_date():
-    dates = pd.to_datetime(
-        ["2024-01-02", "2024-01-31", "2024-02-01", "2024-02-28"]
-    )
+    dates = pd.to_datetime(["2024-01-02", "2024-01-31", "2024-02-01", "2024-02-28"])
 
     out = get_period_end_dates(dates)
 
@@ -80,122 +85,6 @@ def test_normalize_query_years_expands_ranges():
     ]
 
 
-def test_load_price_csv(tmp_path):
-    path = tmp_path / "price.csv"
-    pd.DataFrame(
-        {"date": ["2024-01-02"], "symbol": ["000001"], "close": [10.0]}
-    ).to_csv(path, index=False)
-
-    out = load_price(path)
-
-    assert out.loc[0, "close"] == 10.0
-
-
-def test_load_partitioned_dataset_uses_catalog_and_canonical_fields(
-    tmp_path, monkeypatch
-):
-    path = tmp_path / "raw" / "stock_daily" / "sh.600000.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
-            "close": [10.0, 11.0, 12.0],
-            "amount": [100.0, 110.0, 120.0],
-            "peTTM": [8.0, 9.0, 10.0],
-        }
-    ).to_parquet(path, index=False)
-    catalog = {
-        "version": 1,
-        "datasets": {
-            "stock_daily": {
-                "source": "test",
-                "storage": {
-                    "kind": "symbol_files",
-                    "path": str(
-                        tmp_path
-                        / "raw"
-                        / "stock_daily"
-                        / "{symbol}.parquet"
-                    ),
-                    "symbol_from": "stem",
-                },
-                "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "required": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "primary_key": ["date", "symbol"],
-                "date_column": "date",
-                "date_columns": ["date"],
-                "numeric_columns": ["close", "amount", "pe_ttm"],
-                "field_map": {"peTTM": "pe_ttm"},
-            }
-        },
-    }
-    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
-
-    out = load_dataset(
-        "stock_daily",
-        start="2024-01-03",
-        end="2024-01-04",
-        symbols=["sh.600000"],
-    )
-
-    assert out.columns.tolist() == ["date", "symbol", "close", "amount", "pe_ttm"]
-    assert out["date"].tolist() == [
-        pd.Timestamp("2024-01-03"),
-        pd.Timestamp("2024-01-04"),
-    ]
-    assert out["symbol"].unique().tolist() == ["sh.600000"]
-    assert out["pe_ttm"].tolist() == [9.0, 10.0]
-
-
-def test_load_partitioned_dataset_excludes_query_metadata(tmp_path, monkeypatch):
-    data_dir = tmp_path / "raw" / "stock_daily"
-    data_dir.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "date": ["2024-01-02"],
-            "close": [10.0],
-            "amount": [100.0],
-            "peTTM": [8.0],
-        }
-    ).to_parquet(data_dir / "sh.600000.parquet", index=False)
-    query_path = data_dir / "queries.parquet"
-    pd.DataFrame(
-        {
-            "code": ["sh.600000", "sh.600001"],
-            "start": ["2024-01-01", "2024-01-01"],
-            "end": ["2024-01-02", "2024-01-02"],
-        }
-    ).to_parquet(query_path, index=False)
-    catalog = {
-        "version": 1,
-        "datasets": {
-            "stock_daily": {
-                "source": "test",
-                "storage": {
-                    "kind": "symbol_files",
-                    "path": str(data_dir / "{symbol}.parquet"),
-                    "query_path": str(query_path),
-                    "symbol_from": "stem",
-                },
-                "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "required": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "primary_key": ["date", "symbol"],
-                "date_column": "date",
-                "date_columns": ["date"],
-                "numeric_columns": ["close", "amount", "pe_ttm"],
-                "field_map": {"peTTM": "pe_ttm"},
-            }
-        },
-    }
-    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
-
-    out = load_dataset("stock_daily", start="2024-01-01", end="2024-01-02")
-
-    assert out[["date", "symbol"]].to_dict("records") == [
-        {"date": pd.Timestamp("2024-01-02"), "symbol": "sh.600000"}
-    ]
-
-
 def test_load_duckdb_dataset_filters_dates_and_normalizes_symbols(
     tmp_path, monkeypatch
 ):
@@ -217,27 +106,23 @@ def test_load_duckdb_dataset_filters_dates_and_normalizes_symbols(
             "2024-01-03",
         )
     catalog = {
-        "version": 1,
-        "datasets": {
-            "stock_daily": {
-                "source": "test",
-                "storage": {
-                    "kind": "duckdb",
-                    "path": str(database_path),
-                    "relation": "api.stock_daily",
-                    "requires_dates": True,
-                },
-                "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "required": ["date", "symbol", "close", "amount", "pe_ttm"],
-                "primary_key": ["date", "symbol"],
-                "date_column": "date",
-                "date_columns": ["date"],
-                "numeric_columns": ["close", "amount", "pe_ttm"],
-                "field_map": {},
-            }
+        "stock_daily": {
+            "source": "generated",
+            "storage": {
+                "kind": "duckdb",
+                "path": str(database_path),
+                "relation": "api.stock_daily",
+                "requires_dates": True,
+            },
+            "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
+            "required": ["date", "symbol", "close", "amount", "pe_ttm"],
+            "primary_key": ["date", "symbol"],
+            "date_column": "date",
+            "date_columns": ["date"],
+            "numeric_columns": ["close", "amount", "pe_ttm"],
         },
     }
-    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
+    patch_catalog(monkeypatch, catalog)
 
     out = load_dataset(
         "stock_daily",
@@ -275,29 +160,25 @@ def test_load_duckdb_index_dataset_preserves_index_codes(tmp_path, monkeypatch):
             CSINDEX_DAILY_FIELD_SET_ID,
         )
     catalog = {
-        "version": 1,
-        "datasets": {
-            "csindex_daily": {
-                "source": "test",
-                "storage": {
-                    "kind": "duckdb",
-                    "path": str(database_path),
-                    "relation": "api.index_daily",
-                    "requires_dates": True,
-                    "normalize_symbols": False,
-                    "allowed_symbols": ["H30269"],
-                },
-                "columns": ["date", "symbol", "close"],
-                "required": ["date", "symbol", "close"],
-                "primary_key": ["date", "symbol"],
-                "date_column": "date",
-                "date_columns": ["date"],
-                "numeric_columns": ["close"],
-                "field_map": {},
-            }
+        "csindex_daily": {
+            "source": "generated",
+            "storage": {
+                "kind": "duckdb",
+                "path": str(database_path),
+                "relation": "api.index_daily",
+                "requires_dates": True,
+                "normalize_symbols": False,
+                "allowed_symbols": ["H30269"],
+            },
+            "columns": ["date", "symbol", "close"],
+            "required": ["date", "symbol", "close"],
+            "primary_key": ["date", "symbol"],
+            "date_column": "date",
+            "date_columns": ["date"],
+            "numeric_columns": ["close"],
         },
     }
-    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
+    patch_catalog(monkeypatch, catalog)
 
     out = load_dataset(
         "csindex_daily",
@@ -315,25 +196,6 @@ def test_load_duckdb_index_dataset_preserves_index_codes(tmp_path, monkeypatch):
     ]
 
 
-def test_load_dataset_requires_explicit_partition_dates(monkeypatch):
-    catalog = {
-        "version": 1,
-        "datasets": {
-            "stock_daily": {
-                "source": "test",
-                "storage": {"kind": "symbol_files", "path": "missing/{symbol}.parquet"},
-                "columns": [],
-                "required": [],
-                "field_map": {},
-            }
-        },
-    }
-    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
-
-    with pytest.raises(ValueError, match="requires explicit start and end"):
-        load_dataset("stock_daily")
-
-
 def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys):
     first_started = Event()
     release_first = Event()
@@ -347,6 +209,7 @@ def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys)
             "pool": "all",
             "pool_date": None,
             "max_tasks": None,
+            "data_root": Path("data"),
         }
         progress(0, 2)
         assert checkpoint()
@@ -359,11 +222,11 @@ def test_dataset_update_pauses_resumes_and_reports_progress(monkeypatch, capsys)
         progress(2, 2)
         return pd.DataFrame({"status": ["success", "success"]})
 
-    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    monkeypatch.setattr("pyquant.data.updater._run_update_dataset", fake_update)
 
     job = update_dataset("stock_daily", start="2024-01-01", pool="all")
 
-    assert isinstance(job, DatasetUpdate)
+    assert isinstance(job, UpdateJob)
     assert first_started.wait(1)
     assert job.state == "running"
     job.pause()
@@ -398,7 +261,7 @@ def test_dataset_update_uses_ipython_display_for_progress(monkeypatch):
 
     monkeypatch.setattr(IPython, "get_ipython", lambda: object())
     monkeypatch.setattr(IPython.display, "DisplayHandle", FakeDisplayHandle)
-    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    monkeypatch.setattr("pyquant.data.updater._run_update_dataset", fake_update)
 
     job = update_dataset("stock_daily", start="2024-01-01", pool=["sh.600000"])
 
@@ -419,7 +282,7 @@ def test_dataset_update_inherits_context():
         seen.append(marker.get())
         return pd.DataFrame()
 
-    job = DatasetUpdate(worker)
+    job = UpdateJob(worker)
     marker.set("caller-changed")
 
     assert job.wait().empty
@@ -443,7 +306,7 @@ def test_dataset_update_stops_while_paused(monkeypatch):
         second_started.set()
         return pd.concat([result, result], ignore_index=True)
 
-    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    monkeypatch.setattr("pyquant.data.updater._run_update_dataset", fake_update)
     job = update_dataset("stock_daily", start="2024-01-01", pool="all")
 
     assert first_started.wait(1)
@@ -469,7 +332,7 @@ def test_dataset_update_reraises_background_error(monkeypatch):
     def fake_update(name, *, checkpoint, progress, **options):
         raise error
 
-    monkeypatch.setattr("pyquant._data_update.update_dataset", fake_update)
+    monkeypatch.setattr("pyquant.data.updater._run_update_dataset", fake_update)
     job = update_dataset("stock_daily", start="2024-01-01", pool="all")
 
     with pytest.raises(RuntimeError, match="download failed"):

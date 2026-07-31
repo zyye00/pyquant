@@ -1,0 +1,30 @@
+version: 1
+
+baostock:
+  stock_pool_queries: {sz50: query_sz50_stocks, hs300: query_hs300_stocks, zz500: query_zz500_stocks}
+  request_log_fields: [date, time, endpoint, code, frequency, start_date, end_date]
+  history:
+    daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
+    float32: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
+    result: [code, start_date, end_date, target_path, status, row_count, error]
+  dividend:
+    data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
+    result: [code, year, status, row_count, error]
+    field_map: {dividPlanAnnounceDate: announce_date, dividRegistDate: record_date, dividOperateDate: operate_date, dividPayDate: payment_date, dividCashPsBeforeTax: cash_dividend_before_tax}
+  profit_quarterly:
+    data: [code, year, quarter, publish_date, report_date, total_shares]
+    numeric: [total_shares]
+    result: [code, year, quarter, status, row_count, error]
+    field_map: {pubDate: publish_date, statDate: report_date, totalShare: total_shares}
+
+csindex:
+  result_columns: [code, start_date, end_date, target_path, status, row_count, error]
+  source_fields: [日期, 指数代码, 收盘]
+  field_map: {日期: date, 指数代码: symbol, 收盘: close}
+
+rqdata:
+  exchange_prefixes: {XSHG: SH, XSHE: SZ}
+
+price:
+  columns: [date, symbol, open, high, low, close, volume, amount]
+  default_field_map: {trade_date: date, datetime: date, ticker: symbol, code: symbol, sec_code: symbol, vol: volume, money: amount, turnover: amount}

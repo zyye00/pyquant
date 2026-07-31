@@ -5,16 +5,12 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 
 from pyquant import build_dividend_low_vol_universe
-from pyquant.io import load_config
 
 
-STRATEGY_DIR = (
-    Path(__file__).parents[1]
-    / "strategies"
-    / "dividend_low_vol"
-)
+STRATEGY_DIR = Path(__file__).parents[1] / "strategies" / "dividend_low_vol"
 SPEC = importlib.util.spec_from_file_location(
     "dividend_low_vol_components", STRATEGY_DIR / "components.py"
 )
@@ -151,9 +147,7 @@ def make_index_queries(symbols: list[str]) -> pd.DataFrame:
 
 
 def empty_index_dividends() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=["symbol", "payment_date", "cash_dividend_before_tax"]
-    )
+    return pd.DataFrame(columns=["symbol", "payment_date", "cash_dividend_before_tax"])
 
 
 def test_download_symbols_require_720_valid_prices_by_as_of_date():
@@ -214,7 +208,9 @@ def test_full_75_then_50_selection_order_and_weights():
     assert out.loc["S000", "weight"] > out.loc["S049", "weight"]
     assert out["as_of_date"].eq(pd.Timestamp("2024-11-29")).all()
     assert out["price_date"].eq(pd.Timestamp("2024-11-29")).all()
-    for frame, original in zip([price, dividends, queries, shares], originals, strict=True):
+    for frame, original in zip(
+        [price, dividends, queries, shares], originals, strict=True
+    ):
         pd.testing.assert_frame_equal(frame, original)
 
 
@@ -288,7 +284,11 @@ def test_public_universe_uses_common_dates_and_exact_date_population():
                     "amount": amount,
                     "pe_ttm": 10.0,
                 }
-                for date, amount in [(dates[0], 1_000.0), (dates[1], 100.0), (dates[4], 300.0)]
+                for date, amount in [
+                    (dates[0], 1_000.0),
+                    (dates[1], 100.0),
+                    (dates[4], 300.0),
+                ]
             ),
             *(
                 {
@@ -336,6 +336,8 @@ def test_public_universe_uses_common_dates_and_exact_date_population():
     assert snapshot.loc["B", "avg_amount_240d"] == pytest.approx(200.0)
     assert snapshot.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
     assert snapshot.loc["B", "avg_market_cap_240d"] == pytest.approx(4_000.0)
+
+
 def test_public_universe_requires_a_full_market_calendar_window():
     price = make_price(["A"], dates=pd.bdate_range("2024-11-25", periods=3))
 
@@ -363,7 +365,10 @@ def test_payout_filters_negative_and_highest_five_percent_after_continuity():
     pe_ttm["S00"] = -10.0
     pe_ttm["S19"] = 100.0
     dividends = make_dividends(symbols)
-    dividends.loc[dividends["symbol"].eq("S20") & dividends["year"].eq(2021), "cash_dividend_before_tax"] = 0.0
+    dividends.loc[
+        dividends["symbol"].eq("S20") & dividends["year"].eq(2021),
+        "cash_dividend_before_tax",
+    ] = 0.0
     config = make_config(
         payout_exclude_ratio=0.05,
         dividend_top_n=18,
@@ -475,7 +480,9 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
             "total_shares": [100.0, 1_000.0],
         }
     )
-    shares["publish_date"] = pd.to_datetime(shares["publish_date"]).astype("datetime64[ms]")
+    shares["publish_date"] = pd.to_datetime(shares["publish_date"]).astype(
+        "datetime64[ms]"
+    )
 
     out = select_constituents(
         make_price(["A"], dates=pd.bdate_range("2023-12-18", periods=10)),
@@ -487,8 +494,8 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     )
 
     assert out.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
-    assert out.loc["A", "dividend_yield_ttm"] == pytest.approx(0.1)
-    assert out.loc["A", "avg_dividend_yield_3y"] == pytest.approx(0.1)
+    assert out.loc["A", "dividend_yield_ttm"] == pytest.approx(0.09)
+    assert out.loc["A", "avg_dividend_yield_3y"] == pytest.approx(0.09)
 
 
 @pytest.mark.parametrize(
@@ -612,7 +619,8 @@ def test_duplicate_price_key_and_invalid_config_raise():
 
 
 def test_strategy_config_contains_original_index_parameters_only():
-    config = load_config(STRATEGY_DIR / "config.yaml")
+    with (STRATEGY_DIR / "config.yaml").open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
 
     assert "backtest" not in config
     assert config["selection"] == {
@@ -657,7 +665,10 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
         volatility_lookback_days=4,
         final_n=2,
     )
-    strategy_config = {"universe": config["universe"], "strategy_1": config["selection"]}
+    strategy_config = {
+        "universe": config["universe"],
+        "strategy_1": config["selection"],
+    }
     dividends = make_dividends(symbols)
     dividends["payment_date"] = pd.NaT
     dividends.loc[dividends.index[0], "payment_date"] = pd.Timestamp("2024-02-15")
@@ -677,10 +688,14 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
         "2024-01-31"
     )
     assert index.index.equals(pd.Index(index.index.unique(), name="date"))
-    assert index.loc[pd.Timestamp("2024-02-29"), "dividend_cash"] == pytest.approx(0.05)
+    assert index.loc[pd.Timestamp("2024-02-29"), "dividend_cash"] == pytest.approx(
+        0.045
+    )
 
 
-def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(monkeypatch):
+def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(
+    monkeypatch,
+):
     symbols = ["A", "B", "C"]
     dates = pd.bdate_range("2024-01-02", periods=45)
     config = make_config(
@@ -718,7 +733,9 @@ def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(monk
     assert index.loc[pd.Timestamp("2024-01-31"), "transaction_cost"] == 0.0
     assert index.loc[pd.Timestamp("2024-02-29"), "turnover"] == 1.0
     assert index.loc[pd.Timestamp("2024-02-29"), "transaction_cost"] == 0.001
-    assert index.loc[pd.Timestamp("2024-02-29"), "total_return"] == pytest.approx(-0.001)
+    assert index.loc[pd.Timestamp("2024-02-29"), "total_return"] == pytest.approx(
+        -0.001
+    )
 
 
 def test_monthly_rebalance_includes_dividend_cash_in_turnover(monkeypatch):
@@ -756,10 +773,10 @@ def test_monthly_rebalance_includes_dividend_cash_in_turnover(monkeypatch):
     )
 
     assert index.loc[pd.Timestamp("2024-02-29"), "turnover"] == pytest.approx(
-        1.0 / 11.0
+        9.0 / 109.0
     )
     assert index.loc[pd.Timestamp("2024-02-29"), "transaction_cost"] == pytest.approx(
-        1.0 / 11_000.0
+        9.0 / 109_000.0
     )
 
 
@@ -773,9 +790,9 @@ def test_fixed_quantity_price_index_and_suspension_forward_fill():
             ("2024-01-04", "B", 18.0),
         ]
     )
-    constituents = pd.DataFrame(
-        {"symbol": ["A", "B"], "weight": [0.5, 0.5]}
-    ).set_index("symbol")
+    constituents = pd.DataFrame({"symbol": ["A", "B"], "weight": [0.5, 0.5]}).set_index(
+        "symbol"
+    )
 
     out = calculate_index(
         price,
@@ -804,9 +821,7 @@ def test_all_constituents_can_forward_fill_on_a_market_trading_day():
             ("2024-01-03", "MARKET_CALENDAR", 1.0),
         ]
     )
-    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
-        "symbol"
-    )
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index("symbol")
 
     out = calculate_index(
         price,
@@ -817,7 +832,10 @@ def test_all_constituents_can_forward_fill_on_a_market_trading_day():
         "2024-01-03",
     )
 
-    assert out.index.tolist() == [pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")]
+    assert out.index.tolist() == [
+        pd.Timestamp("2024-01-02"),
+        pd.Timestamp("2024-01-03"),
+    ]
     assert out["price_index"].tolist() == pytest.approx([1.0, 1.1])
 
 
@@ -836,9 +854,7 @@ def test_total_return_credits_payment_and_moves_weekend_payment_forward():
             "cash_dividend_before_tax": [1.0, 1.0],
         }
     )
-    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
-        "symbol"
-    )
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index("symbol")
 
     out = calculate_index(
         price,
@@ -850,12 +866,12 @@ def test_total_return_credits_payment_and_moves_weekend_payment_forward():
     )
 
     assert out.loc["2024-01-05", "dividend_cash"] == 0.0
-    assert out.loc["2024-01-08", "dividend_cash"] == pytest.approx(0.1)
-    assert out.loc["2024-01-08", "total_return"] == pytest.approx(0.1)
+    assert out.loc["2024-01-08", "dividend_cash"] == pytest.approx(0.09)
+    assert out.loc["2024-01-08", "total_return"] == pytest.approx(0.09)
     assert out.loc["2024-01-08", "price_index"] == pytest.approx(1.0)
-    assert out.loc["2024-01-08", "total_return_index"] == pytest.approx(1.1)
-    assert out.loc["2024-01-09", "dividend_cash"] == pytest.approx(0.1)
-    assert out.loc["2024-01-09", "total_return_index"] == pytest.approx(1.21)
+    assert out.loc["2024-01-08", "total_return_index"] == pytest.approx(1.09)
+    assert out.loc["2024-01-09", "dividend_cash"] == pytest.approx(0.09)
+    assert out.loc["2024-01-09", "total_return_index"] == pytest.approx(1.1881)
 
 
 def test_no_dividend_indices_match_and_unit_base_segments_can_link():
@@ -867,9 +883,7 @@ def test_no_dividend_indices_match_and_unit_base_segments_can_link():
         ]
     )
     queries = make_index_queries(["A"])
-    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
-        "symbol"
-    )
+    constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index("symbol")
     first = calculate_index(
         price,
         empty_index_dividends(),
@@ -890,8 +904,7 @@ def test_no_dividend_indices_match_and_unit_base_segments_can_link():
         first["price_index"].iloc[-1] * (1.0 + second["price_return"]).cumprod()
     )
     second["total_return_index"] = (
-        first["total_return_index"].iloc[-1]
-        * (1.0 + second["total_return"]).cumprod()
+        first["total_return_index"].iloc[-1] * (1.0 + second["total_return"]).cumprod()
     )
     chained = pd.concat([first, second.iloc[1:]])
     full = calculate_index(
@@ -960,9 +973,9 @@ def test_annual_rebalanced_index_uses_second_friday_and_links_segments():
         pd.Timestamp("2023-12-11"),
         pd.Timestamp("2024-12-16"),
     ]
-    assert constituents.loc[(pd.Timestamp("2024-12-16"), "A"), "as_of_date"] == pd.Timestamp(
-        "2024-12-13"
-    )
+    assert constituents.loc[
+        (pd.Timestamp("2024-12-16"), "A"), "as_of_date"
+    ] == pd.Timestamp("2024-12-13")
 
 
 def test_index_validates_coverage_effective_prices_and_duplicate_events():
@@ -973,12 +986,12 @@ def test_index_validates_coverage_effective_prices_and_duplicate_events():
             ("2024-01-03", "B", 20.0),
         ]
     )
-    constituents = pd.DataFrame(
-        {"symbol": ["A", "B"], "weight": [0.5, 0.5]}
-    ).set_index("symbol")
-    single_constituent = pd.DataFrame(
-        {"symbol": ["A"], "weight": [1.0]}
-    ).set_index("symbol")
+    constituents = pd.DataFrame({"symbol": ["A", "B"], "weight": [0.5, 0.5]}).set_index(
+        "symbol"
+    )
+    single_constituent = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
+        "symbol"
+    )
 
     with pytest.raises(ValueError, match="No price is available on or before"):
         calculate_index(

@@ -11,39 +11,37 @@
 
 ## 数据目录
 
-项目按数据集组织本地数据。`configs/datasets.yaml` 是唯一可执行的数据目录，说明每个数据集的：
+基础数据保存在 `data/pyquant.duckdb`。`configs/datasets.yaml` 是数据集目录，说明每个数据集的：
 
 - 标准字段、必需字段、主键和日期字段；
-- 本地路径、分区方式和股票代码来源；
-- 当前上游数据源及其字段映射；
-- 是否支持更新、股票池选择和复权参数。
+- DuckDB 视图或文件路径；
+- 上游数据源及字段映射；
+- 是否支持更新、股票池选择和源代码映射。
 
 当前可更新的数据集为：
 
 ```text
 stock_daily
 index_daily
-stock_5m
+csindex_daily
+index_constituents
 dividend
 stock_profit_quarterly
 ```
 
-`other_daily`、`dividend_queries` 和 `stock_profit_quarterly_queries` 是只读数据集。
+`dividend_queries` 和 `stock_profit_quarterly_queries` 是 DuckDB 下载覆盖视图；
+`other_daily` 是保留的只读文件数据集。
 
-数据落盘位置不包含数据源名称：
+数据层按职责拆分：
 
 ```text
-data/
-├─ raw/
-│  ├─ stock_daily/{symbol}.parquet
-│  ├─ index_daily/{symbol}.parquet
-│  ├─ stock_5m/{symbol}/{year}.parquet
-│  ├─ other_daily/{symbol}.parquet
-│  ├─ dividend/{data,queries}.parquet
-│  └─ stock_profit_quarterly/{data,queries}.parquet
-└─ state/
-   ├─ request_log.csv
-   └─ download.lock
+pyquant.data.catalog       数据集定义与校验
+pyquant.data.loader        规范化读取
+pyquant.data.updater       更新编排与 UpdateJob
+pyquant.data.duckdb        连接、schema 和可信关系查询
+pyquant.data.store         事实表与覆盖事务
+pyquant.data.migration     离线迁移与验收
+pyquant.data.sources       BaoStock、AKShare、RQData 适配器
 ```
 
 ## 读取数据
@@ -55,18 +53,15 @@ price = load_dataset(
     "stock_daily",
     start="2023-01-01",
     end="2024-12-31",
-    adjustment="none",
 )
-dividends = load_dataset("dividend", start="2021-01-01", end="2024-12-31")
+dividends = load_dataset("dividend")
 dividend_queries = load_dataset("dividend_queries")
-shares = load_dataset(
-    "stock_profit_quarterly",
-    start="2021-01-01",
-    end="2024-12-31",
-)
+shares = load_dataset("stock_profit_quarterly")
+constituents = load_dataset("index_constituents")
 ```
 
-分区行情必须显式提供起止日期，避免意外读取全部历史数据。日期过滤包含起止日。
+日行情必须显式提供起止日期，避免意外读取全部历史数据。日期过滤包含起止日。
+测试或独立数据根目录可通过 `data_root=Path(...)` 指定，不需要修改全局 catalog。
 
 ## 更新数据
 
@@ -80,7 +75,6 @@ job = update_dataset(
     start="2024-01-02",
     end="2024-01-03",
     pool="all",
-    adjustment="none",
 )
 ```
 
@@ -114,6 +108,18 @@ index_job = update_dataset(
     start="2024-01-02",
     pool=["sh.000300"],
 )
+official_index_job = update_dataset(
+    "csindex_daily",
+    start="2014-01-01",
+    end="2023-06-30",
+    pool=["H30269", "H20269"],
+)
+constituent_job = update_dataset(
+    "index_constituents",
+    start="2014-01-01",
+    end="2023-06-30",
+    pool=["H30269"],
+)
 dividend_job = update_dataset("dividend", start="2021-01-01", pool="all")
 shares_job = update_dataset(
     "stock_profit_quarterly",
@@ -124,5 +130,6 @@ shares_job = update_dataset(
 
 `end` 默认使用当天。`pool` 可以是 `all`、`sz50`、`hs300`、`zz500`，也可以是
 BaoStock 证券代码的可迭代对象。代码列表会去重并保持原顺序，适合逐级筛选后只更新剩余
-证券。`max_tasks` 可限制本次最多执行的远端请求任务数。下载器根据每只证券已有 parquet
-的日期范围分别补齐前向和后向缺口，并通过查询记录区分“空结果”和“尚未查询”。
+证券。不支持命名股票池的数据集必须传显式代码集合；`index_constituents` 的项目指数代码
+会由 catalog 映射为 RQData 代码。`max_tasks` 可限制本次最多执行的远端请求任务数。
+下载器依据 DuckDB 覆盖表补齐缺口，并区分“空结果”和“尚未查询”。

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from pyquant._data_update import (
+from pyquant.data.sources.baostock import (
     BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY,
     BAOSTOCK_SOCKET_TIMEOUT_SECONDS,
@@ -16,23 +16,22 @@ from pyquant._data_update import (
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
-    clean_csindex_history,
-    create_download_lock,
-    init_data_storage,
     request_count_today,
     resolve_baostock_codes,
+    validate_request_limit,
+)
+from pyquant.data.sources.csindex import clean_csindex_history
+from pyquant.data.updater import (
+    _run_update_dataset as update_dataset,
+    create_download_lock,
+    init_data_storage,
     update_dividends,
-    update_dataset,
     update_csindex_daily,
     update_history_dataset,
     update_profit_quarterly,
-    validate_request_limit,
 )
-from pyquant.database import (
-    connect_database,
-    ensure_securities,
-    write_stock_daily_request,
-)
+from pyquant.data.duckdb import connect_database
+from pyquant.data.store import ensure_securities, write_stock_daily_request
 
 
 class FakeResult:
@@ -216,7 +215,7 @@ def test_init_data_storage_has_no_task_state(tmp_path):
     assert paths.database_path.exists()
     assert (paths.data_root / "staging/migration").exists()
     assert paths.request_log_path.exists()
-    assert not (paths.state_dir / "tasks.parquet").exists()
+    assert not (paths.state_dir / "tasks.csv").exists()
 
 
 def test_create_download_lock_replaces_stale_lock(tmp_path, monkeypatch):
@@ -465,7 +464,7 @@ def test_runtime_error_stops_history_update_and_releases_lock(tmp_path, monkeypa
         calls.append(code)
         raise RuntimeError("source failed")
 
-    monkeypatch.setattr("pyquant._data_update.query_baostock_history", fail)
+    monkeypatch.setattr("pyquant.data.updater.query_baostock_history", fail)
     with pytest.raises(RuntimeError, match="source failed"):
         update_history_dataset(
             "stock",
@@ -514,7 +513,7 @@ def test_database_write_failure_stops_history_update(tmp_path, monkeypatch):
         raise OSError("database write failed")
 
     monkeypatch.setattr(
-        "pyquant._data_update.write_stock_daily_request",
+        "pyquant.data.updater.write_stock_daily_request",
         fail_database_write,
     )
     with pytest.raises(OSError, match="database write failed"):
@@ -714,9 +713,9 @@ def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
         ("sh.600000", "2022", "4"),
     ]
     root = tmp_path / "data"
-    assert read_database(
-        root, "SELECT COUNT(*) FROM core.share_capital_quarterly"
-    ) == [(1,)]
+    assert read_database(root, "SELECT COUNT(*) FROM core.share_capital_quarterly") == [
+        (1,)
+    ]
     assert read_database(
         root,
         """
@@ -797,9 +796,9 @@ def test_update_profit_saves_when_checkpoint_stops(tmp_path):
     )
 
     assert result["quarter"].tolist() == [1]
-    assert read_database(
-        root, "SELECT COUNT(*) FROM core.share_capital_quarterly"
-    ) == [(1,)]
+    assert read_database(root, "SELECT COUNT(*) FROM core.share_capital_quarterly") == [
+        (1,)
+    ]
     assert read_database(
         root,
         "SELECT report_year, report_quarter FROM meta.share_capital_coverage",
@@ -864,9 +863,10 @@ def test_history_request_log_records_requests_before_runtime_error(tmp_path):
     )
 
     assert request_count_today(paths.request_log_path) == 4
-    assert pd.read_csv(paths.request_log_path, keep_default_na=False).iloc[-1][
-        "endpoint"
-    ] == "query_history_k_data_plus"
+    assert (
+        pd.read_csv(paths.request_log_path, keep_default_na=False).iloc[-1]["endpoint"]
+        == "query_history_k_data_plus"
+    )
 
 
 def test_resolve_pool_requests_are_logged_with_fake_client(tmp_path):
@@ -938,7 +938,7 @@ def test_update_dataset_preserves_worker_error(tmp_path, monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("local storage failed")
 
-    monkeypatch.setattr("pyquant._data_update.update_history_dataset", fail)
+    monkeypatch.setattr("pyquant.data.updater.update_history_dataset", fail)
 
     with pytest.raises(OSError, match="local storage failed"):
         update_dataset(

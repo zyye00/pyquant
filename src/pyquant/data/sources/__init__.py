@@ -1,0 +1,1 @@
+"""Upstream data-source adapters."""

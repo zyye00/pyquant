@@ -9,6 +9,9 @@ import pandas as pd
 from pyquant.data import normalize_query_years
 
 
+DIVIDEND_AFTER_TAX_RATIO = 0.9
+
+
 def build_universe(
     price: pd.DataFrame,
     symbols: Optional[list[str]] = None,
@@ -74,14 +77,18 @@ def build_dividend_low_vol_universe(
         )
         & set(
             prepared["price_counts"].loc[
-                lambda data: data["date"].eq(as_of_date)
-                & data["observation_count"].ge(price_history_lookback_days),
+                lambda data: (
+                    data["date"].eq(as_of_date)
+                    & data["observation_count"].ge(price_history_lookback_days)
+                ),
                 "symbol",
             ]
         )
     )
     if not symbols:
-        raise ValueError("No symbols passed the market, liquidity, and price-history filters")
+        raise ValueError(
+            "No symbols passed the market, liquidity, and price-history filters"
+        )
     _require_dividend_low_vol_query_coverage(
         query_data,
         symbols,
@@ -161,15 +168,19 @@ def _prepare_dividend_low_vol_price(price: pd.DataFrame) -> pd.DataFrame:
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
     out.loc[out["amount"].lt(0), "amount"] = np.nan
-    return out[out["close"].gt(0)].sort_values(["symbol", "date"]).reset_index(drop=True)
+    return (
+        out[out["close"].gt(0)].sort_values(["symbol", "date"]).reset_index(drop=True)
+    )
 
 
 def _prepare_dividend_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "announce_date", "cash_dividend_before_tax"}
     _require_dividend_low_vol_columns(dividends, required, "dividends")
-    out = dividends.loc[:, sorted(required)].dropna(
-        subset=["announce_date", "cash_dividend_before_tax"]
-    ).copy()
+    out = (
+        dividends.loc[:, sorted(required)]
+        .dropna(subset=["announce_date", "cash_dividend_before_tax"])
+        .copy()
+    )
     out["year"] = out["announce_date"].dt.year
     return out
 
@@ -199,13 +210,19 @@ def _dividend_low_vol_market_snapshot(
         .tail(lookback_days)
     )
     if len(dates) < lookback_days:
-        raise ValueError(f"Only {len(dates)} market dates are available; at least {lookback_days} are required")
+        raise ValueError(
+            f"Only {len(dates)} market dates are available; at least {lookback_days} are required"
+        )
     snapshot = price[price["date"].eq(as_of_date)].copy()
     if snapshot.empty:
         raise ValueError(f"No price data is available on {as_of_date.date()}")
-    average = market_data[market_data["date"].isin(dates)].groupby("symbol", as_index=False).agg(
-        avg_market_cap_240d=("total_market_cap", "mean"),
-        avg_amount_240d=("amount", "mean"),
+    average = (
+        market_data[market_data["date"].isin(dates)]
+        .groupby("symbol", as_index=False)
+        .agg(
+            avg_market_cap_240d=("total_market_cap", "mean"),
+            avg_amount_240d=("amount", "mean"),
+        )
     )
     return snapshot.merge(average, on="symbol", how="left")
 
@@ -217,10 +234,17 @@ def _add_dividend_low_vol_metrics(
     dividend_years: int,
 ) -> pd.DataFrame:
     visible = dividends[dividends["announce_date"].le(as_of_date)]
-    annual = visible.groupby(["symbol", "year"])["cash_dividend_before_tax"].sum()
-    trailing = visible[
-        visible["announce_date"] > as_of_date - pd.Timedelta(days=365)
-    ].groupby("symbol")["cash_dividend_before_tax"].sum()
+    annual = (
+        visible.groupby(["symbol", "year"])["cash_dividend_before_tax"]
+        .sum()
+        .mul(DIVIDEND_AFTER_TAX_RATIO)
+    )
+    trailing = (
+        visible[visible["announce_date"] > as_of_date - pd.Timedelta(days=365)]
+        .groupby("symbol")["cash_dividend_before_tax"]
+        .sum()
+        .mul(DIVIDEND_AFTER_TAX_RATIO)
+    )
     years = _dividend_low_vol_continuous_years(as_of_date, dividend_years)
     metrics["consecutive_dividends"] = metrics["symbol"].map(
         lambda symbol: all(annual.get((symbol, year), 0.0) > 0 for year in years)
@@ -229,18 +253,29 @@ def _add_dividend_low_vol_metrics(
     def growth(symbol: str) -> float:
         current_announced = annual.get((symbol, as_of_date.year), 0.0) > 0
         first_year = as_of_date.year - dividend_years + int(current_announced)
-        values = [annual.get((symbol, year), 0.0) for year in range(first_year, first_year + dividend_years)]
+        values = [
+            annual.get((symbol, year), 0.0)
+            for year in range(first_year, first_year + dividend_years)
+        ]
         slope = float(np.polyfit(np.arange(dividend_years), values, 1)[0])
         return 0.0 if np.isclose(slope, 0.0, atol=1e-12) else slope
 
     metrics["dividend_growth_slope"] = metrics["symbol"].map(growth)
-    metrics["dividend_yield_ttm"] = metrics["symbol"].map(trailing).fillna(0.0).div(metrics["close"])
+    metrics["dividend_yield_ttm"] = (
+        metrics["symbol"].map(trailing).fillna(0.0).div(metrics["close"])
+    )
     metrics["payout_ratio"] = metrics["dividend_yield_ttm"] * metrics["pe_ttm"]
     return metrics
 
 
-def _dividend_low_vol_continuous_years(as_of_date: pd.Timestamp, dividend_years: int) -> range:
-    start = as_of_date.year - dividend_years + (as_of_date.month == 12 and as_of_date.day >= 21)
+def _dividend_low_vol_continuous_years(
+    as_of_date: pd.Timestamp, dividend_years: int
+) -> range:
+    start = (
+        as_of_date.year
+        - dividend_years
+        + (as_of_date.month == 12 and as_of_date.day >= 21)
+    )
     return range(start, start + dividend_years)
 
 
@@ -262,8 +297,9 @@ def _top_dividend_low_vol_symbols(
 ) -> set[str]:
     data = data.dropna(subset=[column])
     return set(
-        data.sort_values([column, "symbol"], ascending=[False, True])
-        .head(floor(len(data) * keep_ratio))["symbol"]
+        data.sort_values([column, "symbol"], ascending=[False, True]).head(
+            floor(len(data) * keep_ratio)
+        )["symbol"]
     )
 
 

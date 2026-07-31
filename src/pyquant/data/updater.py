@@ -1,46 +1,181 @@
-"""Private dataset-update implementation for the configured upstream source."""
+"""Dataset update orchestration."""
 
 from __future__ import annotations
 
-import csv
 import os
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Mapping
+from contextvars import copy_context
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
+from threading import Condition, Thread
 from typing import Any
 
 import pandas as pd
 
-from pyquant.data import DATASET_CATALOG, get_dataset
-from pyquant.database import (
+from pyquant.data.catalog import get_dataset_spec
+from pyquant.data.duckdb import connect_database, get_database_path, initialize_database
+from pyquant.data.identifiers import normalize_security_symbol
+from pyquant.data.resources import load_source_protocols
+from pyquant.data.sources.baostock import (
+    BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
+    BaostockClient,
+    append_request_log,
+    clean_baostock_data,
+    clean_baostock_dividends,
+    clean_baostock_profit,
+    normalize_baostock_code,
+    query_baostock_dividends,
+    query_baostock_history,
+    query_baostock_profit,
+    request_count_today,
+    reset_request_log,
+    resolve_baostock_codes,
+    validate_request_limit,
+)
+from pyquant.data.sources.csindex import (
+    clean_csindex_history,
+    query_csindex_history,
+)
+from pyquant.data.sources.rqdata import query_index_constituents
+from pyquant.data.store import (
     BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
     CSINDEX_DAILY_FIELD_SET_ID,
-    connect_database,
     dividend_coverage,
-    get_database_path,
     index_daily_coverage,
-    initialize_database,
-    normalize_security_symbol,
     share_capital_coverage,
     stock_daily_coverage,
     write_dividend_request,
+    write_index_constituents,
     write_index_daily_request,
     write_share_capital_request,
     write_stock_daily_request,
 )
 
-_baostock = DATASET_CATALOG["sources"]["baostock"]
-_akshare = DATASET_CATALOG["sources"]["akshare"]
-_datasets = DATASET_CATALOG["datasets"]
-_fields = _baostock["fields"]
-_csindex = _akshare["csindex_daily"]
+_fields = load_source_protocols()["baostock"]
+_csindex = load_source_protocols()["csindex"]
+_normalize_baostock_code = normalize_baostock_code
 
-BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY = _baostock["hard_max_requests_per_day"]
-BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY = _baostock["safe_max_requests_per_day"]
-BAOSTOCK_SOCKET_TIMEOUT_SECONDS = _baostock["socket_timeout_seconds"]
-BAOSTOCK_STOCK_POOL_QUERIES = _baostock["stock_pool_queries"]
-_REQUEST_LOG_FIELDS = _fields["request_log"]
+
+class UpdateJob:
+    """A controllable dataset update running in a background thread."""
+
+    def __init__(
+        self,
+        worker: Callable[
+            [Callable[[], bool], Callable[[int, int], None]], pd.DataFrame
+        ],
+    ) -> None:
+        self._condition = Condition()
+        self._state = "running"
+        self._completed = 0
+        self._total = 0
+        self._progress_printed = False
+        self._progress_handle: Any | None = None
+        self._error: Exception | None = None
+        self._result: pd.DataFrame
+        try:
+            from IPython import get_ipython
+            from IPython.display import DisplayHandle
+        except ImportError:
+            pass
+        else:
+            if get_ipython() is not None:
+                self._progress_handle = DisplayHandle()
+                self._progress_handle.display({"text/plain": "Updated 0/0"}, raw=True)
+        context = copy_context()
+        self._thread = Thread(target=context.run, args=(self._run, worker))
+        self._thread.start()
+
+    @property
+    def state(self) -> str:
+        with self._condition:
+            return self._state
+
+    @property
+    def completed(self) -> int:
+        with self._condition:
+            return self._completed
+
+    @property
+    def total(self) -> int:
+        with self._condition:
+            return self._total
+
+    @property
+    def error(self) -> Exception | None:
+        with self._condition:
+            return self._error
+
+    def pause(self) -> None:
+        """Pause before the next remote request."""
+        with self._condition:
+            if self._state == "running":
+                self._state = "paused"
+
+    def resume(self) -> None:
+        """Resume a paused update."""
+        with self._condition:
+            if self._state == "paused":
+                self._state = "running"
+                self._condition.notify_all()
+
+    def stop(self) -> None:
+        """Stop gracefully after the current remote request."""
+        with self._condition:
+            if self._state not in {"completed", "failed"}:
+                self._state = "stopping"
+                self._condition.notify_all()
+
+    def wait(self) -> pd.DataFrame:
+        """Wait for completion and return results or raise the worker error."""
+        self._thread.join()
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+    def _run(
+        self,
+        worker: Callable[
+            [Callable[[], bool], Callable[[int, int], None]], pd.DataFrame
+        ],
+    ) -> None:
+        def checkpoint() -> bool:
+            with self._condition:
+                while self._state == "paused":
+                    self._condition.wait()
+                return self._state != "stopping"
+
+        def progress(completed: int, total: int) -> None:
+            with self._condition:
+                self._completed = completed
+                self._total = total
+            self._show_progress(completed, total)
+            self._progress_printed = True
+
+        try:
+            result = worker(checkpoint, progress)
+        except Exception as exc:
+            with self._condition:
+                self._error = exc
+                self._state = "failed"
+                self._condition.notify_all()
+        else:
+            with self._condition:
+                self._result = result
+                self._state = "completed"
+                self._condition.notify_all()
+        finally:
+            if self._progress_printed:
+                self._show_progress(self._completed, self._total, final=True)
+
+    def _show_progress(self, completed: int, total: int, final: bool = False) -> None:
+        message = f"Updated {completed}/{total}"
+        if self._progress_handle is not None:
+            self._progress_handle.update({"text/plain": message}, raw=True)
+        else:
+            print(f"\r{message}", end="\n" if final else "", flush=True)
 
 
 @dataclass(frozen=True)
@@ -48,78 +183,20 @@ class DataPaths:
     data_root: Path
 
     @property
-    def raw_root(self) -> Path:
-        return _configured_path("data/raw", self.data_root)
-
-    @property
-    def daily_stock_dir(self) -> Path:
-        return self.raw_root / "stock_daily"
-
-    @property
     def database_path(self) -> Path:
         return get_database_path(self.data_root)
 
     @property
     def state_dir(self) -> Path:
-        return _configured_path(DATASET_CATALOG["state"]["root"], self.data_root)
-
-    @property
-    def dividend_path(self) -> Path:
-        return self.database_path
-
-    @property
-    def dividend_queries_path(self) -> Path:
-        return self.database_path
-
-    @property
-    def profit_path(self) -> Path:
-        return self.database_path
-
-    @property
-    def profit_queries_path(self) -> Path:
-        return self.database_path
+        return self.data_root / "state"
 
     @property
     def request_log_path(self) -> Path:
-        return _configured_path(DATASET_CATALOG["state"]["request_log"], self.data_root)
+        return self.state_dir / "request_log.csv"
 
     @property
     def lock_path(self) -> Path:
-        return _configured_path(DATASET_CATALOG["state"]["lock"], self.data_root)
-
-
-def _configured_path(template: str, data_root: Path, **values: object) -> Path:
-    return data_root / Path(template.format(**values)).relative_to("data")
-
-
-def _normalize_baostock_code(code: object) -> str:
-    symbol = normalize_security_symbol(code)
-    security_code, exchange = symbol.split(".")
-    return f"{exchange.lower()}.{security_code}"
-
-
-class BaostockClient:
-    """Thin BaoStock client wrapper with lazy import."""
-
-    def __init__(self) -> None:
-        try:
-            import baostock as bs
-        except ImportError as exc:
-            raise ImportError("BaoStock download requires package 'baostock'.") from exc
-        self.bs = bs
-
-    def __enter__(self) -> "BaostockClient":
-        result = self.bs.login()
-        if getattr(result, "error_code", "0") != "0":
-            msg = f"BaoStock login failed: {result.error_code} {result.error_msg}"
-            raise RuntimeError(msg)
-        self.bs.common.context.default_socket.settimeout(
-            BAOSTOCK_SOCKET_TIMEOUT_SECONDS
-        )
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.bs.logout()
+        return self.state_dir / "download.lock"
 
 
 def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
@@ -129,95 +206,11 @@ def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
         paths.state_dir,
         data_root / "staging/migration",
         data_root / "staging/downloads",
-        data_root / "legacy_parquet_backup",
     ]:
         path.mkdir(parents=True, exist_ok=True)
     initialize_database(paths.database_path)
     reset_request_log(paths.request_log_path)
     return paths
-
-
-def clean_baostock_data(data: pd.DataFrame) -> pd.DataFrame:
-    """Convert BaoStock strings to compact types and remove source-only fields."""
-    out = data.copy()
-    if "tradestatus" in out:
-        out = out.loc[out["tradestatus"].astype(str) == "1"].copy()
-    out["date"] = pd.to_datetime(out["date"])
-    for column in set(_fields["history"]["float32"]) & set(out.columns):
-        out[column] = pd.to_numeric(out[column], errors="coerce").astype("float32")
-    if "amount" in out:
-        out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
-    if "isST" in out:
-        out["isST"] = pd.to_numeric(out["isST"], errors="coerce").astype("boolean")
-    if "volume" in out:
-        column = "volume"
-        out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
-    return out.drop(columns=["code", "tradestatus", "adjustflag"], errors="ignore")
-
-
-def clean_baostock_dividends(
-    data: pd.DataFrame,
-    code: str,
-    year: int,
-) -> pd.DataFrame:
-    """Keep dividend fields needed for point-in-time yield calculations."""
-    fields = _fields["dividend"]
-    out = data.rename(
-        columns={
-            key: value
-            for key, value in _datasets["dividend"]["field_map"].items()
-            if key != "code"
-        }
-    ).copy()
-    for column in fields["data"]:
-        if column not in out:
-            out[column] = pd.NA
-    out["code"] = out["code"].fillna(code).astype(str)
-    out["year"] = year
-    for column in ["announce_date", "record_date", "operate_date", "payment_date"]:
-        out[column] = pd.to_datetime(out[column], errors="coerce")
-    raw_cash = out["cash_dividend_before_tax"]
-    parsed_cash = pd.to_numeric(raw_cash, errors="coerce")
-    invalid = (
-        raw_cash.notna()
-        & raw_cash.astype(str).str.strip().ne("")
-        & parsed_cash.isna()
-    )
-    if invalid.any():
-        examples = raw_cash.loc[invalid].astype(str).head(5).tolist()
-        raise ValueError(
-            f"Invalid dividCashPsBeforeTax values; examples: {examples}"
-        )
-    out["cash_dividend_before_tax"] = parsed_cash.astype("float32")
-    return out[fields["data"]]
-
-
-def clean_baostock_profit(
-    data: pd.DataFrame,
-    code: str,
-    year: int,
-    quarter: int,
-) -> pd.DataFrame:
-    """Keep quarterly publication dates and total shares."""
-    fields = _fields["profit_quarterly"]
-    out = data.rename(
-        columns={
-            key: value
-            for key, value in _datasets["stock_profit_quarterly"]["field_map"].items()
-            if key != "code"
-        }
-    ).copy()
-    for column in fields["data"]:
-        if column not in out:
-            out[column] = pd.NA
-    out["code"] = out["code"].fillna(code).astype(str)
-    out["year"] = year
-    out["quarter"] = quarter
-    for column in ["publish_date", "report_date"]:
-        out[column] = pd.to_datetime(out[column], errors="coerce")
-    for column in fields["numeric"]:
-        out[column] = pd.to_numeric(out[column], errors="coerce")
-    return out[fields["data"]]
 
 
 def missing_baostock_ranges(
@@ -250,66 +243,6 @@ def missing_baostock_ranges(
     return missing
 
 
-def request_count_today(
-    request_log_path: Path,
-    today: date | None = None,
-) -> int:
-    reset_request_log(request_log_path, today)
-    with request_log_path.open(newline="", encoding="utf-8") as stream:
-        reader = csv.reader(stream)
-        next(reader)
-        return sum(bool(row) for row in reader)
-
-
-def _reset_request_log(request_log_path: Path) -> None:
-    request_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with request_log_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=_REQUEST_LOG_FIELDS)
-        writer.writeheader()
-
-
-def reset_request_log(
-    request_log_path: Path,
-    today: date | None = None,
-) -> None:
-    today_str = (today or date.today()).isoformat()
-    if not request_log_path.exists():
-        _reset_request_log(request_log_path)
-        return
-    with request_log_path.open(newline="", encoding="utf-8") as stream:
-        reader = csv.reader(stream)
-        header = next(reader, [])
-        first_row = next(reader, [])
-    if header != _REQUEST_LOG_FIELDS or (first_row and first_row[0] != today_str):
-        _reset_request_log(request_log_path)
-
-
-def append_request_log(
-    request_log_path: Path,
-    endpoint: str,
-    code: str,
-    frequency: str,
-    start_date: str,
-    end_date: str,
-) -> None:
-    """Append an outgoing BaoStock request before it is sent."""
-    reset_request_log(request_log_path)
-    now = datetime.now()
-    with request_log_path.open("a", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=_REQUEST_LOG_FIELDS)
-        writer.writerow(
-            {
-                "date": now.date().isoformat(),
-                "time": now.strftime("%H:%M:%S"),
-                "endpoint": endpoint,
-                "code": code,
-                "frequency": frequency,
-                "start_date": start_date,
-                "end_date": end_date,
-            }
-        )
-
-
 def create_download_lock(data_root: Path = Path("data")) -> Path:
     paths = init_data_storage(data_root)
     if paths.lock_path.exists():
@@ -338,39 +271,6 @@ def remove_download_lock(data_root: Path = Path("data")) -> None:
         lock_path.unlink()
 
 
-def clean_csindex_history(data: pd.DataFrame, code: str) -> pd.DataFrame:
-    """Select AKShare CSI index fields and convert them to catalog columns."""
-    missing = sorted(set(_csindex["fields"]) - set(data))
-    if missing:
-        raise ValueError(f"AKShare CSI result missing required columns: {missing}")
-    data = data.loc[:, _csindex["fields"]].rename(
-        columns=_datasets["csindex_daily"]["field_map"]
-    ).copy()
-    data["date"] = pd.to_datetime(data["date"], errors="raise")
-    data["symbol"] = data["symbol"].fillna(code).astype(str)
-    data["close"] = pd.to_numeric(data["close"], errors="coerce")
-    return data
-
-
-def query_csindex_history(
-    code: str,
-    start_date: str,
-    end_date: str,
-    client: Any | None = None,
-) -> pd.DataFrame:
-    """Download CSI daily history from AKShare."""
-    if client is None:
-        try:
-            import akshare as client
-        except ImportError as exc:
-            raise ImportError("AKShare download requires package 'akshare'.") from exc
-    return client.stock_zh_index_hist_csindex(
-        symbol=code,
-        start_date=pd.Timestamp(start_date).strftime("%Y%m%d"),
-        end_date=pd.Timestamp(end_date).strftime("%Y%m%d"),
-    )
-
-
 def update_csindex_daily(
     codes: Iterable[str],
     start_date: str,
@@ -383,7 +283,8 @@ def update_csindex_daily(
 ) -> pd.DataFrame:
     """Download official CSI histories directly into DuckDB."""
     codes = list(codes)
-    unsupported = sorted(set(codes) - set(_csindex["codes"]))
+    allowed_codes = get_dataset_spec("csindex_daily").storage.allowed_symbols
+    unsupported = sorted(set(codes) - set(allowed_codes))
     if unsupported:
         raise ValueError(f"Unsupported CSI index codes: {unsupported}")
     if progress is not None:
@@ -408,9 +309,9 @@ def update_csindex_daily(
                 queried_ranges=queried,
             ):
                 if max_tasks is not None and tasks >= max_tasks:
-                    return pd.DataFrame(results, columns=_csindex["result"])
+                    return pd.DataFrame(results, columns=_csindex["result_columns"])
                 if checkpoint is not None and not checkpoint():
-                    return pd.DataFrame(results, columns=_csindex["result"])
+                    return pd.DataFrame(results, columns=_csindex["result_columns"])
                 tasks += 1
                 try:
                     data = clean_csindex_history(
@@ -456,7 +357,7 @@ def update_csindex_daily(
             completed += 1
             if progress is not None:
                 progress(completed, len(codes))
-        return pd.DataFrame(results, columns=_csindex["result"])
+        return pd.DataFrame(results, columns=_csindex["result_columns"])
     finally:
         connection.close()
 
@@ -722,19 +623,58 @@ def update_history_dataset(
             context.__exit__(None, None, None)
 
 
-def validate_request_limit(max_requests_per_day: int) -> int:
-    """Validate the user safety threshold against BaoStock's hard limit."""
-    if max_requests_per_day <= 0:
-        raise ValueError("max_requests_per_day must be positive")
-    if max_requests_per_day > BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY:
-        raise ValueError(
-            "max_requests_per_day exceeds BaoStock hard limit "
-            f"{BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY}: {max_requests_per_day}"
-        )
-    return min(max_requests_per_day, BAOSTOCK_HARD_REQUEST_LIMIT_PER_DAY)
+def update_index_constituents(
+    codes: Collection[str],
+    start_date: str,
+    end_date: str,
+    source_codes: Mapping[str, str],
+    data_root: Path = Path("data"),
+    client: Any | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
+) -> pd.DataFrame:
+    """Download and replace RQData constituent snapshots."""
+    codes = list(dict.fromkeys(codes))
+    if not codes:
+        raise ValueError("No security codes were selected")
+    unsupported = sorted(set(codes) - set(source_codes))
+    if unsupported:
+        raise ValueError(f"Unsupported RQData index codes: {unsupported}")
+    if max_tasks is not None:
+        codes = codes[:max_tasks]
+    paths = init_data_storage(data_root)
+    results = []
+    if progress is not None:
+        progress(0, len(codes))
+    with connect_database(paths.database_path) as connection:
+        for completed, code in enumerate(codes, start=1):
+            if checkpoint is not None and not checkpoint():
+                break
+            data = query_index_constituents(
+                start_date,
+                end_date,
+                source_codes[code],
+                client=client,
+            )
+            write_index_constituents(connection, code, data)
+            results.append(
+                (
+                    code,
+                    start_date,
+                    end_date,
+                    str(paths.database_path),
+                    "success",
+                    len(data),
+                    "",
+                )
+            )
+            if progress is not None:
+                progress(completed, len(codes))
+    return pd.DataFrame(results, columns=_csindex["result_columns"])
 
 
-def update_dataset(
+def _run_update_dataset(
     name: str,
     *,
     start: str,
@@ -748,18 +688,18 @@ def update_dataset(
     data_root: Path = Path("data"),
 ) -> pd.DataFrame:
     """Update a named catalog dataset through its current source."""
-    dataset = get_dataset(name)
-    update = dataset.get("update")
+    dataset = get_dataset_spec(name)
+    update = dataset.update
     if update is None:
         raise ValueError(f"Dataset {name!r} is read-only")
     end_date = end or date.today().isoformat()
     if pd.Timestamp(start) > pd.Timestamp(end_date):
         raise ValueError("start must not be after end")
-    if isinstance(pool, str) and not update["pool"]:
+    if isinstance(pool, str) and not update.pool:
         raise ValueError(f"Dataset {name!r} does not support named pools")
     if max_tasks is not None and max_tasks <= 0:
         raise ValueError("max_tasks must be positive")
-    if dataset["source"] == "akshare":
+    if dataset.source == "akshare":
         if isinstance(pool, str):
             raise ValueError(f"Dataset {name!r} does not support named pools")
         codes = list(dict.fromkeys(pool))
@@ -775,10 +715,24 @@ def update_dataset(
             progress,
             max_tasks,
         )
-    if dataset["source"] != "baostock":
-        raise ValueError(f"Dataset {name!r} has unsupported source {dataset['source']!r}")
+    if dataset.source == "rqdata":
+        if isinstance(pool, str):
+            raise ValueError(f"Dataset {name!r} does not support named pools")
+        return update_index_constituents(
+            pool,
+            start,
+            end_date,
+            update.source_codes,
+            data_root,
+            client,
+            checkpoint,
+            progress,
+            max_tasks,
+        )
+    if dataset.source != "baostock":
+        raise ValueError(f"Dataset {name!r} has unsupported source {dataset.source!r}")
     if checkpoint is not None and not checkpoint():
-        return pd.DataFrame(columns=_fields[update["kind"]]["result"])
+        return pd.DataFrame(columns=_fields[update.kind]["result"])
 
     context = None if client is not None else BaostockClient()
     client = client if client is not None else context.__enter__()
@@ -804,15 +758,16 @@ def update_dataset(
             common["progress"] = progress
         if max_tasks is not None:
             common["max_tasks"] = max_tasks
-        if update["kind"] == "history":
+        if update.kind == "history":
+            assert update.target is not None
             return update_history_dataset(
-                update["target"],
+                update.target,
                 codes,
                 start,
                 end_date,
                 **common,
             )
-        if update["kind"] == "dividend":
+        if update.kind == "dividend":
             return update_dividends(
                 codes,
                 pd.Timestamp(start).year,
@@ -825,163 +780,27 @@ def update_dataset(
             context.__exit__(None, None, None)
 
 
-def resolve_baostock_codes(
-    pool: str,
-    trade_date: str,
-    client: Any,
-    request_log_path: Path | None = None,
-    max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
-) -> list[str]:
-    """Resolve a pool on its latest available trading day."""
-    if pool == "all":
-        data = _query_with_request_log(
-            request_log_path,
-            "query_stock_basic",
-            pool,
-            "pool",
-            trade_date,
-            trade_date,
-            lambda: baostock_result_to_frame(client.bs.query_stock_basic()),
-            max_requests_per_day,
+def update_dataset(
+    name: str,
+    *,
+    start: str,
+    pool: str | Collection[str],
+    end: str | None = None,
+    pool_date: str | None = None,
+    max_tasks: int | None = None,
+    data_root: Path = Path("data"),
+) -> UpdateJob:
+    """Start a background update for a named pool or code collection."""
+    parameters = locals()
+
+    def run(
+        checkpoint: Callable[[], bool],
+        progress: Callable[[int, int], None],
+    ) -> pd.DataFrame:
+        return _run_update_dataset(
+            **parameters,
+            checkpoint=checkpoint,
+            progress=progress,
         )
-        if not {"code", "type"}.issubset(data.columns):
-            raise ValueError(
-                f"BaoStock stock-basic result has unexpected columns: {list(data.columns)}"
-            )
-        return (
-            data.loc[data["type"].astype(str) == "1", "code"]
-            .dropna()
-            .astype(str)
-            .drop_duplicates()
-            .tolist()
-        )
-    if pool not in BAOSTOCK_STOCK_POOL_QUERIES:
-        raise ValueError(f"Unsupported BaoStock stock pool: {pool}")
-    query = getattr(client.bs, BAOSTOCK_STOCK_POOL_QUERIES[pool])
 
-    end = pd.Timestamp(trade_date)
-    calendar_start = (end - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
-    calendar = _query_with_request_log(
-        request_log_path,
-        "query_trade_dates",
-        pool,
-        "calendar",
-        calendar_start,
-        trade_date,
-        lambda: baostock_result_to_frame(
-            client.bs.query_trade_dates(calendar_start, trade_date)
-        ),
-        max_requests_per_day,
-    )
-    if not {"calendar_date", "is_trading_day"}.issubset(calendar.columns):
-        raise ValueError(
-            f"BaoStock trade calendar has unexpected columns: {list(calendar.columns)}"
-        )
-    for day in calendar.loc[
-        calendar["is_trading_day"].astype(str) == "1", "calendar_date"
-    ].iloc[::-1]:
-        data = _query_with_request_log(
-            request_log_path,
-            BAOSTOCK_STOCK_POOL_QUERIES[pool],
-            pool,
-            "pool",
-            str(day),
-            str(day),
-            lambda: baostock_result_to_frame(query(str(day))),
-            max_requests_per_day,
-        )
-        if "code" not in data.columns:
-            raise ValueError(
-                f"BaoStock pool result has no code column: {list(data.columns)}"
-            )
-        codes = data["code"].dropna().astype(str).drop_duplicates().tolist()
-        if codes:
-            return codes
-    return []
-
-
-def _query_with_request_log(
-    request_log_path: Path | None,
-    endpoint: str,
-    code: str,
-    frequency: str,
-    start_date: str,
-    end_date: str,
-    query: Callable[[], pd.DataFrame],
-    max_requests_per_day: int,
-) -> pd.DataFrame:
-    """Run one source query after durably recording it in the request log."""
-    if request_log_path is None:
-        return query()
-    if request_count_today(request_log_path) >= validate_request_limit(
-        max_requests_per_day
-    ):
-        raise RuntimeError("BaoStock request limit reached while resolving stock pool")
-    append_request_log(request_log_path, endpoint, code, frequency, start_date, end_date)
-    try:
-        return query()
-    except Exception as exc:
-        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
-
-
-def baostock_result_to_frame(result: Any) -> pd.DataFrame:
-    if getattr(result, "error_code", "0") != "0":
-        raise RuntimeError(
-            f"BaoStock query failed: {result.error_code} {result.error_msg}"
-        )
-    rows = []
-    while result.next():
-        rows.append(result.get_row_data())
-    return pd.DataFrame(rows, columns=result.fields)
-
-
-def query_baostock_history(
-    code: str,
-    start_date: str,
-    end_date: str,
-    fields: list[str],
-    frequency: str,
-    client: Any,
-) -> pd.DataFrame:
-    """Query BaoStock history and convert its cursor-like result to DataFrame."""
-    try:
-        result = client.bs.query_history_k_data_plus(
-            code,
-            ",".join(fields),
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            adjustflag="3",
-        )
-        if getattr(result, "error_code", "0") != "0":
-            raise RuntimeError(
-                f"BaoStock query failed: {result.error_code} {result.error_msg}"
-            )
-        return baostock_result_to_frame(result)
-    except Exception as exc:
-        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
-
-
-def query_baostock_dividends(code: str, year: int, client: Any) -> pd.DataFrame:
-    """Query BaoStock dividends by operating year."""
-    try:
-        return baostock_result_to_frame(
-            client.bs.query_dividend_data(code, str(year), yearType="operate")
-        )
-    except Exception as exc:
-        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
-
-
-def query_baostock_profit(
-    code: str,
-    year: int,
-    quarter: int,
-    client: Any,
-) -> pd.DataFrame:
-    """Query BaoStock quarterly profit data."""
-    try:
-        return baostock_result_to_frame(
-            client.bs.query_profit_data(code, str(year), str(quarter))
-        )
-    except Exception as exc:
-        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
+    return UpdateJob(run)

@@ -1,7 +1,9 @@
 .DS_Store
 *.md
 
-data/
+/data/**
+!/data/**/
+!/data/**/README.md
 *.egg-info/
 __pycache__/
 .vscode/

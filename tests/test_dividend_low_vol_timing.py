@@ -5,10 +5,15 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 
-from pyquant import get_dataset
-from pyquant.database import connect_database
-from pyquant.io import load_config
+from pyquant.data.catalog import DuckDBStorage, get_dataset_spec
+from pyquant.data.duckdb import connect_database
+from pyquant.data.sources.rqdata import (
+    extract_changed_snapshots,
+    rqdata_symbol_to_project,
+)
+from pyquant.data.updater import _run_update_dataset
 
 
 STRATEGY_DIR = Path(__file__).parents[1] / "strategies" / "dividend_low_vol"
@@ -25,11 +30,7 @@ def load_strategy_module(name: str):
     return module
 
 
-DOWNLOAD = load_strategy_module("download_index_constituents")
 TIMING = load_strategy_module("timing")
-extract_changed_snapshots = DOWNLOAD.extract_changed_snapshots
-rqdata_symbol_to_project = DOWNLOAD.rqdata_symbol_to_project
-download_index_constituents = DOWNLOAD.download_index_constituents
 calculate_bp_spread = TIMING.calculate_bp_spread
 backtest_timing = TIMING.backtest_valuation_spread_timing
 
@@ -141,7 +142,7 @@ def test_changed_snapshots_drop_consecutive_duplicate_sets():
     ]
 
 
-def test_download_index_constituents_replaces_database_snapshots(tmp_path):
+def test_update_index_constituents_replaces_database_snapshots(tmp_path):
     class FakeRqdata:
         def __init__(self):
             self.initialized = False
@@ -163,18 +164,21 @@ def test_download_index_constituents_replaces_database_snapshots(tmp_path):
             }
 
     client = FakeRqdata()
-    database_path = tmp_path / "pyquant.duckdb"
-    out = download_index_constituents(
-        "2024-01-01",
-        "2024-01-31",
-        "H30269.XSHG",
-        database_path,
+    data_root = tmp_path / "data"
+    out = _run_update_dataset(
+        "index_constituents",
+        start="2024-01-01",
+        end="2024-01-31",
+        pool=["H30269"],
         client=client,
+        data_root=data_root,
     )
 
     assert client.initialized
-    assert len(out) == 2
-    with connect_database(database_path) as connection:
+    assert out[["code", "status", "row_count"]].to_dict("records") == [
+        {"code": "H30269", "status": "success", "row_count": 2}
+    ]
+    with connect_database(data_root / "pyquant.duckdb") as connection:
         assert connection.execute(
             "SELECT index_code, symbol FROM api.index_constituents ORDER BY symbol"
         ).fetchall() == [
@@ -261,9 +265,7 @@ def test_timing_signal_applies_to_following_month():
     assert out["bearish_position"].tolist() == [False, False, True]
     assert out["benchmark_return"].iloc[1:].tolist() == pytest.approx([-0.1, 0.1])
     assert out["cash_timing_return"].iloc[1:].tolist() == pytest.approx([-0.1, 0.0])
-    assert out["short_timing_return"].iloc[1:].tolist() == pytest.approx(
-        [-0.1, -0.1]
-    )
+    assert out["short_timing_return"].iloc[1:].tolist() == pytest.approx([-0.1, -0.1])
     assert out.loc["2024-03-29", "signal_date"] == pd.Timestamp("2024-02-29")
 
 
@@ -281,24 +283,22 @@ def test_strategy_3_validates_snapshot_and_config():
 
 
 def test_strategy_3_config_and_dataset_catalog():
-    config = load_config(STRATEGY_DIR / "config.yaml")
-    dataset = get_dataset("index_constituents")
+    with (STRATEGY_DIR / "config.yaml").open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+    dataset = get_dataset_spec("index_constituents")
 
     assert config["strategy_3"] == {
         "index_code": "H30269",
-        "rqdata_index_code": "H30269.XSHG",
         "trim_ratio": 0.1,
         "band_window_months": 6,
         "band_std_multiplier": 1.5,
     }
-    assert dataset["storage"] == {
-        "kind": "duckdb",
-        "path": "data/pyquant.duckdb",
-        "relation": "api.index_constituents",
-        "requires_dates": False,
-        "normalize_symbols": True,
-    }
-    assert dataset["primary_key"] == ["effective_date", "index_code", "symbol"]
+    assert dataset.storage == DuckDBStorage(
+        path="data/pyquant.duckdb",
+        relation="api.index_constituents",
+        requires_dates=False,
+    )
+    assert dataset.primary_key == ("effective_date", "index_code", "symbol")
 
 
 def test_strategy_3_notebook_and_download_entry_are_separated():
@@ -316,7 +316,8 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
 
     download_notebook = str(notebooks["download.ipynb"])
     strategy_notebook = str(notebooks["strategy_3_valuation_spread_timing.ipynb"])
-    assert "download_index_constituents(" in download_notebook
+    assert "'index_constituents'" in download_notebook
+    assert "constituent_job.wait()" in download_notebook
     assert "conda run" not in download_notebook
     assert "subprocess" not in download_notebook
     assert "rqdatac" not in strategy_notebook
