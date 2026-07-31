@@ -165,11 +165,13 @@ def _prepare_dividend_low_vol_price(price: pd.DataFrame) -> pd.DataFrame:
 
 
 def _prepare_dividend_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
-    required = {"symbol", "year", "announce_date", "cash_dividend_after_tax"}
+    required = {"symbol", "announce_date", "cash_dividend_before_tax"}
     _require_dividend_low_vol_columns(dividends, required, "dividends")
-    return dividends.loc[:, sorted(required)].dropna(
-        subset=["announce_date", "cash_dividend_after_tax"]
-    )
+    out = dividends.loc[:, sorted(required)].dropna(
+        subset=["announce_date", "cash_dividend_before_tax"]
+    ).copy()
+    out["year"] = out["announce_date"].dt.year
+    return out
 
 
 def _prepare_dividend_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
@@ -215,10 +217,10 @@ def _add_dividend_low_vol_metrics(
     dividend_years: int,
 ) -> pd.DataFrame:
     visible = dividends[dividends["announce_date"].le(as_of_date)]
-    annual = visible.groupby(["symbol", "year"])["cash_dividend_after_tax"].sum()
+    annual = visible.groupby(["symbol", "year"])["cash_dividend_before_tax"].sum()
     trailing = visible[
         visible["announce_date"] > as_of_date - pd.Timedelta(days=365)
-    ].groupby("symbol")["cash_dividend_after_tax"].sum()
+    ].groupby("symbol")["cash_dividend_before_tax"].sum()
     years = _dividend_low_vol_continuous_years(as_of_date, dividend_years)
     metrics["consecutive_dividends"] = metrics["symbol"].map(
         lambda symbol: all(annual.get((symbol, year), 0.0) > 0 for year in years)

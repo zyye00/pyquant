@@ -334,7 +334,7 @@ def _calculate_dividend_low_vol_monthly_index(
     cash_events = index_inputs["dividend_events"].rename(
         columns={
             "payment_date": "date",
-            "cash_dividend_after_tax": "cash_per_share",
+            "cash_dividend_before_tax": "cash_per_share",
         }
     )
     cash_events = cash_events.loc[
@@ -475,13 +475,13 @@ def _prepare_index_inputs(
     dividend_queries: pd.DataFrame,
 ) -> dict:
     price_data = _prepare_index_price(price)
-    required = {"symbol", "payment_date", "cash_dividend_after_tax"}
+    required = {"symbol", "payment_date", "cash_dividend_before_tax"}
     _require_columns(dividends, required, "dividends")
     event_key = [
         column
         for column in [
             "symbol", "year", "announce_date", "record_date", "operate_date",
-            "payment_date", "cash_dividend_after_tax",
+            "payment_date", "cash_dividend_before_tax",
         ]
         if column in dividends
     ]
@@ -531,7 +531,7 @@ def _average_ttm_dividend_yield(
             continue
         events = dividends[dividends["symbol"] == symbol].sort_values("announce_date")
         event_dates = events["announce_date"].to_numpy(dtype="datetime64[ns]")
-        cash = events["cash_dividend_after_tax"].to_numpy(dtype=float)
+        cash = events["cash_dividend_before_tax"].to_numpy(dtype=float)
         cumulative = np.concatenate(([0.0], np.cumsum(cash)))
         dates = history["date"].to_numpy(dtype="datetime64[ns]")
         right = np.searchsorted(event_dates, dates, side="right")
@@ -567,14 +567,14 @@ def _index_dividend_cash(
         dividends["symbol"].isin(normalized_shares.index)
         & dividends["payment_date"].gt(effective)
         & dividends["payment_date"].le(end)
-        & dividends["cash_dividend_after_tax"].gt(0)
+        & dividends["cash_dividend_before_tax"].gt(0)
     ]
     cash = pd.Series(0.0, index=calendar, name="dividend_cash")
     for event in events.itertuples(index=False):
         position = calendar.searchsorted(event.payment_date, side="left")
         if position < len(calendar):
             cash.iloc[position] += (
-                normalized_shares[event.symbol] * event.cash_dividend_after_tax
+                normalized_shares[event.symbol] * event.cash_dividend_before_tax
             )
     return cash
 

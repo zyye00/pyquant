@@ -11,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 
+from pyquant.database import load_relation, normalize_security_symbol
 from pyquant.io import load_config
 
 
@@ -161,25 +162,59 @@ def load_dataset(
     dataset = get_dataset(name)
     storage = dataset["storage"]
     kind = storage["kind"]
-    if kind != "table" and (start is None or end is None):
+    if storage.get("requires_dates", kind != "table") and (
+        start is None or end is None
+    ):
         raise ValueError(f"Dataset {name!r} requires explicit start and end dates")
     start_at = pd.Timestamp(start) if start is not None else None
     end_at = pd.Timestamp(end) if end is not None else None
     if start_at is not None and end_at is not None and start_at > end_at:
         raise ValueError("start must not be after end")
-    paths = _dataset_paths(storage, symbols, start_at, end_at)
-    if not paths:
-        raise FileNotFoundError(f"No files found for dataset {name!r}")
-    frames = [
-        _read_dataset_file(path, dataset, storage, start_at, end_at) for path in paths
-    ]
-    frames = [frame for frame in frames if not frame.empty]
-    if not frames:
-        return pd.DataFrame(columns=dataset["columns"])
-    out = pd.concat(frames, ignore_index=True)
+    if kind == "duckdb":
+        relation_symbols = symbols
+        if storage.get("allowed_symbols"):
+            allowed = set(storage["allowed_symbols"])
+            if symbols is not None and not set(symbols).issubset(allowed):
+                unsupported = sorted(set(symbols) - allowed)
+                raise ValueError(
+                    f"Dataset {name!r} does not support symbols: {unsupported}"
+                )
+            relation_symbols = symbols or storage["allowed_symbols"]
+        out = load_relation(
+            storage["relation"],
+            dataset["columns"],
+            database_path=Path(storage["path"]),
+            date_column=dataset.get("date_column"),
+            start=start_at,
+            end=end_at,
+            symbols=relation_symbols,
+            normalize_symbols=storage.get("normalize_symbols", True),
+        )
+    else:
+        paths = _dataset_paths(storage, symbols, start_at, end_at)
+        if not paths:
+            raise FileNotFoundError(f"No files found for dataset {name!r}")
+        frames = [
+            _read_dataset_file(path, dataset, storage, start_at, end_at)
+            for path in paths
+        ]
+        frames = [frame for frame in frames if not frame.empty]
+        if not frames:
+            return pd.DataFrame(columns=dataset["columns"])
+        out = pd.concat(frames, ignore_index=True)
     out = _canonicalize_dataset(out, dataset)
     if symbols is not None:
-        out = out[out["symbol"].isin({str(symbol) for symbol in symbols})]
+        requested = (
+            {
+                normalize_security_symbol(symbol)
+                if storage.get("normalize_symbols", True)
+                else str(symbol)
+                for symbol in symbols
+            }
+            if kind == "duckdb"
+            else {str(symbol) for symbol in symbols}
+        )
+        out = out[out["symbol"].isin(requested)]
     key = dataset.get("primary_key", [])
     if key and out.duplicated(key).any():
         raise ValueError(f"Dataset {name!r} contains duplicate primary keys: {key}")

@@ -16,6 +16,13 @@ from pyquant import (
     standardize_price,
     update_dataset,
 )
+from pyquant.database import (
+    CSINDEX_DAILY_FIELD_SET_ID,
+    connect_database,
+    initialize_database,
+    write_index_daily_request,
+    write_stock_daily_request,
+)
 
 
 def test_standardize_price_renames_required_fields():
@@ -180,6 +187,125 @@ def test_load_partitioned_dataset_excludes_query_metadata(tmp_path, monkeypatch)
 
     assert out[["date", "symbol"]].to_dict("records") == [
         {"date": pd.Timestamp("2024-01-02"), "symbol": "sh.600000"}
+    ]
+
+
+def test_load_duckdb_dataset_filters_dates_and_normalizes_symbols(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+    with connect_database(database_path) as connection:
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+                    "close": [10.0, 11.0],
+                    "amount": [100.0, 110.0],
+                    "peTTM": [8.0, 9.0],
+                }
+            ),
+            "2024-01-02",
+            "2024-01-03",
+        )
+    catalog = {
+        "version": 1,
+        "datasets": {
+            "stock_daily": {
+                "source": "test",
+                "storage": {
+                    "kind": "duckdb",
+                    "path": str(database_path),
+                    "relation": "api.stock_daily",
+                    "requires_dates": True,
+                },
+                "columns": ["date", "symbol", "close", "amount", "pe_ttm"],
+                "required": ["date", "symbol", "close", "amount", "pe_ttm"],
+                "primary_key": ["date", "symbol"],
+                "date_column": "date",
+                "date_columns": ["date"],
+                "numeric_columns": ["close", "amount", "pe_ttm"],
+                "field_map": {},
+            }
+        },
+    }
+    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
+
+    out = load_dataset(
+        "stock_daily",
+        start="2024-01-03",
+        end="2024-01-03",
+        symbols=["sh.600000"],
+    )
+
+    assert out.to_dict("records") == [
+        {
+            "date": pd.Timestamp("2024-01-03"),
+            "symbol": "600000.SH",
+            "close": 11.0,
+            "amount": 110.0,
+            "pe_ttm": 9.0,
+        }
+    ]
+
+
+def test_load_duckdb_index_dataset_preserves_index_codes(tmp_path, monkeypatch):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+    with connect_database(database_path) as connection:
+        write_index_daily_request(
+            connection,
+            "H30269",
+            pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-02"]),
+                    "close": [1_234.5],
+                }
+            ),
+            "2024-01-02",
+            "2024-01-02",
+            CSINDEX_DAILY_FIELD_SET_ID,
+        )
+    catalog = {
+        "version": 1,
+        "datasets": {
+            "csindex_daily": {
+                "source": "test",
+                "storage": {
+                    "kind": "duckdb",
+                    "path": str(database_path),
+                    "relation": "api.index_daily",
+                    "requires_dates": True,
+                    "normalize_symbols": False,
+                    "allowed_symbols": ["H30269"],
+                },
+                "columns": ["date", "symbol", "close"],
+                "required": ["date", "symbol", "close"],
+                "primary_key": ["date", "symbol"],
+                "date_column": "date",
+                "date_columns": ["date"],
+                "numeric_columns": ["close"],
+                "field_map": {},
+            }
+        },
+    }
+    monkeypatch.setattr(data_module, "DATASET_CATALOG", catalog)
+
+    out = load_dataset(
+        "csindex_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        symbols=["H30269"],
+    )
+
+    assert out.to_dict("records") == [
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "H30269",
+            "close": 1_234.5,
+        }
     ]
 
 

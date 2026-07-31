@@ -12,6 +12,7 @@ dependencies = [
     "pandas",
     "numpy",
     "pyarrow",
+    "duckdb",
     "pyyaml",
     "matplotlib",
     "scipy",

@@ -9,11 +9,16 @@ from pathlib import Path
 
 import pandas as pd
 
+from pyquant.database import (
+    DEFAULT_DATABASE_PATH,
+    connect_database,
+    initialize_database,
+    write_index_constituents,
+)
 
-DEFAULT_OUTPUT = Path("data/raw/index_constituents/H30269.parquet")
 EXCHANGE_PREFIXES = {
-    "XSHG": "sh",
-    "XSHE": "sz",
+    "XSHG": "SH",
+    "XSHE": "SZ",
 }
 
 
@@ -26,7 +31,7 @@ def rqdata_symbol_to_project(symbol: str) -> str:
         raise ValueError(f"Unsupported RQData stock identifier: {symbol!r}") from exc
     if len(code) != 6 or not code.isdigit():
         raise ValueError(f"Unsupported RQData stock identifier: {symbol!r}")
-    return f"{prefix}.{code}"
+    return f"{code}.{prefix}"
 
 
 def extract_changed_snapshots(
@@ -68,36 +73,32 @@ def download_index_constituents(
     start: str,
     end: str,
     rqdata_index_code: str,
-    output: str | Path = DEFAULT_OUTPUT,
+    database_path: str | Path = DEFAULT_DATABASE_PATH,
     *,
-    overwrite: bool = False,
+    client: object | None = None,
 ) -> pd.DataFrame:
-    """Download, validate, and save changed constituent snapshots."""
+    """Download changed snapshots and replace the target index in DuckDB."""
     start_at = pd.Timestamp(start)
     end_at = pd.Timestamp(end)
     if start_at > end_at:
         raise ValueError("start must not be after end")
-    output = Path(output)
-    if output.exists() and not overwrite:
-        raise FileExistsError(
-            f"Output already exists: {output}. Pass --overwrite to replace it."
-        )
 
-    import rqdatac
+    if client is None:
+        import rqdatac
 
-    rqdatac.init()
-    history = rqdatac.index_components(
+        client = rqdatac
+    client.init()
+    history = client.index_components(
         rqdata_index_code,
         start_date=start_at.strftime("%Y-%m-%d"),
         end_date=end_at.strftime("%Y-%m-%d"),
     )
-    data = extract_changed_snapshots(history, rqdata_index_code.split(".", 1)[0])
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(".tmp.parquet")
-    if temporary.exists():
-        raise FileExistsError(f"Temporary output already exists: {temporary}")
-    data.to_parquet(temporary, index=False)
-    temporary.replace(output)
+    index_code = rqdata_index_code.split(".", 1)[0]
+    data = extract_changed_snapshots(history, index_code)
+    database_path = Path(database_path)
+    initialize_database(database_path)
+    with connect_database(database_path) as connection:
+        write_index_constituents(connection, index_code, data)
     return data
 
 
@@ -108,8 +109,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--index-code", required=True)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--database-path",
+        type=Path,
+        default=DEFAULT_DATABASE_PATH,
+    )
     return parser.parse_args()
 
 
@@ -120,8 +124,7 @@ def main() -> None:
         args.start,
         args.end,
         args.index_code,
-        args.output,
-        overwrite=args.overwrite,
+        args.database_path,
     )
     snapshot_count = data["effective_date"].nunique()
     print(f"Saved {len(data)} rows across {snapshot_count} changed snapshots")

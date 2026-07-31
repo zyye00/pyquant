@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from pyquant import get_dataset
+from pyquant.database import connect_database
 from pyquant.io import load_config
 
 
@@ -28,6 +29,7 @@ DOWNLOAD = load_strategy_module("download_index_constituents")
 TIMING = load_strategy_module("timing")
 extract_changed_snapshots = DOWNLOAD.extract_changed_snapshots
 rqdata_symbol_to_project = DOWNLOAD.rqdata_symbol_to_project
+download_index_constituents = DOWNLOAD.download_index_constituents
 calculate_bp_spread = TIMING.calculate_bp_spread
 backtest_timing = TIMING.backtest_valuation_spread_timing
 
@@ -95,8 +97,8 @@ def make_spread_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def test_rqdata_symbols_convert_to_project_format():
-    assert rqdata_symbol_to_project("600000.XSHG") == "sh.600000"
-    assert rqdata_symbol_to_project("000001.XSHE") == "sz.000001"
+    assert rqdata_symbol_to_project("600000.XSHG") == "600000.SH"
+    assert rqdata_symbol_to_project("000001.XSHE") == "000001.SZ"
 
     with pytest.raises(ValueError, match="Unsupported RQData"):
         rqdata_symbol_to_project("00700.XHKG")
@@ -119,24 +121,67 @@ def test_changed_snapshots_drop_consecutive_duplicate_sets():
         {
             "effective_date": pd.Timestamp("2024-01-02"),
             "index_code": "H30269",
-            "symbol": "sh.600000",
+            "symbol": "000001.SZ",
         },
         {
             "effective_date": pd.Timestamp("2024-01-02"),
             "index_code": "H30269",
-            "symbol": "sz.000001",
+            "symbol": "600000.SH",
         },
         {
             "effective_date": pd.Timestamp("2024-02-01"),
             "index_code": "H30269",
-            "symbol": "sh.600000",
+            "symbol": "000002.SZ",
         },
         {
             "effective_date": pd.Timestamp("2024-02-01"),
             "index_code": "H30269",
-            "symbol": "sz.000002",
+            "symbol": "600000.SH",
         },
     ]
+
+
+def test_download_index_constituents_replaces_database_snapshots(tmp_path):
+    class FakeRqdata:
+        def __init__(self):
+            self.initialized = False
+
+        def init(self):
+            self.initialized = True
+
+        def index_components(self, code, start_date, end_date):
+            assert (code, start_date, end_date) == (
+                "H30269.XSHG",
+                "2024-01-01",
+                "2024-01-31",
+            )
+            return {
+                pd.Timestamp("2024-01-02"): [
+                    "600000.XSHG",
+                    "000001.XSHE",
+                ]
+            }
+
+    client = FakeRqdata()
+    database_path = tmp_path / "pyquant.duckdb"
+    out = download_index_constituents(
+        "2024-01-01",
+        "2024-01-31",
+        "H30269.XSHG",
+        database_path,
+        client=client,
+    )
+
+    assert client.initialized
+    assert len(out) == 2
+    with connect_database(database_path) as connection:
+        assert connection.execute(
+            "SELECT index_code, symbol FROM api.index_constituents ORDER BY symbol"
+        ).fetchall() == [
+            ("H30269", "000001.SZ"),
+            ("H30269", "600000.SH"),
+        ]
+    assert not (tmp_path / "index_constituents").exists()
 
 
 def test_bp_spread_trims_groups_and_generates_six_month_signal():
@@ -247,8 +292,11 @@ def test_strategy_3_config_and_dataset_catalog():
         "band_std_multiplier": 1.5,
     }
     assert dataset["storage"] == {
-        "kind": "table",
-        "path": "data/raw/index_constituents/H30269.parquet",
+        "kind": "duckdb",
+        "path": "data/pyquant.duckdb",
+        "relation": "api.index_constituents",
+        "requires_dates": False,
+        "normalize_symbols": True,
     }
     assert dataset["primary_key"] == ["effective_date", "index_code", "symbol"]
 

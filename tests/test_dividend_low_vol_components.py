@@ -131,7 +131,7 @@ def make_dividends(
                 "symbol": symbol,
                 "year": year,
                 "announce_date": announce_dates[year],
-                "cash_dividend_after_tax": value,
+                "cash_dividend_before_tax": value,
             }
             for year, value in zip(years, symbol_values, strict=True)
         )
@@ -152,7 +152,7 @@ def make_index_queries(symbols: list[str]) -> pd.DataFrame:
 
 def empty_index_dividends() -> pd.DataFrame:
     return pd.DataFrame(
-        columns=["symbol", "payment_date", "cash_dividend_after_tax"]
+        columns=["symbol", "payment_date", "cash_dividend_before_tax"]
     )
 
 
@@ -363,7 +363,7 @@ def test_payout_filters_negative_and_highest_five_percent_after_continuity():
     pe_ttm["S00"] = -10.0
     pe_ttm["S19"] = 100.0
     dividends = make_dividends(symbols)
-    dividends.loc[dividends["symbol"].eq("S20") & dividends["year"].eq(2021), "cash_dividend_after_tax"] = 0.0
+    dividends.loc[dividends["symbol"].eq("S20") & dividends["year"].eq(2021), "cash_dividend_before_tax"] = 0.0
     config = make_config(
         payout_exclude_ratio=0.05,
         dividend_top_n=18,
@@ -464,7 +464,7 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
         {
             2021: "2021-04-30",
             2022: "2022-04-30",
-            2023: "2024-02-01",
+            2023: "2023-04-30",
             2024: "2025-01-02",
         },
     )
@@ -478,11 +478,11 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     shares["publish_date"] = pd.to_datetime(shares["publish_date"]).astype("datetime64[ms]")
 
     out = select_constituents(
-        make_price(["A"]),
+        make_price(["A"], dates=pd.bdate_range("2023-12-18", periods=10)),
         dividends,
         make_queries(["A"]),
         shares,
-        "2024-11-29",
+        "2023-12-29",
         make_config(dividend_top_n=1, final_n=1),
     )
 
@@ -514,7 +514,7 @@ def test_public_universe_applies_december_annual_dividend_cutoff(as_of, is_eligi
             "announce_date": pd.to_datetime(
                 ["2010-06-01", "2011-06-01", "2012-06-01", "2013-06-01"]
             ),
-            "cash_dividend_after_tax": [1.0, 1.0, 1.0, 0.0],
+            "cash_dividend_before_tax": [1.0, 1.0, 1.0, 0.0],
         }
     )
     shares = make_shares(["A"])
@@ -833,7 +833,7 @@ def test_total_return_credits_payment_and_moves_weekend_payment_forward():
         {
             "symbol": ["A", "A"],
             "payment_date": pd.to_datetime(["2024-01-06", "2024-01-09"]),
-            "cash_dividend_after_tax": [1.0, 1.0],
+            "cash_dividend_before_tax": [1.0, 1.0],
         }
     )
     constituents = pd.DataFrame({"symbol": ["A"], "weight": [1.0]}).set_index(
@@ -931,7 +931,7 @@ def test_annual_rebalanced_index_uses_second_friday_and_links_segments():
                     "symbol": ["A", "B"],
                     "year": [2020, 2020],
                     "announce_date": pd.to_datetime(["2020-04-30", "2020-04-30"]),
-                    "cash_dividend_after_tax": [2.0, 1.0],
+                    "cash_dividend_before_tax": [2.0, 1.0],
                 }
             ),
         ],
@@ -1004,7 +1004,7 @@ def test_index_validates_coverage_effective_prices_and_duplicate_events():
         {
             "symbol": ["A", "A"],
             "payment_date": pd.to_datetime(["2024-01-03", "2024-01-03"]),
-            "cash_dividend_after_tax": [1.0, 1.0],
+            "cash_dividend_before_tax": [1.0, 1.0],
         }
     )
     with pytest.raises(ValueError, match="duplicate event keys"):

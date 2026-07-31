@@ -13,6 +13,22 @@ from typing import Any
 import pandas as pd
 
 from pyquant.data import DATASET_CATALOG, get_dataset
+from pyquant.database import (
+    BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
+    CSINDEX_DAILY_FIELD_SET_ID,
+    connect_database,
+    dividend_coverage,
+    get_database_path,
+    index_daily_coverage,
+    initialize_database,
+    normalize_security_symbol,
+    share_capital_coverage,
+    stock_daily_coverage,
+    write_dividend_request,
+    write_index_daily_request,
+    write_share_capital_request,
+    write_stock_daily_request,
+)
 
 _baostock = DATASET_CATALOG["sources"]["baostock"]
 _akshare = DATASET_CATALOG["sources"]["akshare"]
@@ -37,15 +53,7 @@ class DataPaths:
 
     @property
     def daily_stock_dir(self) -> Path:
-        return _dataset_path(
-            "stock_daily", self.data_root, symbol="_"
-        ).parent
-
-    @property
-    def daily_index_dir(self) -> Path:
-        return _dataset_path(
-            "index_daily", self.data_root, symbol="_"
-        ).parent
+        return self.raw_root / "stock_daily"
 
     @property
     def minute_5_stock_dir(self) -> Path:
@@ -54,12 +62,16 @@ class DataPaths:
         ).parents[1]
 
     def history_queries_path(self, dataset: str, frequency: str) -> Path:
+        if frequency == "d" and dataset in {"stock", "index"}:
+            return self.database_path
         name = {
-            ("stock", "d"): "stock_daily",
-            ("index", "d"): "index_daily",
             ("stock", "5"): "stock_5m",
         }[dataset, frequency]
         return _configured_path(_datasets[name]["storage"]["query_path"], self.data_root)
+
+    @property
+    def database_path(self) -> Path:
+        return get_database_path(self.data_root)
 
     @property
     def state_dir(self) -> Path:
@@ -67,19 +79,19 @@ class DataPaths:
 
     @property
     def dividend_path(self) -> Path:
-        return _dataset_path("dividend", self.data_root)
+        return self.database_path
 
     @property
     def dividend_queries_path(self) -> Path:
-        return _dataset_path("dividend_queries", self.data_root)
+        return self.database_path
 
     @property
     def profit_path(self) -> Path:
-        return _dataset_path("stock_profit_quarterly", self.data_root)
+        return self.database_path
 
     @property
     def profit_queries_path(self) -> Path:
-        return _dataset_path("stock_profit_quarterly_queries", self.data_root)
+        return self.database_path
 
     @property
     def request_log_path(self) -> Path:
@@ -96,6 +108,12 @@ def _configured_path(template: str, data_root: Path, **values: object) -> Path:
 
 def _dataset_path(name: str, data_root: Path, **values: object) -> Path:
     return _configured_path(_datasets[name]["storage"]["path"], data_root, **values)
+
+
+def _normalize_baostock_code(code: object) -> str:
+    symbol = normalize_security_symbol(code)
+    security_code, exchange = symbol.split(".")
+    return f"{exchange.lower()}.{security_code}"
 
 
 class BaostockClient:
@@ -123,15 +141,17 @@ class BaostockClient:
 
 
 def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
-    """Create the dataset-oriented raw-data directory skeleton."""
+    """Create DuckDB and the remaining source-specific directories."""
     paths = DataPaths(data_root)
     for path in [
-        paths.daily_stock_dir,
-        paths.daily_index_dir,
         paths.minute_5_stock_dir,
         paths.state_dir,
+        data_root / "staging/migration",
+        data_root / "staging/downloads",
+        data_root / "legacy_parquet_backup",
     ]:
         path.mkdir(parents=True, exist_ok=True)
+    initialize_database(paths.database_path)
     reset_request_log(paths.request_log_path)
     return paths
 
@@ -200,22 +220,20 @@ def clean_baostock_dividends(
     out["year"] = year
     for column in ["announce_date", "record_date", "operate_date", "payment_date"]:
         out[column] = pd.to_datetime(out[column], errors="coerce")
-    out["cash_dividend_after_tax"] = out["cash_dividend_after_tax"].map(
-        _parse_baostock_cash_dividend
+    raw_cash = out["cash_dividend_before_tax"]
+    parsed_cash = pd.to_numeric(raw_cash, errors="coerce")
+    invalid = (
+        raw_cash.notna()
+        & raw_cash.astype(str).str.strip().ne("")
+        & parsed_cash.isna()
     )
-    for column in fields["float32"]:
-        out[column] = out[column].astype("float32")
+    if invalid.any():
+        examples = raw_cash.loc[invalid].astype(str).head(5).tolist()
+        raise ValueError(
+            f"Invalid dividCashPsBeforeTax values; examples: {examples}"
+        )
+    out["cash_dividend_before_tax"] = parsed_cash.astype("float32")
     return out[fields["data"]]
-
-
-def _parse_baostock_cash_dividend(value: object) -> float:
-    """Sum BaoStock tax-after cash amounts joined by the Chinese `or` marker."""
-    if pd.isna(value):
-        return float("nan")
-    try:
-        return sum(float(part.strip()) for part in str(value).split("或"))
-    except ValueError:
-        return float("nan")
 
 
 def clean_baostock_profit(
@@ -438,36 +456,84 @@ def update_csindex_daily(
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
-    """Download the configured official CSI Dividend Low Volatility indices."""
+    """Download official CSI histories directly into DuckDB."""
     codes = list(codes)
     unsupported = sorted(set(codes) - set(_csindex["codes"]))
     if unsupported:
         raise ValueError(f"Unsupported CSI index codes: {unsupported}")
     if progress is not None:
         progress(0, len(codes))
+    paths = init_data_storage(data_root)
+    connection = connect_database(paths.database_path)
     results = []
     completed = 0
-    for code in codes:
-        if max_tasks is not None and completed >= max_tasks:
-            break
-        if checkpoint is not None and not checkpoint():
-            break
-        target_path = _dataset_path("csindex_daily", data_root, symbol=code)
-        try:
-            data = query_csindex_history(code, start_date, end_date, client)
-            data = merge_history_data(clean_csindex_history(data, code), target_path)
-            atomic_write_parquet(data, target_path, overwrite=True)
-            results.append(
-                (code, start_date, end_date, str(target_path), "success", len(data), "")
+    tasks = 0
+    try:
+        for code in codes:
+            if checkpoint is not None and not checkpoint():
+                break
+            queried = index_daily_coverage(
+                connection,
+                code,
+                CSINDEX_DAILY_FIELD_SET_ID,
             )
-        except Exception as exc:
-            results.append(
-                (code, start_date, end_date, str(target_path), "failed", 0, str(exc))
-            )
-        completed += 1
-        if progress is not None:
-            progress(completed, len(codes))
-    return pd.DataFrame(results, columns=_csindex["result"])
+            for range_start, range_end in missing_baostock_ranges(
+                start_date,
+                end_date,
+                queried_ranges=queried,
+            ):
+                if max_tasks is not None and tasks >= max_tasks:
+                    return pd.DataFrame(results, columns=_csindex["result"])
+                if checkpoint is not None and not checkpoint():
+                    return pd.DataFrame(results, columns=_csindex["result"])
+                tasks += 1
+                try:
+                    data = clean_csindex_history(
+                        query_csindex_history(
+                            code,
+                            range_start,
+                            range_end,
+                            client,
+                        ),
+                        code,
+                    )
+                    write_index_daily_request(
+                        connection,
+                        code,
+                        data,
+                        range_start,
+                        range_end,
+                        CSINDEX_DAILY_FIELD_SET_ID,
+                    )
+                    results.append(
+                        (
+                            code,
+                            range_start,
+                            range_end,
+                            str(paths.database_path),
+                            "success",
+                            len(data),
+                            "",
+                        )
+                    )
+                except Exception as exc:
+                    results.append(
+                        (
+                            code,
+                            range_start,
+                            range_end,
+                            str(paths.database_path),
+                            "failed",
+                            0,
+                            str(exc),
+                        )
+                    )
+            completed += 1
+            if progress is not None:
+                progress(completed, len(codes))
+        return pd.DataFrame(results, columns=_csindex["result"])
+    finally:
+        connection.close()
 
 
 def update_dividends(
@@ -481,28 +547,19 @@ def update_dividends(
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
-    """Download BaoStock dividends by operating year, skipping queried code-years."""
+    """Download before-tax dividends by year into DuckDB."""
     fields = _fields["dividend"]
-    codes = list(codes)
+    codes = [_normalize_baostock_code(code) for code in codes]
     paths = init_data_storage(data_root)
-    dividend_path = paths.dividend_path
-    query_cache_path = paths.dividend_queries_path
-    dividends = pd.read_parquet(dividend_path) if dividend_path.exists() else None
-    query_cache = _read_query_cache(query_cache_path, fields["query"])
-    queried = set(query_cache.itertuples(index=False, name=None))
-
-    def query_range(code: str, year: int) -> tuple[str, pd.Timestamp, pd.Timestamp]:
-        return code, pd.Timestamp(f"{year}-01-01"), pd.Timestamp(f"{year}-12-31")
-
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
+    connection = connect_database(paths.database_path)
+    queried = dividend_coverage(connection)
     results = []
-    pending_dividends = []
-    pending_queries = []
     remaining = {
         code: sum(
-            query_range(code, year) not in queried
+            (normalize_security_symbol(code), year) not in queried
             for year in range(start_year, end_year + 1)
         )
         for code in codes
@@ -514,7 +571,8 @@ def update_dividends(
     try:
         for code in codes:
             for year in range(start_year, end_year + 1):
-                if query_range(code, year) in queried:
+                query_key = normalize_security_symbol(code), year
+                if query_key in queried:
                     continue
                 if max_tasks is not None and len(results) >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
@@ -532,10 +590,8 @@ def update_dividends(
                 )
                 data = query_baostock_dividends(code, year, active_client)
                 data = clean_baostock_dividends(data, code, year)
-                if not data.empty:
-                    pending_dividends.append(data)
-                pending_queries.append(query_range(code, year))
-                queried.add(query_range(code, year))
+                write_dividend_request(connection, code, year, data)
+                queried.add(query_key)
                 results.append((code, year, "success", len(data), ""))
                 remaining[code] -= 1
                 if remaining[code] == 0:
@@ -544,50 +600,9 @@ def update_dividends(
                         progress(completed, len(codes))
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
-            if pending_dividends:
-                new_data = pd.concat(pending_dividends, ignore_index=True)
-                dividends = (
-                    new_data if dividends is None else pd.concat([dividends, new_data])
-                )
-                dividends = (
-                    dividends.drop_duplicates()
-                    .sort_values(["code", "year"])
-                    .reset_index(drop=True)
-                )
-                atomic_write_parquet(dividends, dividend_path, overwrite=True)
-                pending_dividends.clear()
-            if pending_queries:
-                query_cache = pd.concat(
-                    [
-                        query_cache,
-                        pd.DataFrame(pending_queries, columns=fields["query"]),
-                    ],
-                    ignore_index=True,
-                ).drop_duplicates()
-                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-                pending_queries.clear()
         return pd.DataFrame(results, columns=fields["result"])
     finally:
-        if pending_dividends:
-            new_data = pd.concat(pending_dividends, ignore_index=True)
-            dividends = (
-                new_data if dividends is None else pd.concat([dividends, new_data])
-            )
-            dividends = (
-                dividends.drop_duplicates()
-                .sort_values(["code", "year"])
-                .reset_index(drop=True)
-            )
-            atomic_write_parquet(dividends, dividend_path, overwrite=True)
-        if pending_queries:
-            query_cache = pd.concat(
-                [
-                    query_cache,
-                    pd.DataFrame(pending_queries, columns=fields["query"]),
-                ],
-                ignore_index=True,
-            ).drop_duplicates()
-            atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+        connection.close()
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
@@ -604,34 +619,25 @@ def update_profit_quarterly(
     progress: Callable[[int, int], None] | None = None,
     max_tasks: int | None = None,
 ) -> pd.DataFrame:
-    """Download total shares for every quarter overlapping a date range."""
+    """Download quarterly total shares into DuckDB."""
     fields = _fields["profit_quarterly"]
-    codes = list(codes)
+    codes = [_normalize_baostock_code(code) for code in codes]
     paths = init_data_storage(data_root)
-    profit_path = paths.profit_path
-    query_cache_path = paths.profit_queries_path
-    profits = pd.read_parquet(profit_path) if profit_path.exists() else None
-    query_cache = _read_query_cache(query_cache_path, fields["query"])
-    queried = set(query_cache.itertuples(index=False, name=None))
-
-    def query_range(
-        code: str, year: int, quarter: int
-    ) -> tuple[str, pd.Timestamp, pd.Timestamp]:
-        period = pd.Period(year=year, quarter=quarter, freq="Q")
-        return code, period.start_time.normalize(), period.end_time.normalize()
-
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
+    connection = connect_database(paths.database_path)
+    queried = share_capital_coverage(connection)
     results = []
-    pending_profits = []
-    pending_queries = []
     periods = [
         (period.year, period.quarter)
         for period in pd.period_range(start_date, end_date, freq="Q")
     ]
     remaining = {
-        code: sum(query_range(code, *period) not in queried for period in periods)
+        code: sum(
+            (normalize_security_symbol(code), *period) not in queried
+            for period in periods
+        )
         for code in codes
     }
     completed = sum(count == 0 for count in remaining.values())
@@ -641,7 +647,8 @@ def update_profit_quarterly(
     try:
         for code in codes:
             for year, quarter in periods:
-                if query_range(code, year, quarter) in queried:
+                query_key = normalize_security_symbol(code), year, quarter
+                if query_key in queried:
                     continue
                 if max_tasks is not None and len(results) >= max_tasks:
                     return pd.DataFrame(results, columns=fields["result"])
@@ -663,10 +670,8 @@ def update_profit_quarterly(
                     year,
                     quarter,
                 )
-                if not data.empty:
-                    pending_profits.append(data)
-                pending_queries.append(query_range(code, year, quarter))
-                queried.add(query_range(code, year, quarter))
+                write_share_capital_request(connection, code, year, quarter, data)
+                queried.add(query_key)
                 results.append((code, year, quarter, "success", len(data), ""))
                 remaining[code] -= 1
                 if remaining[code] == 0:
@@ -675,48 +680,9 @@ def update_profit_quarterly(
                         progress(completed, len(codes))
                 if checkpoint is not None and not checkpoint():
                     return pd.DataFrame(results, columns=fields["result"])
-            if pending_profits:
-                new_data = pd.concat(pending_profits, ignore_index=True)
-                profits = (
-                    new_data if profits is None else pd.concat([profits, new_data])
-                )
-                profits = profits.drop_duplicates(
-                    ["code", "year", "quarter"], keep="last"
-                )
-                profits = profits.sort_values(["code", "year", "quarter"]).reset_index(
-                    drop=True
-                )
-                atomic_write_parquet(profits, profit_path, overwrite=True)
-                pending_profits.clear()
-            if pending_queries:
-                query_cache = pd.concat(
-                    [
-                        query_cache,
-                        pd.DataFrame(pending_queries, columns=fields["query"]),
-                    ],
-                    ignore_index=True,
-                ).drop_duplicates()
-                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
-                pending_queries.clear()
         return pd.DataFrame(results, columns=fields["result"])
     finally:
-        if pending_profits:
-            new_data = pd.concat(pending_profits, ignore_index=True)
-            profits = new_data if profits is None else pd.concat([profits, new_data])
-            profits = profits.drop_duplicates(["code", "year", "quarter"], keep="last")
-            profits = profits.sort_values(["code", "year", "quarter"]).reset_index(
-                drop=True
-            )
-            atomic_write_parquet(profits, profit_path, overwrite=True)
-        if pending_queries:
-            query_cache = pd.concat(
-                [
-                    query_cache,
-                    pd.DataFrame(pending_queries, columns=fields["query"]),
-                ],
-                ignore_index=True,
-            ).drop_duplicates()
-            atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+        connection.close()
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)
@@ -737,10 +703,18 @@ def update_history_dataset(
 ) -> pd.DataFrame:
     """Check and update each security's locally missing date ranges."""
     fields = _fields["history"]
-    codes = list(codes)
+    codes = [_normalize_baostock_code(code) for code in codes]
     paths = init_data_storage(data_root)
-    query_cache_path = paths.history_queries_path(dataset, frequency)
-    query_cache = _read_query_cache(query_cache_path, fields["query"])
+    duckdb_daily = frequency == "d" and dataset in {"stock", "index"}
+    connection = connect_database(paths.database_path) if duckdb_daily else None
+    query_cache_path = (
+        None if duckdb_daily else paths.history_queries_path(dataset, frequency)
+    )
+    query_cache = (
+        None
+        if duckdb_daily
+        else _read_query_cache(query_cache_path, fields["query"])
+    )
     effective_limit = validate_request_limit(max_requests_per_day)
     context = None if client is not None else BaostockClient()
     active_client = client if client is not None else context.__enter__()
@@ -755,13 +729,29 @@ def update_history_dataset(
             if checkpoint is not None and not checkpoint():
                 return pd.DataFrame(results, columns=fields["result"])
             slices = []
-            queried = list(
-                query_cache.loc[
-                    query_cache["code"] == code, ["start", "end"]
-                ].itertuples(index=False, name=None)
+            queried = (
+                (
+                    stock_daily_coverage(connection, code)
+                    if dataset == "stock"
+                    else index_daily_coverage(
+                        connection,
+                        code,
+                        BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
+                    )
+                )
+                if duckdb_daily
+                else list(
+                    query_cache.loc[
+                        query_cache["code"] == code, ["start", "end"]
+                    ].itertuples(index=False, name=None)
+                )
             )
             if frequency == "d":
-                target = daily_target_path(code, dataset, data_root)
+                target = (
+                    paths.database_path
+                    if duckdb_daily
+                    else daily_target_path(code, dataset, data_root)
+                )
                 slices.extend(
                     (first, last, target)
                     for first, last in missing_baostock_ranges(
@@ -810,19 +800,47 @@ def update_history_dataset(
                     frequency,
                     active_client,
                 )
-                data = merge_history_data(clean_baostock_data(data), target_path)
-                atomic_write_parquet(data, target_path, overwrite=True)
-                query_cache = pd.concat(
-                    [
-                        query_cache,
-                        pd.DataFrame(
-                            [[code, pd.Timestamp(range_start), pd.Timestamp(range_end)]],
-                            columns=fields["query"],
-                        ),
-                    ],
-                    ignore_index=True,
-                ).drop_duplicates()
-                atomic_write_parquet(query_cache, query_cache_path, overwrite=True)
+                data = clean_baostock_data(data)
+                if duckdb_daily:
+                    if dataset == "stock":
+                        write_stock_daily_request(
+                            connection,
+                            code,
+                            data,
+                            range_start,
+                            range_end,
+                        )
+                    else:
+                        write_index_daily_request(
+                            connection,
+                            code,
+                            data,
+                            range_start,
+                            range_end,
+                            BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
+                        )
+                else:
+                    data = merge_history_data(data, target_path)
+                    atomic_write_parquet(data, target_path, overwrite=True)
+                    query_cache = pd.concat(
+                        [
+                            query_cache,
+                            pd.DataFrame(
+                                [
+                                    [
+                                        code,
+                                        pd.Timestamp(range_start),
+                                        pd.Timestamp(range_end),
+                                    ]
+                                ],
+                                columns=fields["query"],
+                            ),
+                        ],
+                        ignore_index=True,
+                    ).drop_duplicates()
+                    atomic_write_parquet(
+                        query_cache, query_cache_path, overwrite=True
+                    )
                 results.append(
                     (
                         code,
@@ -841,6 +859,8 @@ def update_history_dataset(
                 progress(completed, len(codes))
         return pd.DataFrame(results, columns=fields["result"])
     finally:
+        if connection is not None:
+            connection.close()
         remove_download_lock(data_root)
         if context is not None:
             context.__exit__(None, None, None)

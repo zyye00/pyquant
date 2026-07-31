@@ -13,13 +13,11 @@ from pyquant._data_update import (
     BAOSTOCK_SOCKET_TIMEOUT_SECONDS,
     BaostockClient,
     append_request_log,
-    atomic_write_parquet,
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
     clean_csindex_history,
     create_download_lock,
-    daily_target_path,
     init_data_storage,
     minute_5_target_path,
     request_count_today,
@@ -30,6 +28,11 @@ from pyquant._data_update import (
     update_history_dataset,
     update_profit_quarterly,
     validate_request_limit,
+)
+from pyquant.database import (
+    connect_database,
+    ensure_securities,
+    write_stock_daily_request,
 )
 
 
@@ -123,7 +126,7 @@ class FakeClient:
                 "dividRegistDate",
                 "dividOperateDate",
                 "dividPayDate",
-                "dividCashPsAfterTax",
+                "dividCashPsBeforeTax",
             ],
             rows,
         )
@@ -196,10 +199,23 @@ class FakeAkshare:
         )
 
 
+def seed_stock_coverage(root, code, start, end):
+    paths = init_data_storage(root)
+    with connect_database(paths.database_path) as connection:
+        write_stock_daily_request(connection, code, pd.DataFrame(), start, end)
+
+
+def read_database(root, query, parameters=None):
+    paths = init_data_storage(root)
+    with connect_database(paths.database_path) as connection:
+        return connection.execute(query, parameters or []).fetchall()
+
+
 def test_init_data_storage_has_no_task_state(tmp_path):
     paths = init_data_storage(tmp_path / "data")
 
-    assert paths.daily_stock_dir.exists()
+    assert paths.database_path.exists()
+    assert (paths.data_root / "staging/migration").exists()
     assert paths.request_log_path.exists()
     assert not (paths.state_dir / "tasks.parquet").exists()
 
@@ -229,16 +245,7 @@ def test_create_download_lock_rejects_active_lock(tmp_path, monkeypatch):
 
 def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_path):
     root = tmp_path / "data"
-    paths = init_data_storage(root)
-    target = daily_target_path("sh.600000", "stock", root)
-    atomic_write_parquet(pd.DataFrame({"date": [date(2024, 1, 3)]}), target)
-    atomic_write_parquet(
-        pd.DataFrame(
-            [["sh.600000", "2024-01-03", "2024-01-03"]],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    seed_stock_coverage(root, "sh.600000", "2024-01-03", "2024-01-03")
     progress = []
 
     result = update_history_dataset(
@@ -257,26 +264,13 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
         ["sh.600000", "2024-01-02", "2024-01-02"],
         ["sh.600000", "2024-01-04", "2024-01-05"],
     ]
-    assert Path(result.loc[0, "target_path"]).parent.name == "stock_daily"
+    assert Path(result.loc[0, "target_path"]).name == "pyquant.duckdb"
     assert progress == [(0, 1), (1, 1)]
 
 
 def test_history_query_cache_skips_completed_ranges(tmp_path):
     root = tmp_path / "data"
-    paths = init_data_storage(root)
-    atomic_write_parquet(
-        pd.DataFrame(
-            [
-                [
-                    "sh.600000",
-                    pd.Timestamp("2024-01-02"),
-                    pd.Timestamp("2024-01-03"),
-                ]
-            ],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    seed_stock_coverage(root, "sh.600000", "2024-01-02", "2024-01-03")
     client = FakeClient()
 
     result = update_history_dataset(
@@ -294,25 +288,37 @@ def test_history_query_cache_skips_completed_ranges(tmp_path):
         ["2024-01-04", "2024-01-05"]
     ]
     assert client.calls == [("sh.600000", "2024-01-04", "2024-01-05", "d", "3")]
-    cache = pd.read_parquet(paths.history_queries_path("stock", "d"))
-    assert pd.api.types.is_datetime64_any_dtype(cache["start"])
-    assert pd.api.types.is_datetime64_any_dtype(cache["end"])
+    assert read_database(
+        root,
+        """
+        SELECT start_date, end_date
+        FROM meta.stock_daily_coverage
+        """,
+    ) == [(date(2024, 1, 2), date(2024, 1, 5))]
 
 
 def test_local_min_max_does_not_hide_query_cache_gap(tmp_path):
     root = tmp_path / "data"
     paths = init_data_storage(root)
-    target = daily_target_path("sh.600000", "stock", root)
-    atomic_write_parquet(
-        pd.DataFrame({"date": [date(2013, 1, 1), date(2014, 1, 3)]}), target
-    )
-    atomic_write_parquet(
-        pd.DataFrame(
-            [["sh.600000", "2014-01-02", "2014-01-03"]],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    with connect_database(paths.database_path) as connection:
+        security_id = ensure_securities(connection, ["sh.600000"])["600000.SH"]
+        connection.executemany(
+            """
+            INSERT INTO core.stock_daily (security_id, trade_date)
+            VALUES (?, ?)
+            """,
+            [
+                (security_id, date(2013, 1, 1)),
+                (security_id, date(2014, 1, 3)),
+            ],
+        )
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            pd.DataFrame(),
+            "2014-01-02",
+            "2014-01-03",
+        )
 
     result = update_history_dataset(
         "stock",
@@ -409,14 +415,7 @@ def test_update_caches_successful_empty_history_query(tmp_path):
 def test_update_reports_completed_stock_count(tmp_path):
     progress = []
     root = tmp_path / "data"
-    paths = init_data_storage(root)
-    atomic_write_parquet(
-        pd.DataFrame(
-            [["sh.600000", "2024-01-02", "2024-01-02"]],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    seed_stock_coverage(root, "sh.600000", "2024-01-02", "2024-01-02")
     client = FakeClient()
 
     update_history_dataset(
@@ -466,14 +465,7 @@ def test_update_respects_request_limit_without_completing_next_stock(tmp_path):
 
 def test_update_does_not_complete_partially_updated_stock(tmp_path):
     root = tmp_path / "data"
-    paths = init_data_storage(root)
-    atomic_write_parquet(
-        pd.DataFrame(
-            [["sh.600000", "2024-01-03", "2024-01-03"]],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    seed_stock_coverage(root, "sh.600000", "2024-01-03", "2024-01-03")
     progress = []
 
     result = update_history_dataset(
@@ -545,20 +537,18 @@ def test_request_error_stops_history_update_and_releases_lock(tmp_path, error):
     assert not init_data_storage(root).lock_path.exists()
 
 
-def test_query_cache_write_failure_stops_history_update(tmp_path, monkeypatch):
+def test_database_write_failure_stops_history_update(tmp_path, monkeypatch):
     root = tmp_path / "data"
     client = FakeClient()
 
-    def fail_query_cache(data, target_path, overwrite=False):
-        if target_path.name == "queries.parquet":
-            raise OSError("query cache write failed")
-        atomic_write_parquet(data, target_path, overwrite)
+    def fail_database_write(*args, **kwargs):
+        raise OSError("database write failed")
 
     monkeypatch.setattr(
-        "pyquant._data_update.atomic_write_parquet",
-        fail_query_cache,
+        "pyquant._data_update.write_stock_daily_request",
+        fail_database_write,
     )
-    with pytest.raises(OSError, match="query cache write failed"):
+    with pytest.raises(OSError, match="database write failed"):
         update_history_dataset(
             "stock",
             "d",
@@ -576,14 +566,7 @@ def test_query_cache_write_failure_stops_history_update(tmp_path, monkeypatch):
 
 def test_update_stop_leaves_partially_updated_stock_incomplete(tmp_path):
     root = tmp_path / "data"
-    paths = init_data_storage(root)
-    atomic_write_parquet(
-        pd.DataFrame(
-            [["sh.600000", "2024-01-03", "2024-01-03"]],
-            columns=["code", "start", "end"],
-        ),
-        paths.history_queries_path("stock", "d"),
-    )
+    seed_stock_coverage(root, "sh.600000", "2024-01-03", "2024-01-03")
     checks = iter([True, True, True, False])
     progress = []
 
@@ -636,7 +619,7 @@ def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
                 "dividRegistDate": ["2022-05-10"],
                 "dividOperateDate": ["2022-05-11"],
                 "dividPayDate": ["2022-05-20"],
-                "dividCashPsAfterTax": ["0.25"],
+                "dividCashPsBeforeTax": ["0.25"],
             }
         ),
         "sh.600000",
@@ -650,28 +633,45 @@ def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
         "record_date",
         "operate_date",
         "payment_date",
-        "cash_dividend_after_tax",
+        "cash_dividend_before_tax",
     ]
     assert pd.api.types.is_datetime64_any_dtype(out["operate_date"])
     assert out.loc[0, "operate_date"] == pd.Timestamp("2022-05-11")
-    assert out.loc[0, "cash_dividend_after_tax"] == pytest.approx(0.25)
+    assert out.loc[0, "cash_dividend_before_tax"] == pytest.approx(0.25)
+    assert out["cash_dividend_before_tax"].dtype == "float32"
 
 
-def test_clean_baostock_dividends_sums_or_separated_tax_after_cash():
+def test_clean_baostock_dividends_rejects_invalid_before_tax_cash():
+    with pytest.raises(ValueError, match="Invalid dividCashPsBeforeTax"):
+        clean_baostock_dividends(
+            pd.DataFrame(
+                {
+                    "code": ["sh.600000", "sh.600001"],
+                    "dividPlanAnnounceDate": ["2022-05-01"] * 2,
+                    "dividCashPsBeforeTax": ["0.1或0.2", "not-a-number"],
+                }
+            ),
+            "sh.600000",
+            2022,
+        )
+
+
+def test_clean_baostock_dividends_keeps_empty_before_tax_cash_as_missing():
     out = clean_baostock_dividends(
         pd.DataFrame(
             {
-                "code": ["sh.600000", "sh.600001", "sh.600002"],
-                "dividPlanAnnounceDate": ["2022-05-01"] * 3,
-                "dividCashPsAfterTax": ["0.1或0.2", "0.25", "not-a-number"],
+                "code": ["sh.600000", "sh.600001"],
+                "dividPlanAnnounceDate": ["2022-05-01"] * 2,
+                "dividCashPsBeforeTax": ["", "0.25"],
             }
         ),
         "sh.600000",
         2022,
     )
 
-    assert out["cash_dividend_after_tax"].tolist()[:2] == pytest.approx([0.3, 0.25])
-    assert pd.isna(out.loc[2, "cash_dividend_after_tax"])
+    assert out["cash_dividend_before_tax"].tolist() == pytest.approx(
+        [float("nan"), 0.25], nan_ok=True
+    )
 
 
 def test_clean_baostock_profit_keeps_total_shares_and_dates():
@@ -717,13 +717,16 @@ def test_update_dividends_skips_saved_and_empty_code_years(tmp_path):
         ("sh.600000", "2022", "operate"),
         ("sh.600000", "2023", "operate"),
     ]
-    dividend_path = tmp_path / "data" / "raw" / "dividend" / "data.parquet"
-    query_cache_path = tmp_path / "data" / "raw" / "dividend" / "queries.parquet"
-    assert len(pd.read_parquet(dividend_path)) == 1
-    assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-12-31")],
-        ["sh.600000", pd.Timestamp("2023-01-01"), pd.Timestamp("2023-12-31")],
-    ]
+    root = tmp_path / "data"
+    assert read_database(root, "SELECT COUNT(*) FROM core.dividend") == [(1,)]
+    assert read_database(
+        root,
+        """
+        SELECT query_year, field_set_id
+        FROM meta.dividend_coverage
+        ORDER BY query_year
+        """,
+    ) == [(2022, 2), (2023, 2)]
 
 
 def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
@@ -743,17 +746,18 @@ def test_update_profit_skips_saved_and_empty_code_quarters(tmp_path):
         ("sh.600000", "2022", "3"),
         ("sh.600000", "2022", "4"),
     ]
-    profit_path = tmp_path / "data" / "raw" / "stock_profit_quarterly" / "data.parquet"
-    query_cache_path = (
-        tmp_path / "data" / "raw" / "stock_profit_quarterly" / "queries.parquet"
-    )
-    assert len(pd.read_parquet(profit_path)) == 3
-    assert pd.read_parquet(query_cache_path).values.tolist() == [
-        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-03-31")],
-        ["sh.600000", pd.Timestamp("2022-04-01"), pd.Timestamp("2022-06-30")],
-        ["sh.600000", pd.Timestamp("2022-07-01"), pd.Timestamp("2022-09-30")],
-        ["sh.600000", pd.Timestamp("2022-10-01"), pd.Timestamp("2022-12-31")],
-    ]
+    root = tmp_path / "data"
+    assert read_database(
+        root, "SELECT COUNT(*) FROM core.share_capital_quarterly"
+    ) == [(1,)]
+    assert read_database(
+        root,
+        """
+        SELECT report_year, report_quarter
+        FROM meta.share_capital_coverage
+        ORDER BY report_quarter
+        """,
+    ) == [(2022, 1), (2022, 2), (2022, 3), (2022, 4)]
 
 
 def test_update_profit_infers_quarters_from_dates(tmp_path):
@@ -802,12 +806,11 @@ def test_update_dividends_saves_when_checkpoint_stops(tmp_path):
     )
 
     assert result["year"].tolist() == [2022]
-    assert len(pd.read_parquet(root / "raw" / "dividend" / "data.parquet")) == 1
-    assert pd.read_parquet(
-        root / "raw" / "dividend" / "queries.parquet"
-    ).values.tolist() == [
-        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-12-31")]
-    ]
+    assert read_database(root, "SELECT COUNT(*) FROM core.dividend") == [(1,)]
+    assert read_database(
+        root,
+        "SELECT query_year, field_set_id FROM meta.dividend_coverage",
+    ) == [(2022, 2)]
     assert not lock_path.exists()
 
 
@@ -827,15 +830,13 @@ def test_update_profit_saves_when_checkpoint_stops(tmp_path):
     )
 
     assert result["quarter"].tolist() == [1]
-    assert (
-        len(pd.read_parquet(root / "raw" / "stock_profit_quarterly" / "data.parquet"))
-        == 1
-    )
-    assert pd.read_parquet(
-        root / "raw" / "stock_profit_quarterly" / "queries.parquet"
-    ).values.tolist() == [
-        ["sh.600000", pd.Timestamp("2022-01-01"), pd.Timestamp("2022-03-31")]
-    ]
+    assert read_database(
+        root, "SELECT COUNT(*) FROM core.share_capital_quarterly"
+    ) == [(1,)]
+    assert read_database(
+        root,
+        "SELECT report_year, report_quarter FROM meta.share_capital_coverage",
+    ) == [(2022, 1)]
     assert not lock_path.exists()
 
 
@@ -877,10 +878,15 @@ def test_history_request_log_records_requests_before_runtime_error(tmp_path):
         "end_date",
     ]
     assert request_count_today(paths.request_log_path) == 3
-    assert pd.read_parquet(paths.history_queries_path("stock", "d"))["code"].tolist() == [
-        "sh.600000",
-        "sz.000001",
-    ]
+    assert read_database(
+        root,
+        """
+        SELECT s.symbol
+        FROM meta.stock_daily_coverage AS c
+        JOIN ref.security AS s USING (security_id)
+        ORDER BY s.symbol
+        """,
+    ) == [("000001.SZ",), ("600000.SH",)]
 
     append_request_log(
         paths.request_log_path,
@@ -937,7 +943,7 @@ def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
         "dividend",
         start="2022-02-01",
         end="2023-07-01",
-        pool=["sh.600000", "sh.600000"],
+        pool=["600000.SH", "600000.SH"],
         max_tasks=1,
         client=client,
         data_root=tmp_path / "data",
@@ -992,6 +998,21 @@ def test_update_index_accepts_code_pool_but_rejects_named_pool(tmp_path):
     )
 
     assert out["status"].tolist() == ["success"]
+    assert read_database(
+        tmp_path / "data",
+        "SELECT symbol, close FROM api.index_daily",
+    ) == [("sh.000300", 10.5)]
+    assert not (tmp_path / "data" / "raw" / "index_daily").exists()
+    cached = update_dataset(
+        "index_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        pool=["sh.000300"],
+        client=client,
+        data_root=tmp_path / "data",
+    )
+    assert cached.empty
+    assert len(client.calls) == 1
     with pytest.raises(ValueError, match="does not support named pools"):
         update_dataset(
             "index_daily",
@@ -1021,7 +1042,7 @@ def test_clean_csindex_history_selects_documented_fields():
     assert data["close"].tolist() == [1234.5]
 
 
-def test_update_csindex_daily_formats_dates_and_writes_one_file_per_code(tmp_path):
+def test_update_csindex_daily_formats_dates_and_writes_duckdb(tmp_path):
     client = FakeAkshare()
 
     out = update_csindex_daily(
@@ -1037,9 +1058,21 @@ def test_update_csindex_daily_formats_dates_and_writes_one_file_per_code(tmp_pat
         ("H20269", "20240102", "20240103"),
     ]
     assert out["status"].tolist() == ["success", "success"]
-    for code in ["H30269", "H20269"]:
-        data = pd.read_parquet(tmp_path / "data" / "raw" / "csindex_daily" / f"{code}.parquet")
-        assert data["symbol"].tolist() == [code]
+    rows = read_database(
+        tmp_path / "data",
+        "SELECT symbol, close FROM api.index_daily ORDER BY symbol",
+    )
+    assert rows == [("H20269", 1_234.5), ("H30269", 1_234.5)]
+    assert not (tmp_path / "data" / "raw" / "csindex_daily").exists()
+    cached = update_csindex_daily(
+        ["H30269", "H20269"],
+        "2024-01-02",
+        "2024-01-03",
+        data_root=tmp_path / "data",
+        client=client,
+    )
+    assert cached.empty
+    assert len(client.calls) == 2
 
 
 def test_update_csindex_daily_rejects_unknown_code_before_request(tmp_path):

@@ -22,10 +22,9 @@ sources:
         query: [code, start, end]
         result: [code, start_date, end_date, target_path, status, row_count, error]
       dividend:
-        data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+        data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
         query: [code, start, end]
         result: [code, year, status, row_count, error]
-        float32: [cash_dividend_after_tax]
       profit_quarterly:
         data: [code, year, quarter, publish_date, report_date, total_shares]
         query: [code, start, end]
@@ -43,10 +42,10 @@ datasets:
     description: Daily stock prices and valuation fields.
     source: baostock
     storage:
-      kind: symbol_files
-      path: data/raw/stock_daily/{symbol}.parquet
-      query_path: data/raw/stock_daily/queries.parquet
-      symbol_from: stem
+      kind: duckdb
+      path: data/pyquant.duckdb
+      relation: api.stock_daily
+      requires_dates: true
     columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
     required: [date, symbol, close, amount, pe_ttm]
     primary_key: [date, symbol]
@@ -60,10 +59,11 @@ datasets:
     description: Daily index prices.
     source: baostock
     storage:
-      kind: symbol_files
-      path: data/raw/index_daily/{symbol}.parquet
-      query_path: data/raw/index_daily/queries.parquet
-      symbol_from: stem
+      kind: duckdb
+      path: data/pyquant.duckdb
+      relation: api.index_daily
+      requires_dates: true
+      normalize_symbols: false
     columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
     required: [date, symbol, close]
     primary_key: [date, symbol]
@@ -77,9 +77,12 @@ datasets:
     description: Daily official CSI Dividend Low Volatility index prices.
     source: akshare
     storage:
-      kind: symbol_files
-      path: data/raw/csindex_daily/{symbol}.parquet
-      symbol_from: stem
+      kind: duckdb
+      path: data/pyquant.duckdb
+      relation: api.index_daily
+      requires_dates: true
+      normalize_symbols: false
+      allowed_symbols: [H30269, H20269]
     columns: [date, symbol, close]
     required: [date, symbol, close]
     primary_key: [date, symbol]
@@ -92,7 +95,7 @@ datasets:
   index_constituents:
     description: Changed snapshots of official index constituents from RQData.
     source: rqdata
-    storage: {kind: table, path: data/raw/index_constituents/H30269.parquet}
+    storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.index_constituents, requires_dates: false, normalize_symbols: true}
     columns: [effective_date, index_code, symbol]
     required: [effective_date, index_code, symbol]
     primary_key: [effective_date, index_code, symbol]
@@ -135,45 +138,45 @@ datasets:
   dividend:
     description: Announced cash dividends per share.
     source: baostock
-    storage: {kind: table, path: data/raw/dividend/data.parquet}
-    columns: [symbol, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
-    required: [symbol, year, announce_date, cash_dividend_after_tax]
-    primary_key: [symbol, year, announce_date, record_date, operate_date, payment_date, cash_dividend_after_tax]
+    storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.dividend, requires_dates: false}
+    columns: [symbol, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
+    required: [symbol, announce_date, cash_dividend_before_tax]
+    primary_key: [symbol, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
     date_column: announce_date
     date_columns: [announce_date, record_date, operate_date, payment_date]
-    numeric_columns: [year, cash_dividend_after_tax]
-    field_map: {code: symbol, dividPlanAnnounceDate: announce_date, dividRegistDate: record_date, dividOperateDate: operate_date, dividPayDate: payment_date, dividCashPsAfterTax: cash_dividend_after_tax}
+    numeric_columns: [cash_dividend_before_tax]
+    field_map: {code: symbol, dividPlanAnnounceDate: announce_date, dividRegistDate: record_date, dividOperateDate: operate_date, dividPayDate: payment_date, dividCashPsBeforeTax: cash_dividend_before_tax}
     update: {kind: dividend, pool: true}
 
   dividend_queries:
     description: Completed dividend source queries, including empty results.
     source: generated
-    storage: {kind: table, path: data/raw/dividend/queries.parquet}
-    columns: [symbol, start, end]
-    required: [symbol, start, end]
-    primary_key: [symbol, start, end]
-    date_columns: [start, end]
-    field_map: {code: symbol}
+    storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.dividend_coverage, requires_dates: false}
+    columns: [symbol, year]
+    required: [symbol, year]
+    primary_key: [symbol, year]
+    numeric_columns: [year]
+    field_map: {}
 
   stock_profit_quarterly:
     description: Quarterly publication dates and total shares.
     source: baostock
-    storage: {kind: table, path: data/raw/stock_profit_quarterly/data.parquet}
-    columns: [symbol, year, quarter, publish_date, report_date, total_shares]
-    required: [symbol, year, quarter, publish_date, total_shares]
-    primary_key: [symbol, year, quarter]
+    storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.share_capital_quarterly, requires_dates: false}
+    columns: [symbol, publish_date, report_date, total_shares]
+    required: [symbol, publish_date, total_shares]
+    primary_key: [symbol, report_date]
     date_column: publish_date
     date_columns: [publish_date, report_date]
-    numeric_columns: [year, quarter, total_shares]
+    numeric_columns: [total_shares]
     field_map: {code: symbol, pubDate: publish_date, statDate: report_date, totalShare: total_shares}
     update: {kind: profit_quarterly, pool: true}
 
   stock_profit_quarterly_queries:
     description: Completed quarterly profit source queries, including empty results.
     source: generated
-    storage: {kind: table, path: data/raw/stock_profit_quarterly/queries.parquet}
-    columns: [symbol, start, end]
-    required: [symbol, start, end]
-    primary_key: [symbol, start, end]
-    date_columns: [start, end]
-    field_map: {code: symbol}
+    storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.share_capital_coverage, requires_dates: false}
+    columns: [symbol, year, quarter]
+    required: [symbol, year, quarter]
+    primary_key: [symbol, year, quarter]
+    numeric_columns: [year, quarter]
+    field_map: {}
