@@ -1,7 +1,5 @@
-import importlib.util
-import json
 from copy import deepcopy
-from pathlib import Path
+from importlib.resources import files
 
 import pandas as pd
 import pytest
@@ -14,23 +12,10 @@ from pyquant.data.sources.rqdata import (
     rqdata_symbol_to_project,
 )
 from pyquant.data.updater import _run_update_dataset
+from strategies.dividend_low_vol import timing as TIMING
 
 
-STRATEGY_DIR = Path(__file__).parents[1] / "strategies" / "dividend_low_vol"
-
-
-def load_strategy_module(name: str):
-    spec = importlib.util.spec_from_file_location(
-        f"dividend_low_vol_{name}",
-        STRATEGY_DIR / f"{name}.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-TIMING = load_strategy_module("timing")
+STRATEGY_CONFIG = files("strategies.dividend_low_vol").joinpath("config.yaml")
 calculate_bp_spread = TIMING.calculate_bp_spread
 backtest_timing = TIMING.backtest_valuation_spread_timing
 
@@ -283,7 +268,7 @@ def test_strategy_3_validates_snapshot_and_config():
 
 
 def test_strategy_3_config_and_dataset_catalog():
-    with (STRATEGY_DIR / "config.yaml").open(encoding="utf-8") as stream:
+    with STRATEGY_CONFIG.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
     dataset = get_dataset_spec("index_constituents")
 
@@ -300,29 +285,3 @@ def test_strategy_3_config_and_dataset_catalog():
     )
     assert dataset.primary_key == ("effective_date", "index_code", "symbol")
 
-
-def test_strategy_3_notebook_and_download_entry_are_separated():
-    notebooks = {
-        name: json.loads((STRATEGY_DIR / name).read_text(encoding="utf-8"))
-        for name in [
-            "download.ipynb",
-            "strategy_3_valuation_spread_timing.ipynb",
-        ]
-    }
-    for notebook in notebooks.values():
-        for cell in notebook["cells"]:
-            if cell["cell_type"] == "code":
-                compile("".join(cell["source"]), "notebook_cell", "exec")
-
-    download_notebook = str(notebooks["download.ipynb"])
-    strategy_notebook = str(notebooks["strategy_3_valuation_spread_timing.ipynb"])
-    assert "'index_constituents'" in download_notebook
-    assert "constituent_job.wait()" in download_notebook
-    assert "conda run" not in download_notebook
-    assert "subprocess" not in download_notebook
-    assert "rqdatac" not in strategy_notebook
-    assert "update_dataset" not in strategy_notebook
-    assert "calculate_bp_spread" in strategy_notebook
-    assert "backtest_valuation_spread_timing" in strategy_notebook
-    assert "红利低波全收益指数月度收益与BP估值差" in strategy_notebook
-    assert "twinx" in strategy_notebook

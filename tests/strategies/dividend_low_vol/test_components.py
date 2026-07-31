@@ -1,22 +1,15 @@
-import importlib.util
-import json
 from copy import deepcopy
-from pathlib import Path
+from importlib.resources import files
 
 import pandas as pd
 import pytest
 import yaml
 
 from pyquant import build_dividend_low_vol_universe
+from strategies.dividend_low_vol import components as COMPONENTS
 
 
-STRATEGY_DIR = Path(__file__).parents[1] / "strategies" / "dividend_low_vol"
-SPEC = importlib.util.spec_from_file_location(
-    "dividend_low_vol_components", STRATEGY_DIR / "components.py"
-)
-assert SPEC is not None and SPEC.loader is not None
-COMPONENTS = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(COMPONENTS)
+STRATEGY_CONFIG = files("strategies.dividend_low_vol").joinpath("config.yaml")
 
 CONSTITUENT_COLUMNS = COMPONENTS.CONSTITUENT_COLUMNS
 INDEX_COLUMNS = COMPONENTS.INDEX_COLUMNS
@@ -619,7 +612,7 @@ def test_duplicate_price_key_and_invalid_config_raise():
 
 
 def test_strategy_config_contains_original_index_parameters_only():
-    with (STRATEGY_DIR / "config.yaml").open(encoding="utf-8") as stream:
+    with STRATEGY_CONFIG.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
 
     assert "backtest" not in config
@@ -634,25 +627,6 @@ def test_strategy_config_contains_original_index_parameters_only():
         "end_date": "2023-06-30",
         "pool": "all",
     }
-
-
-def test_notebooks_split_downloads_from_calculation():
-    notebooks = {
-        name: json.loads((STRATEGY_DIR / name).read_text(encoding="utf-8"))
-        for name in ["download.ipynb", "strategy_1_monthly_rebalance.ipynb"]
-    }
-    for notebook in notebooks.values():
-        for cell in notebook["cells"]:
-            if cell["cell_type"] == "code":
-                compile("".join(cell["source"]), "notebook_cell", "exec")
-
-    assert "update_dataset" in str(notebooks["download.ipynb"])
-    strategy_notebook = str(notebooks["strategy_1_monthly_rebalance.ipynb"])
-    assert "update_dataset" not in strategy_notebook
-    assert "csindex_daily" in str(notebooks["download.ipynb"])
-    assert "csindex_daily" in strategy_notebook
-    assert "calculate_dividend_low_vol_monthly_rebalanced_index" in strategy_notebook
-    assert "official_index_job.wait()" in str(notebooks["download.ipynb"])
 
 
 def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():

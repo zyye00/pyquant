@@ -9,6 +9,26 @@
 - 具体因子、择时指标、组合规则优先留在对应策略目录；
 - 不构建完整量化平台，不接入实盘交易。
 
+## 项目结构
+
+通用框架位于 `src/pyquant/`，具体策略实现位于 `src/strategies/{strategy_name}/`，notebook
+统一位于 `notebooks/{strategy_name}/`。以红利低波策略为例：
+
+```text
+src/strategies/dividend_low_vol/
+├─ config.yaml
+├─ components.py
+└─ timing.py
+
+notebooks/dividend_low_vol/
+├─ download.ipynb
+├─ strategy_1_monthly_rebalance.ipynb
+└─ strategy_3_valuation_spread_timing.ipynb
+```
+
+从仓库根目录启动 notebook。它会将 `src/` 加入导入路径，并从 `strategies` 与 `pyquant` 包读取
+策略实现和数据接口；策略配置在 notebook 中通过 `yaml.safe_load` 读取。
+
 ## 数据目录
 
 基础数据保存在 `data/pyquant.duckdb`。`configs/datasets.yaml` 是数据集目录，说明每个数据集的：

@@ -1,9 +1,19 @@
-.DS_Store
-*.md
+# Agent artifacts
+AGENTS.md
+.agents/
 
+# Local data and runtime state
 /data/**
 !/data/**/
 !/data/**/README.md
+
+# Python and test caches
 *.egg-info/
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Notebook, editor, and system files
+.ipynb_checkpoints/
 .vscode/
+.DS_Store
