@@ -22,9 +22,12 @@ from pyquant.data.sources.baostock import (
 )
 from pyquant.data.sources.csindex import clean_csindex_history
 from pyquant.data.updater import (
+    MinuteRequest,
+    _run_minute_update,
     _run_update_dataset as update_dataset,
     create_download_lock,
     init_data_storage,
+    plan_missing_minute_requests,
     update_dividends,
     update_csindex_daily,
     update_history_dataset,
@@ -213,7 +216,8 @@ def test_init_data_storage_has_no_task_state(tmp_path):
     paths = init_data_storage(tmp_path / "data")
 
     assert paths.database_path.exists()
-    assert (paths.data_root / "staging/migration").exists()
+    assert paths.state_dir.exists()
+    assert not (paths.data_root / "staging").exists()
     assert paths.request_log_path.exists()
     assert not (paths.state_dir / "tasks.csv").exists()
 
@@ -1071,3 +1075,178 @@ def test_update_csindex_daily_rejects_malformed_source_response(tmp_path):
 
     assert out["status"].tolist() == ["failed"]
     assert "missing required columns" in out.loc[0, "error"]
+
+
+def test_minute_planner_merges_by_trading_day_and_subtracts_completed():
+    requests = [
+        MinuteRequest("600000.SH", date(2024, 1, 5), date(2024, 1, 9)),
+        MinuteRequest("600000.SH", date(2024, 1, 8), date(2024, 1, 10)),
+    ]
+    calendar = pd.to_datetime(
+        ["2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10"]
+    )
+
+    out = plan_missing_minute_requests(
+        requests,
+        calendar,
+        completed=[("600000.SH", "2024-01-08")],
+    )
+
+    assert [(request.start_date, request.end_date) for request in out] == [
+        (date(2024, 1, 5), date(2024, 1, 5)),
+        (date(2024, 1, 9), date(2024, 1, 10)),
+    ]
+
+
+class FakeMinuteRQData:
+    def __init__(self):
+        self.price_calls = 0
+        self.user = SimpleNamespace(
+            get_quota=lambda: {"bytes_limit": 0, "bytes_used": 0}
+        )
+
+    def init(self):
+        pass
+
+    def get_trading_dates(self, start_date, end_date, market):
+        assert market == "cn"
+        return pd.bdate_range(start_date, end_date)
+
+    def get_price(self, **kwargs):
+        self.price_calls += 1
+        rows = []
+        for trade_date in pd.bdate_range(kwargs["start_date"], kwargs["end_date"]):
+            rows.extend(
+                [
+                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=31)),
+                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=32)),
+                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=33)),
+                ]
+            )
+        index = pd.MultiIndex.from_tuples(
+            rows,
+            names=["order_book_id", "datetime"],
+        )
+        values = [10.0 + index / 100 for index in range(len(rows))]
+        return pd.DataFrame(
+            {
+                "open": values,
+                "high": values,
+                "low": values,
+                "close": values,
+                "volume": 100.0,
+                "total_turnover": 1_000.0,
+            },
+            index=index,
+        )
+
+
+def test_minute_update_caches_completed_days_and_writes_features(tmp_path):
+    client = FakeMinuteRQData()
+    request = MinuteRequest(
+        "600000.SH",
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+    )
+    root = tmp_path / "data"
+
+    first = _run_minute_update(
+        [request],
+        data_root=root,
+        client=client,
+        quota_reserve_bytes=0,
+    )
+    second = _run_minute_update(
+        [request],
+        data_root=root,
+        client=client,
+        quota_reserve_bytes=0,
+    )
+
+    assert first["status"].tolist() == ["success"]
+    assert first["row_count"].tolist() == [6]
+    assert second.empty
+    assert client.price_calls == 1
+    assert read_database(
+        root,
+        "SELECT COUNT(*) FROM api.stock_minute_1m",
+    ) == [(6,)]
+    assert read_database(
+        root,
+        "SELECT COUNT(*) FROM api.intraday_volatility_daily",
+    ) == [(2,)]
+
+
+def test_quota_stopped_minute_task_remains_pending_and_is_reused(tmp_path, capsys):
+    client = FakeMinuteRQData()
+    client.user = SimpleNamespace(
+        get_quota=lambda: {"bytes_limit": 100, "bytes_used": 50}
+    )
+    request = MinuteRequest(
+        "600000.SH",
+        date(2024, 1, 2),
+        date(2024, 1, 2),
+    )
+    root = tmp_path / "data"
+
+    stopped = _run_minute_update(
+        [request],
+        data_root=root,
+        client=client,
+        quota_reserve_bytes=100,
+    )
+    resumed = _run_minute_update(
+        [request],
+        data_root=root,
+        client=client,
+        quota_reserve_bytes=0,
+    )
+
+    assert stopped.empty
+    assert resumed["status"].tolist() == ["success"]
+    assert "stopped by quota reserve (50 bytes remaining; reserve: 100)" in (
+        capsys.readouterr().out
+    )
+    assert read_database(
+        root,
+        "SELECT COUNT(*), MIN(task_id), MAX(task_id) FROM meta.minute_download_task",
+    ) == [(1, 1, 1)]
+
+
+def test_failed_minute_request_records_retryable_day_statuses(tmp_path):
+    class FailingMinuteRQData(FakeMinuteRQData):
+        def get_price(self, **kwargs):
+            self.price_calls += 1
+            raise ConnectionError("simulated minute failure")
+
+    client = FailingMinuteRQData()
+    root = tmp_path / "data"
+
+    out = _run_minute_update(
+        [
+            MinuteRequest(
+                "600000.SH",
+                date(2024, 1, 2),
+                date(2024, 1, 3),
+            )
+        ],
+        data_root=root,
+        client=client,
+        max_attempts=2,
+        quota_reserve_bytes=0,
+    )
+
+    assert out["status"].tolist() == ["failed"]
+    assert client.price_calls == 2
+    assert read_database(
+        root,
+        """
+        SELECT status, raw_saved, feature_saved
+        FROM meta.minute_day_status
+        ORDER BY trade_date
+        """,
+    ) == [(4, False, False), (4, False, False)]
+    assert read_database(
+        root,
+        "SELECT status, attempts FROM meta.minute_download_task",
+    ) == [(5, 2)]

@@ -24,6 +24,14 @@ csindex:
 
 rqdata:
   exchange_prefixes: {XSHG: SH, XSHE: SZ}
+  project_exchanges: {SH: XSHG, SZ: XSHE, BJ: XBEI}
+  stock_minute_1m:
+    frequency: 1m
+    adjust_type: none
+    skip_suspended: true
+    market: cn
+    fields: [open, high, low, close, volume, total_turnover]
+    result: [symbol, start_date, end_date, status, row_count, day_count, error]
 
 price:
   columns: [date, symbol, open, high, low, close, volume, amount]

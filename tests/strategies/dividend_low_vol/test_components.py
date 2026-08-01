@@ -20,6 +20,10 @@ calculate_monthly_rebalanced_index = (
 )
 select_constituents = COMPONENTS.select_dividend_low_vol_constituents
 select_download_symbols = COMPONENTS.select_dividend_low_vol_download_symbols
+build_minute_requests = COMPONENTS.build_intraday_minute_requests
+calculate_high_frequency_factor = (
+    COMPONENTS.calculate_high_frequency_volatility_factor
+)
 
 
 def make_config(
@@ -1003,3 +1007,68 @@ def test_index_validates_coverage_effective_prices_and_duplicate_events():
             "2024-01-02",
             "2024-01-03",
         )
+
+
+def test_intraday_requests_use_exact_trading_day_lookback_and_candidate_cap():
+    calendar = pd.bdate_range("2024-01-01", periods=25)
+    symbols = [f"{index:06d}.SH" for index in range(151)]
+
+    out = build_minute_requests(
+        symbols,
+        calendar[-1],
+        calendar,
+        lookback_trading_days=20,
+        max_candidates=150,
+    )
+
+    assert len(out) == 150
+    assert out[0].start_date == calendar[-20].date()
+    assert out[0].end_date == calendar[-1].date()
+
+
+def test_high_frequency_factor_is_market_cap_neutralized():
+    dates = pd.bdate_range("2024-01-01", periods=20)
+    symbols = ["A", "B", "C"]
+    daily = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "trade_date": trade_date,
+                "volatility": base + slope * index,
+            }
+            for symbol, base, slope in [
+                ("A", 0.01, 0.0001),
+                ("B", 0.02, 0.0004),
+                ("C", 0.03, 0.0009),
+            ]
+            for index, trade_date in enumerate(dates)
+        ]
+    )
+    market_cap = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "trade_date": trade_date,
+                "total_market_cap": value,
+            }
+            for symbol, value in zip(
+                symbols,
+                [100.0, 200.0, 500.0],
+                strict=True,
+            )
+            for trade_date in dates
+        ]
+    )
+
+    out = calculate_high_frequency_factor(
+        daily,
+        market_cap,
+        dates[-1],
+    )
+
+    residual = out["minute_return_volatility"].to_numpy()
+    assert residual.sum() == pytest.approx(0.0, abs=1e-12)
+    assert residual @ out["log_market_cap"].to_numpy() == pytest.approx(
+        0.0,
+        abs=1e-12,
+    )

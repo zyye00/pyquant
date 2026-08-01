@@ -27,6 +27,9 @@ def test_strategy_1_notebooks_split_downloads_from_calculation():
     assert "csindex_daily" in strategy_notebook
     assert "calculate_dividend_low_vol_monthly_rebalanced_index" in strategy_notebook
     assert "official_index_job.wait()" in str(notebooks["download.ipynb"])
+    assert "update_minute_data" in str(notebooks["download.ipynb"])
+    assert "build_intraday_minute_requests" in str(notebooks["download.ipynb"])
+    assert "minute_job.wait()" in str(notebooks["download.ipynb"])
 
 
 def test_strategy_3_notebook_and_download_entry_are_separated():

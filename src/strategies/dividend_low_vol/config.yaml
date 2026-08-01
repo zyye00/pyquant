@@ -27,6 +27,14 @@ strategy_1:
   volatility_lookback_days: 20
   transaction_cost_rate: 0.001
 
+minute_data:
+  lookback_trading_days: 20
+  max_candidates: 150
+  min_valid_days: 20
+  min_bars_per_day: null
+  max_attempts: 3
+  quota_reserve_bytes: 80000000
+
 strategy_3:
   index_code: H30269
   trim_ratio: 0.1

@@ -9,12 +9,27 @@ import numpy as np
 import pandas as pd
 
 from pyquant.data.identifiers import normalize_index_code, normalize_security_symbol
+from pyquant.data.intraday import (
+    MINUTE_DAY_FAILED,
+    MINUTE_DAY_INCOMPLETE,
+    MINUTE_DAY_NO_DATA_CONFIRMED,
+    MINUTE_DAY_VALID,
+)
 
 STOCK_DAILY_FIELD_SET_ID = 1
+STOCK_MINUTE_1M_FIELD_SET_ID = 1
 BAOSTOCK_INDEX_DAILY_FIELD_SET_ID = 1
 CSINDEX_DAILY_FIELD_SET_ID = 2
 LEGACY_DIVIDEND_FIELD_SET_ID = 1
 DIVIDEND_BEFORE_TAX_FIELD_SET_ID = 2
+MINUTE_TASK_PENDING = 0
+MINUTE_TASK_RUNNING = 1
+MINUTE_TASK_SUCCESS = 2
+MINUTE_TASK_PARTIAL = 3
+MINUTE_TASK_NO_DATA = 4
+MINUTE_TASK_FAILED = 5
+MINUTE_TASK_INVALID_CODE = 6
+MINUTE_TASK_QUOTA_STOPPED = 7
 
 
 def ensure_securities(
@@ -143,6 +158,471 @@ def share_capital_coverage(
             """
         ).fetchall()
     }
+
+
+def completed_minute_days(
+    connection: duckdb.DuckDBPyConnection,
+    symbols: Iterable[str],
+    field_set_id: int = STOCK_MINUTE_1M_FIELD_SET_ID,
+) -> set[tuple[str, pd.Timestamp]]:
+    """Return minute days whose raw and feature requirements are satisfied."""
+    symbols = sorted({normalize_security_symbol(symbol) for symbol in symbols})
+    if not symbols:
+        return set()
+    placeholders = ", ".join("?" for _ in symbols)
+    rows = connection.execute(
+        f"""
+        SELECT s.symbol, d.trade_date
+        FROM meta.minute_day_status AS d
+        JOIN ref.security AS s USING (security_id)
+        WHERE s.symbol IN ({placeholders})
+          AND d.field_set_id = ?
+          AND d.status IN (?, ?)
+          AND d.raw_saved
+          AND d.feature_saved
+        """,
+        [
+            *symbols,
+            field_set_id,
+            MINUTE_DAY_VALID,
+            MINUTE_DAY_NO_DATA_CONFIRMED,
+        ],
+    ).fetchall()
+    return {(symbol, pd.Timestamp(trade_date)) for symbol, trade_date in rows}
+
+
+def create_minute_download_task(
+    connection: duckdb.DuckDBPyConnection,
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    retain_raw: bool,
+    field_set_id: int = STOCK_MINUTE_1M_FIELD_SET_ID,
+) -> int:
+    """Create one pending minute-download task and return its stable ID."""
+    symbol = normalize_security_symbol(symbol)
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    connection.begin()
+    try:
+        security_id = ensure_securities(connection, [symbol])[symbol]
+        existing = connection.execute(
+            """
+            SELECT task_id
+            FROM meta.minute_download_task
+            WHERE security_id = ?
+              AND start_date = ?
+              AND end_date = ?
+              AND field_set_id = ?
+              AND retain_raw = ?
+              AND status = ?
+            ORDER BY task_id
+            LIMIT 1
+            """,
+            [
+                security_id,
+                start,
+                end,
+                field_set_id,
+                retain_raw,
+                MINUTE_TASK_PENDING,
+            ],
+        ).fetchone()
+        if existing is not None:
+            connection.commit()
+            return int(existing[0])
+        task_id = connection.execute(
+            "SELECT COALESCE(MAX(task_id), 0) + 1 FROM meta.minute_download_task"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO meta.minute_download_task
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, now(), now())
+            """,
+            [
+                task_id,
+                security_id,
+                start,
+                end,
+                field_set_id,
+                retain_raw,
+                MINUTE_TASK_PENDING,
+            ],
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return int(task_id)
+
+
+def update_minute_download_task(
+    connection: duckdb.DuckDBPyConnection,
+    task_id: int,
+    status: int,
+    *,
+    increment_attempts: bool = False,
+    rows_received: int | None = None,
+    days_received: int | None = None,
+    error: Exception | None = None,
+) -> None:
+    """Update mutable execution fields for one minute-download task."""
+    error_type = type(error).__name__ if error is not None else None
+    error_message = str(error) if error is not None else None
+    changed = connection.execute(
+        """
+        UPDATE meta.minute_download_task
+        SET
+            status = ?,
+            attempts = attempts + ?,
+            rows_received = COALESCE(?, rows_received),
+            days_received = COALESCE(?, days_received),
+            error_type = ?,
+            error_message = ?,
+            updated_at = now()
+        WHERE task_id = ?
+        RETURNING task_id
+        """,
+        [
+            status,
+            int(increment_attempts),
+            rows_received,
+            days_received,
+            error_type,
+            error_message,
+            task_id,
+        ],
+    ).fetchone()
+    if changed is None:
+        raise ValueError(f"Unknown minute download task: {task_id}")
+
+
+def recover_minute_download_tasks(
+    connection: duckdb.DuckDBPyConnection,
+    max_attempts: int,
+    stale_after_seconds: int = 3_600,
+) -> None:
+    """Recover tasks left running by an interrupted process."""
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    connection.execute(
+        """
+        UPDATE meta.minute_download_task
+        SET
+            status = CASE WHEN attempts < ? THEN ? ELSE ? END,
+            error_type = CASE
+                WHEN attempts < ? THEN NULL
+                ELSE 'InterruptedTask'
+            END,
+            error_message = CASE
+                WHEN attempts < ? THEN NULL
+                ELSE 'Task exceeded max_attempts after interruption'
+            END,
+            updated_at = now()
+        WHERE status = ?
+          AND updated_at < now() - ? * INTERVAL '1 second'
+        """,
+        [
+            max_attempts,
+            MINUTE_TASK_PENDING,
+            MINUTE_TASK_FAILED,
+            max_attempts,
+            max_attempts,
+            MINUTE_TASK_RUNNING,
+            stale_after_seconds,
+        ],
+    )
+
+
+def write_minute_request(
+    connection: duckdb.DuckDBPyConnection,
+    task_id: int,
+    symbol: str,
+    minute: pd.DataFrame,
+    daily: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    *,
+    retain_raw: bool = True,
+    field_set_id: int = STOCK_MINUTE_1M_FIELD_SET_ID,
+) -> None:
+    """Atomically replace minute facts, daily features, coverage, and task state."""
+    symbol = normalize_security_symbol(symbol)
+    required_minute = {
+        "symbol",
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "total_turnover",
+    }
+    required_daily = {
+        "symbol",
+        "trade_date",
+        "volatility",
+        "bar_count",
+        "return_count",
+        "status",
+    }
+    for name, data, required in [
+        ("minute", minute, required_minute),
+        ("daily", daily, required_daily),
+    ]:
+        missing = sorted(required - set(data))
+        if missing:
+            raise ValueError(f"{name} data missing required columns: {missing}")
+        if not data.empty and set(data["symbol"]) != {symbol}:
+            raise ValueError(f"{name} data does not match the requested symbol")
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    if not daily["status"].isin(
+        [MINUTE_DAY_VALID, MINUTE_DAY_NO_DATA_CONFIRMED, MINUTE_DAY_INCOMPLETE]
+    ).all():
+        raise ValueError("daily data contains unsupported minute-day statuses")
+    incoming_minute = minute.drop(columns="symbol").copy()
+    incoming_daily = daily.drop(columns="symbol").copy()
+    terminal = incoming_daily["status"].isin(
+        [MINUTE_DAY_VALID, MINUTE_DAY_NO_DATA_CONFIRMED]
+    )
+    if terminal.all() and incoming_daily["status"].eq(
+        MINUTE_DAY_NO_DATA_CONFIRMED
+    ).all():
+        task_status = MINUTE_TASK_NO_DATA
+    elif terminal.all():
+        task_status = MINUTE_TASK_SUCCESS
+    else:
+        task_status = MINUTE_TASK_PARTIAL
+
+    connection.begin()
+    registered_minute = False
+    registered_daily = False
+    try:
+        security_id = ensure_securities(connection, [symbol])[symbol]
+        if retain_raw:
+            connection.execute(
+                """
+                DELETE FROM core.stock_minute_1m
+                WHERE security_id = ?
+                  AND datetime >= ?
+                  AND datetime < ?
+                """,
+                [security_id, start, end + pd.Timedelta(days=1)],
+            )
+            if not incoming_minute.empty:
+                connection.register("incoming_stock_minute_1m", incoming_minute)
+                registered_minute = True
+                connection.execute(
+                    """
+                    INSERT INTO core.stock_minute_1m
+                    SELECT
+                        ?,
+                        CAST(datetime AS TIMESTAMP),
+                        CAST(open AS FLOAT),
+                        CAST(high AS FLOAT),
+                        CAST(low AS FLOAT),
+                        CAST(close AS FLOAT),
+                        CAST(volume AS DOUBLE),
+                        CAST(total_turnover AS DOUBLE)
+                    FROM incoming_stock_minute_1m
+                    ORDER BY datetime
+                    """,
+                    [security_id],
+                )
+        connection.execute(
+            """
+            DELETE FROM feature.intraday_volatility_daily
+            WHERE security_id = ?
+              AND trade_date >= ?
+              AND trade_date <= ?
+            """,
+            [security_id, start, end],
+        )
+        if not incoming_daily.empty:
+            connection.register("incoming_minute_daily", incoming_daily)
+            registered_daily = True
+            feature_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info('feature.intraday_volatility_daily')"
+                ).fetchall()
+            }
+            targets = ["security_id", "trade_date", "volatility"]
+            values = [
+                "?",
+                "CAST(trade_date AS DATE)",
+                "CAST(volatility AS FLOAT)",
+            ]
+            legacy = {
+                "vol_daily": "CAST(volatility AS FLOAT)",
+                "bar_count": "CAST(bar_count AS USMALLINT)",
+                "return_count": "CAST(return_count AS USMALLINT)",
+                "is_valid": "TRUE",
+            }
+            for column, expression in legacy.items():
+                if column in feature_columns:
+                    targets.append(column)
+                    values.append(expression)
+            connection.execute(
+                f"""
+                INSERT INTO feature.intraday_volatility_daily (
+                    {", ".join(targets)}
+                )
+                SELECT
+                    {", ".join(values)}
+                FROM incoming_minute_daily
+                WHERE status = ?
+                """,
+                [security_id, MINUTE_DAY_VALID],
+            )
+            connection.execute(
+                """
+                DELETE FROM meta.minute_day_status
+                WHERE security_id = ?
+                  AND field_set_id = ?
+                  AND trade_date IN (
+                      SELECT CAST(trade_date AS DATE) FROM incoming_minute_daily
+                  )
+                """,
+                [security_id, field_set_id],
+            )
+            connection.execute(
+                """
+                INSERT INTO meta.minute_day_status
+                SELECT
+                    ?,
+                    CAST(trade_date AS DATE),
+                    ?,
+                    CAST(status AS UTINYINT),
+                    CAST(bar_count AS USMALLINT),
+                    CAST(return_count AS USMALLINT),
+                    TRUE,
+                    status IN (?, ?),
+                    now()
+                FROM incoming_minute_daily
+                """,
+                [
+                    security_id,
+                    field_set_id,
+                    MINUTE_DAY_VALID,
+                    MINUTE_DAY_NO_DATA_CONFIRMED,
+                ],
+            )
+        changed = connection.execute(
+            """
+            UPDATE meta.minute_download_task
+            SET
+                status = ?,
+                rows_received = ?,
+                days_received = ?,
+                error_type = NULL,
+                error_message = NULL,
+                updated_at = now()
+            WHERE task_id = ? AND security_id = ?
+            RETURNING task_id
+            """,
+            [
+                task_status,
+                len(incoming_minute),
+                int(incoming_daily["status"].eq(MINUTE_DAY_VALID).sum()),
+                task_id,
+                security_id,
+            ],
+        ).fetchone()
+        if changed is None:
+            raise ValueError(f"Minute task {task_id} does not match {symbol}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if registered_minute:
+            connection.unregister("incoming_stock_minute_1m")
+        if registered_daily:
+            connection.unregister("incoming_minute_daily")
+
+
+def write_minute_request_failure(
+    connection: duckdb.DuckDBPyConnection,
+    task_id: int,
+    symbol: str,
+    trading_dates: Iterable[object],
+    error: Exception,
+    field_set_id: int = STOCK_MINUTE_1M_FIELD_SET_ID,
+) -> None:
+    """Atomically record failed minute days and their terminal task attempt."""
+    symbol = normalize_security_symbol(symbol)
+    dates = sorted(
+        {
+            pd.Timestamp(trade_date).date()
+            for trade_date in trading_dates
+        }
+    )
+    connection.begin()
+    try:
+        task = connection.execute(
+            """
+            SELECT t.security_id
+            FROM meta.minute_download_task AS t
+            JOIN ref.security AS s USING (security_id)
+            WHERE t.task_id = ? AND s.symbol = ?
+            """,
+            [task_id, symbol],
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"Minute task {task_id} does not match {symbol}")
+        security_id = task[0]
+        if dates:
+            connection.executemany(
+                """
+                DELETE FROM meta.minute_day_status
+                WHERE security_id = ?
+                  AND trade_date = ?
+                  AND field_set_id = ?
+                """,
+                [
+                    (security_id, trade_date, field_set_id)
+                    for trade_date in dates
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO meta.minute_day_status
+                VALUES (?, ?, ?, ?, NULL, NULL, FALSE, FALSE, now())
+                """,
+                [
+                    (
+                        security_id,
+                        trade_date,
+                        field_set_id,
+                        MINUTE_DAY_FAILED,
+                    )
+                    for trade_date in dates
+                ],
+            )
+        connection.execute(
+            """
+            UPDATE meta.minute_download_task
+            SET
+                status = ?,
+                error_type = ?,
+                error_message = ?,
+                updated_at = now()
+            WHERE task_id = ?
+            """,
+            [MINUTE_TASK_FAILED, type(error).__name__, str(error), task_id],
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def write_stock_daily_request(

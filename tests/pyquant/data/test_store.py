@@ -9,11 +9,14 @@ from pyquant.data.identifiers import normalize_index_code, normalize_security_sy
 from pyquant.data.store import (
     BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
     CSINDEX_DAILY_FIELD_SET_ID,
+    MINUTE_TASK_SUCCESS,
+    create_minute_download_task,
     ensure_market_indices,
     ensure_securities,
     write_dividend_request,
     write_index_constituents,
     write_index_daily_request,
+    write_minute_request,
     write_share_capital_request,
 )
 
@@ -206,3 +209,71 @@ def test_missing_total_shares_are_preserved_as_null(tmp_path):
             FROM core.share_capital_quarterly
             """
         ).fetchall() == [(pd.Timestamp("2024-03-31").date(), None)]
+
+
+def test_minute_facts_features_status_and_task_commit_together(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+    minute = pd.DataFrame(
+        {
+            "symbol": ["600000.SH"] * 3,
+            "datetime": pd.to_datetime(
+                [
+                    "2024-01-02 09:31",
+                    "2024-01-02 09:32",
+                    "2024-01-02 09:33",
+                ]
+            ),
+            "open": [10.0, 10.1, 10.2],
+            "high": [10.0, 10.1, 10.2],
+            "low": [10.0, 10.1, 10.2],
+            "close": [10.0, 10.1, 10.2],
+            "volume": [100.0, 100.0, 100.0],
+            "total_turnover": [1_000.0, 1_000.0, 1_000.0],
+        }
+    )
+    daily = pd.DataFrame(
+        {
+            "symbol": ["600000.SH"],
+            "trade_date": pd.to_datetime(["2024-01-02"]),
+            "volatility": [0.001],
+            "bar_count": [3],
+            "return_count": [2],
+            "status": [1],
+        }
+    )
+
+    with connect_database(database_path) as connection:
+        task_id = create_minute_download_task(
+            connection,
+            "600000.SH",
+            "2024-01-02",
+            "2024-01-02",
+            True,
+        )
+        write_minute_request(
+            connection,
+            task_id,
+            "600000.SH",
+            minute,
+            daily,
+            "2024-01-02",
+            "2024-01-02",
+        )
+        raw = connection.execute("SELECT COUNT(*) FROM api.stock_minute_1m").fetchone()
+        feature = connection.execute(
+            """
+            SELECT volatility, bar_count, return_count, status
+            FROM api.intraday_volatility_daily
+            """
+        ).fetchone()
+        task = connection.execute(
+            """
+            SELECT status, attempts, rows_received, days_received
+            FROM meta.minute_download_task
+            """
+        ).fetchone()
+
+    assert raw == (3,)
+    assert feature == pytest.approx((0.001, 3, 2, 1))
+    assert task == (MINUTE_TASK_SUCCESS, 0, 3, 1)

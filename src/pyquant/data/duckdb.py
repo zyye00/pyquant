@@ -58,10 +58,16 @@ def load_relation(
     parameters: list[Any] = []
     if date_column is not None and start is not None:
         conditions.append(f"{date_column} >= ?")
-        parameters.append(start.date())
+        parameters.append(
+            start.to_pydatetime() if date_column == "datetime" else start.date()
+        )
     if date_column is not None and end is not None:
-        conditions.append(f"{date_column} <= ?")
-        parameters.append(end.date())
+        if date_column == "datetime":
+            conditions.append(f"{date_column} < ?")
+            parameters.append((end.normalize() + pd.Timedelta(days=1)).to_pydatetime())
+        else:
+            conditions.append(f"{date_column} <= ?")
+            parameters.append(end.date())
     if symbols:
         normalized = [
             normalize_security_symbol(symbol) if normalize_symbols else str(symbol)

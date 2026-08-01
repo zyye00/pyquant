@@ -16,6 +16,13 @@ import pandas as pd
 from pyquant.data.catalog import get_dataset_spec
 from pyquant.data.duckdb import connect_database, get_database_path, initialize_database
 from pyquant.data.identifiers import normalize_security_symbol
+from pyquant.data.intraday import (
+    MINUTE_DAY_INCOMPLETE,
+    MINUTE_DAY_NO_DATA_CONFIRMED,
+    MINUTE_DAY_VALID,
+    calculate_daily_intraday_volatility,
+    normalize_minute_bars,
+)
 from pyquant.data.resources import load_source_protocols
 from pyquant.data.sources.baostock import (
     BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
@@ -37,23 +44,36 @@ from pyquant.data.sources.csindex import (
     clean_csindex_history,
     query_csindex_history,
 )
-from pyquant.data.sources.rqdata import query_index_constituents
+from pyquant.data.sources.rqdata import (
+    query_index_constituents,
+    query_rqdata_quota_remaining,
+    query_rqdata_trading_dates,
+    query_stock_minute_1m,
+)
 from pyquant.data.store import (
     BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
     CSINDEX_DAILY_FIELD_SET_ID,
+    MINUTE_TASK_RUNNING,
+    completed_minute_days,
+    create_minute_download_task,
     dividend_coverage,
     index_daily_coverage,
     share_capital_coverage,
     stock_daily_coverage,
+    recover_minute_download_tasks,
+    update_minute_download_task,
     write_dividend_request,
     write_index_constituents,
     write_index_daily_request,
     write_share_capital_request,
+    write_minute_request,
+    write_minute_request_failure,
     write_stock_daily_request,
 )
 
 _fields = load_source_protocols()["baostock"]
 _csindex = load_source_protocols()["csindex"]
+_rqdata_minute = load_source_protocols()["rqdata"]["stock_minute_1m"]
 _normalize_baostock_code = normalize_baostock_code
 
 
@@ -200,17 +220,286 @@ class DataPaths:
 
 
 def init_data_storage(data_root: Path = Path("data")) -> DataPaths:
-    """Create DuckDB and the remaining source-specific directories."""
+    """Create DuckDB and source-specific state storage."""
     paths = DataPaths(data_root)
-    for path in [
-        paths.state_dir,
-        data_root / "staging/migration",
-        data_root / "staging/downloads",
-    ]:
-        path.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
     initialize_database(paths.database_path)
     reset_request_log(paths.request_log_path)
     return paths
+
+
+@dataclass(frozen=True)
+class MinuteRequest:
+    """One strategy-generated need for a security's minute bars."""
+
+    symbol: str
+    start_date: date
+    end_date: date
+    retain_raw: bool = True
+
+    def __post_init__(self) -> None:
+        start = pd.Timestamp(self.start_date).date()
+        end = pd.Timestamp(self.end_date).date()
+        if start > end:
+            raise ValueError("start_date must not be after end_date")
+        object.__setattr__(self, "symbol", normalize_security_symbol(self.symbol))
+        object.__setattr__(self, "start_date", start)
+        object.__setattr__(self, "end_date", end)
+
+
+def plan_missing_minute_requests(
+    requests: Iterable[MinuteRequest],
+    trading_dates: Collection[object],
+    completed: Collection[tuple[str, object]] = (),
+) -> list[MinuteRequest]:
+    """Subtract completed days and merge adjacent trading-day requirements."""
+    requests = list(requests)
+    if not requests:
+        return []
+    calendar = pd.DatetimeIndex(pd.to_datetime(list(trading_dates), errors="raise"))
+    if calendar.hasnans:
+        raise ValueError("trading_dates must not contain invalid values")
+    calendar = calendar.normalize().drop_duplicates().sort_values()
+    positions = {value: index for index, value in enumerate(calendar)}
+    completed = {
+        (normalize_security_symbol(symbol), pd.Timestamp(trade_date).normalize())
+        for symbol, trade_date in completed
+    }
+    needed: dict[str, dict[pd.Timestamp, bool]] = {}
+    for request in requests:
+        dates = calendar[
+            (calendar >= pd.Timestamp(request.start_date))
+            & (calendar <= pd.Timestamp(request.end_date))
+        ]
+        symbol_dates = needed.setdefault(request.symbol, {})
+        for trade_date in dates:
+            if (request.symbol, trade_date) not in completed:
+                symbol_dates[trade_date] = (
+                    symbol_dates.get(trade_date, False) or request.retain_raw
+                )
+    planned = []
+    for symbol, values in sorted(needed.items()):
+        current: list[object] | None = None
+        for trade_date, retain_raw in sorted(values.items()):
+            if (
+                current is None
+                or retain_raw != current[2]
+                or positions[trade_date] != positions[current[1]] + 1
+            ):
+                if current is not None:
+                    planned.append(
+                        MinuteRequest(symbol, current[0], current[1], current[2])
+                    )
+                current = [trade_date, trade_date, retain_raw]
+            else:
+                current[1] = trade_date
+        if current is not None:
+            planned.append(MinuteRequest(symbol, current[0], current[1], current[2]))
+    return planned
+
+
+def _run_minute_update(
+    requests: Iterable[MinuteRequest],
+    *,
+    data_root: Path = Path("data"),
+    client: Any | None = None,
+    max_attempts: int = 3,
+    quota_reserve_bytes: int = 80_000_000,
+    min_bars_per_day: int | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
+) -> pd.DataFrame:
+    """Synchronously fulfill strategy-generated one-minute data requirements."""
+    requests = list(requests)
+    if not requests:
+        raise ValueError("No minute requests were provided")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    if quota_reserve_bytes < 0:
+        raise ValueError("quota_reserve_bytes must not be negative")
+    if max_tasks is not None and max_tasks <= 0:
+        raise ValueError("max_tasks must be positive")
+    start = min(request.start_date for request in requests)
+    end = max(request.end_date for request in requests)
+    calendar = query_rqdata_trading_dates(
+        str(start),
+        str(end),
+        client=client,
+    )
+    paths = init_data_storage(data_root)
+    results = []
+    exit_reason = None
+    total_tasks = 0
+    with connect_database(paths.database_path) as connection:
+        recover_minute_download_tasks(connection, max_attempts)
+        completed = completed_minute_days(
+            connection,
+            [request.symbol for request in requests],
+        )
+        planned = plan_missing_minute_requests(requests, calendar, completed)
+        if max_tasks is not None:
+            planned = planned[:max_tasks]
+        tasks = [
+            (
+                request,
+                create_minute_download_task(
+                    connection,
+                    request.symbol,
+                    str(request.start_date),
+                    str(request.end_date),
+                    request.retain_raw,
+                ),
+            )
+            for request in planned
+        ]
+        total_tasks = len(tasks)
+        if progress is not None:
+            progress(0, len(tasks))
+        for completed_tasks, (request, task_id) in enumerate(tasks):
+            if checkpoint is not None and not checkpoint():
+                exit_reason = "user"
+                break
+            if quota_reserve_bytes:
+                remaining = query_rqdata_quota_remaining(client=client)
+                if remaining is not None and remaining < quota_reserve_bytes:
+                    exit_reason = (
+                        f"quota reserve ({remaining} bytes remaining; "
+                        f"reserve: {quota_reserve_bytes})"
+                    )
+                    break
+            task_calendar = calendar[
+                (calendar >= pd.Timestamp(request.start_date))
+                & (calendar <= pd.Timestamp(request.end_date))
+            ]
+            attempts = connection.execute(
+                """
+                SELECT attempts
+                FROM meta.minute_download_task
+                WHERE task_id = ?
+                """,
+                [task_id],
+            ).fetchone()[0]
+            for attempt in range(attempts, max_attempts):
+                update_minute_download_task(
+                    connection,
+                    task_id,
+                    MINUTE_TASK_RUNNING,
+                    increment_attempts=True,
+                )
+                try:
+                    minute = normalize_minute_bars(
+                        query_stock_minute_1m(
+                            request.symbol,
+                            str(request.start_date),
+                            str(request.end_date),
+                            client=client,
+                        ),
+                        request.symbol,
+                        str(request.start_date),
+                        str(request.end_date),
+                    )
+                    daily = calculate_daily_intraday_volatility(
+                        minute,
+                        request.symbol,
+                        task_calendar,
+                        min_bars_per_day=min_bars_per_day,
+                    )
+                    write_minute_request(
+                        connection,
+                        task_id,
+                        request.symbol,
+                        minute,
+                        daily,
+                        str(request.start_date),
+                        str(request.end_date),
+                        retain_raw=request.retain_raw,
+                    )
+                except Exception as exc:
+                    if attempt + 1 < max_attempts:
+                        continue
+                    write_minute_request_failure(
+                        connection,
+                        task_id,
+                        request.symbol,
+                        task_calendar,
+                        exc,
+                    )
+                    results.append(
+                        (
+                            request.symbol,
+                            str(request.start_date),
+                            str(request.end_date),
+                            "failed",
+                            0,
+                            0,
+                            str(exc),
+                        )
+                    )
+                else:
+                    statuses = set(daily["status"])
+                    status = (
+                        "partial"
+                        if MINUTE_DAY_INCOMPLETE in statuses
+                        else "no_data"
+                        if statuses == {MINUTE_DAY_NO_DATA_CONFIRMED}
+                        else "success"
+                    )
+                    results.append(
+                        (
+                            request.symbol,
+                            str(request.start_date),
+                            str(request.end_date),
+                            status,
+                            len(minute),
+                            int(daily["status"].eq(MINUTE_DAY_VALID).sum()),
+                            "",
+                        )
+                    )
+                break
+            if progress is not None:
+                progress(completed_tasks + 1, len(tasks))
+    if exit_reason is None:
+        print(
+            "Minute-data update completed: "
+            f"{len(results)}/{total_tasks} tasks processed."
+        )
+    else:
+        print(
+            f"Minute-data update stopped by {exit_reason}: "
+            f"{len(results)}/{total_tasks} tasks processed."
+        )
+    return pd.DataFrame(results, columns=_rqdata_minute["result"])
+
+
+def update_minute_data(
+    requests: Iterable[MinuteRequest],
+    *,
+    data_root: Path = Path("data"),
+    max_attempts: int = 3,
+    quota_reserve_bytes: int = 80_000_000,
+    min_bars_per_day: int | None = None,
+    max_tasks: int | None = None,
+) -> UpdateJob:
+    """Start a controllable background update for one-minute data requests."""
+    requests = list(requests)
+
+    def run(
+        checkpoint: Callable[[], bool],
+        progress: Callable[[int, int], None],
+    ) -> pd.DataFrame:
+        return _run_minute_update(
+            requests,
+            data_root=data_root,
+            max_attempts=max_attempts,
+            quota_reserve_bytes=quota_reserve_bytes,
+            min_bars_per_day=min_bars_per_day,
+            checkpoint=checkpoint,
+            progress=progress,
+            max_tasks=max_tasks,
+        )
+
+    return UpdateJob(run)
 
 
 def missing_baostock_ranges(

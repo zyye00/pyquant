@@ -2,12 +2,14 @@
 
 from pyquant.backtest import run_backtest
 from pyquant.data import (
+    MinuteRequest,
     UpdateJob,
     get_period_end_dates,
     load_dataset,
     normalize_query_years,
     standardize_price,
     update_dataset,
+    update_minute_data,
 )
 from pyquant.io import ensure_dir, save_output
 from pyquant.metrics import calc_metrics
@@ -19,6 +21,7 @@ from pyquant.universe import (
 )
 
 __all__ = [
+    "MinuteRequest",
     "UpdateJob",
     "build_dividend_low_vol_universe",
     "build_universe",
@@ -33,4 +36,5 @@ __all__ = [
     "standardize_price",
     "transform_factor",
     "update_dataset",
+    "update_minute_data",
 ]

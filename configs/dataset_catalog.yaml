@@ -14,6 +14,28 @@ stock_daily:
   numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
   update: {kind: history, target: stock, pool: true}
 
+stock_minute_1m:
+  description: Unadjusted one-minute stock bars downloaded from RQData.
+  source: rqdata
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.stock_minute_1m, requires_dates: true}
+  columns: [symbol, datetime, open, high, low, close, volume, total_turnover]
+  required: [symbol, datetime, close]
+  primary_key: [symbol, datetime]
+  date_column: datetime
+  date_columns: [datetime]
+  numeric_columns: [open, high, low, close, volume, total_turnover]
+
+intraday_volatility_daily:
+  description: Daily volatility of within-day one-minute stock returns.
+  source: generated
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.intraday_volatility_daily, requires_dates: true}
+  columns: [symbol, trade_date, volatility, bar_count, return_count, status]
+  required: [symbol, trade_date]
+  primary_key: [symbol, trade_date]
+  date_column: trade_date
+  date_columns: [trade_date]
+  numeric_columns: [volatility, bar_count, return_count, status]
+
 index_daily:
   description: Daily index prices.
   source: baostock

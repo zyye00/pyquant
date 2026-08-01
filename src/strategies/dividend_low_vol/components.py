@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from pyquant import (
+    MinuteRequest,
     build_dividend_low_vol_universe,
     get_period_end_dates,
     normalize_query_years,
@@ -26,6 +27,17 @@ CONSTITUENT_COLUMNS = [
     "dividend_yield_rank",
     "volatility_rank",
     "weight",
+]
+CANDIDATE_COLUMNS = [
+    "as_of_date",
+    "price_date",
+    "avg_market_cap_240d",
+    "avg_amount_240d",
+    "dividend_yield_ttm",
+    "payout_ratio",
+    "dividend_growth_slope",
+    "avg_dividend_yield_3y",
+    "dividend_yield_rank",
 ]
 INDEX_COLUMNS = [
     "price_return",
@@ -76,6 +88,52 @@ def select_dividend_low_vol_constituents(
     prepared: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
+    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    metrics = select_dividend_low_vol_candidates(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        as_of_date,
+        config,
+        prepared,
+    ).reset_index()
+    selection = config["selection"]
+    price_data = prepared["price"]
+    price_data = price_data[price_data["date"] <= pd.Timestamp(as_of_date)]
+    candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
+    metrics["volatility_240d"] = metrics["symbol"].map(
+        _price_volatility(candidate_price, selection["volatility_lookback_days"])
+    )
+    metrics = metrics.dropna(subset=["volatility_240d"])
+    if len(metrics) < selection["final_n"]:
+        raise ValueError(
+            f"Only {len(metrics)} eligible symbols remain; "
+            f"at least {selection['final_n']} are required"
+        )
+    metrics = metrics.sort_values(
+        ["volatility_240d", "symbol"], ascending=[True, True]
+    ).head(selection["final_n"])
+    metrics["volatility_rank"] = np.arange(1, len(metrics) + 1)
+    weight_total = metrics["avg_dividend_yield_3y"].sum()
+    if not np.isfinite(weight_total) or weight_total <= 0:
+        raise ValueError("Selected dividend yields must sum to a positive value")
+    metrics["weight"] = metrics["avg_dividend_yield_3y"] / weight_total
+    return metrics.set_index("symbol")[CONSTITUENT_COLUMNS]
+
+
+def select_dividend_low_vol_candidates(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    config: dict,
+    prepared: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Select the dividend-ranked candidates before applying a volatility factor."""
     _validate_selection_config(config)
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
@@ -109,28 +167,148 @@ def select_dividend_low_vol_constituents(
         ["avg_dividend_yield_3y", "symbol"], ascending=[False, True]
     ).head(selection["dividend_top_n"])
     metrics["dividend_yield_rank"] = np.arange(1, len(metrics) + 1)
-
-    candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
-    metrics["volatility_240d"] = metrics["symbol"].map(
-        _price_volatility(candidate_price, selection["volatility_lookback_days"])
-    )
-    metrics = metrics.dropna(subset=["volatility_240d"])
-    if len(metrics) < selection["final_n"]:
-        raise ValueError(
-            f"Only {len(metrics)} eligible symbols remain; "
-            f"at least {selection['final_n']} are required"
-        )
-    metrics = metrics.sort_values(
-        ["volatility_240d", "symbol"], ascending=[True, True]
-    ).head(selection["final_n"])
-    metrics["volatility_rank"] = np.arange(1, len(metrics) + 1)
-    weight_total = metrics["avg_dividend_yield_3y"].sum()
-    if not np.isfinite(weight_total) or weight_total <= 0:
-        raise ValueError("Selected dividend yields must sum to a positive value")
-    metrics["weight"] = metrics["avg_dividend_yield_3y"] / weight_total
     metrics["as_of_date"] = as_of_date
     metrics["price_date"] = metrics["date"]
-    return metrics.set_index("symbol")[CONSTITUENT_COLUMNS]
+    return metrics.set_index("symbol")[CANDIDATE_COLUMNS]
+
+
+def build_intraday_minute_requests(
+    symbols: list[str],
+    signal_date: str | pd.Timestamp,
+    trading_dates: pd.Index,
+    *,
+    lookback_trading_days: int = 20,
+    max_candidates: int = 150,
+    retain_raw: bool = True,
+) -> list[MinuteRequest]:
+    """Build one 20-trading-day minute request per ranked candidate."""
+    if lookback_trading_days <= 0 or max_candidates <= 0:
+        raise ValueError("lookback_trading_days and max_candidates must be positive")
+    calendar = pd.DatetimeIndex(pd.to_datetime(trading_dates, errors="raise"))
+    if calendar.hasnans:
+        raise ValueError("trading_dates must not contain invalid values")
+    calendar = calendar.normalize().drop_duplicates().sort_values()
+    signal_date = pd.Timestamp(signal_date).normalize()
+    eligible = calendar[calendar <= signal_date]
+    if signal_date not in calendar:
+        raise ValueError("signal_date must be a trading date")
+    if len(eligible) < lookback_trading_days:
+        raise ValueError("Not enough trading dates for the intraday lookback")
+    symbols = list(dict.fromkeys(map(str, symbols)))[:max_candidates]
+    return [
+        MinuteRequest(
+            symbol,
+            eligible[-lookback_trading_days],
+            eligible[-1],
+            retain_raw,
+        )
+        for symbol in symbols
+    ]
+
+
+def calculate_high_frequency_volatility_factor(
+    daily_volatility: pd.DataFrame,
+    market_cap: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    *,
+    lookback_trading_days: int = 20,
+    min_valid_days: int = 20,
+) -> pd.DataFrame:
+    """Calculate and market-cap-neutralize the report's 20-day intraday factor."""
+    if not 2 <= min_valid_days <= lookback_trading_days:
+        raise ValueError(
+            "min_valid_days must be at least 2 and no larger than the lookback"
+        )
+    _require_columns(
+        daily_volatility,
+        {"symbol", "trade_date", "volatility"},
+        "daily_volatility",
+    )
+    _require_columns(
+        market_cap,
+        {"symbol", "trade_date", "total_market_cap"},
+        "market_cap",
+    )
+    if daily_volatility.duplicated(["symbol", "trade_date"]).any():
+        raise ValueError("daily_volatility contains duplicate symbol-date rows")
+    if market_cap.duplicated(["symbol", "trade_date"]).any():
+        raise ValueError("market_cap contains duplicate symbol-date rows")
+    as_of_date = pd.Timestamp(as_of_date).normalize()
+    volatility = daily_volatility.copy()
+    volatility["trade_date"] = pd.to_datetime(
+        volatility["trade_date"], errors="raise"
+    )
+    volatility["volatility"] = pd.to_numeric(
+        volatility["volatility"], errors="coerce"
+    )
+    caps = market_cap.copy()
+    caps["trade_date"] = pd.to_datetime(caps["trade_date"], errors="raise")
+    caps["total_market_cap"] = pd.to_numeric(
+        caps["total_market_cap"], errors="coerce"
+    )
+    window_dates = (
+        caps.loc[caps["trade_date"].le(as_of_date), "trade_date"]
+        .drop_duplicates()
+        .sort_values()
+        .tail(lookback_trading_days)
+    )
+    if len(window_dates) < lookback_trading_days:
+        raise ValueError("Not enough market-cap trading dates for the factor lookback")
+    volatility = volatility[
+        volatility["trade_date"].isin(window_dates)
+        & volatility["volatility"].gt(0)
+    ].sort_values(["symbol", "trade_date"])
+    rows = []
+    for symbol, history in volatility.groupby("symbol", sort=False):
+        values = history["volatility"].dropna().tail(lookback_trading_days)
+        if len(values) < min_valid_days:
+            continue
+        mean = values.mean()
+        factor = values.std(ddof=1) / mean
+        if np.isfinite(factor) and mean > 0:
+            rows.append((str(symbol), factor))
+    factors = pd.DataFrame(
+        rows,
+        columns=["symbol", "intraday_volatility_cv"],
+    )
+    caps = (
+        caps[
+            caps["trade_date"].le(as_of_date)
+            & caps["total_market_cap"].gt(0)
+        ]
+        .sort_values(["symbol", "trade_date"])
+        .groupby("symbol", sort=False)
+        .tail(1)
+    )
+    factors = factors.merge(
+        caps[["symbol", "total_market_cap"]],
+        on="symbol",
+        how="inner",
+        validate="one_to_one",
+    )
+    if len(factors) < 2:
+        raise ValueError("At least two eligible symbols are required for neutralization")
+    factors["log_market_cap"] = np.log(factors["total_market_cap"])
+    design = np.column_stack(
+        [np.ones(len(factors)), factors["log_market_cap"].to_numpy()]
+    )
+    fitted = design @ np.linalg.lstsq(
+        design,
+        factors["intraday_volatility_cv"].to_numpy(),
+        rcond=None,
+    )[0]
+    factors["minute_return_volatility"] = (
+        factors["intraday_volatility_cv"] - fitted
+    )
+    factors["as_of_date"] = as_of_date
+    return factors.set_index("symbol")[
+        [
+            "as_of_date",
+            "intraday_volatility_cv",
+            "log_market_cap",
+            "minute_return_volatility",
+        ]
+    ].sort_index()
 
 
 def calculate_dividend_low_vol_index(

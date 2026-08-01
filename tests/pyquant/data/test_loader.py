@@ -142,6 +142,40 @@ def test_load_duckdb_dataset_filters_dates_and_normalizes_symbols(
     ]
 
 
+def test_load_minute_dataset_includes_the_full_end_date(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+    with connect_database(database_path) as connection:
+        connection.execute("INSERT INTO ref.security VALUES (1, '600000.SH')")
+        connection.execute(
+            """
+            INSERT INTO core.stock_minute_1m (
+                security_id,
+                datetime,
+                close
+            )
+            VALUES
+                (1, '2024-01-02 09:31:00', 10.0),
+                (1, '2024-01-03 09:31:00', 11.0)
+            """
+        )
+
+    out = load_dataset(
+        "stock_minute_1m",
+        start="2024-01-02",
+        end="2024-01-02",
+        data_root=tmp_path,
+    )
+
+    assert out[["symbol", "datetime", "close"]].to_dict("records") == [
+        {
+            "symbol": "600000.SH",
+            "datetime": pd.Timestamp("2024-01-02 09:31:00"),
+            "close": 10.0,
+        }
+    ]
+
+
 def test_load_duckdb_index_dataset_preserves_index_codes(tmp_path, monkeypatch):
     database_path = tmp_path / "pyquant.duckdb"
     initialize_database(database_path)
