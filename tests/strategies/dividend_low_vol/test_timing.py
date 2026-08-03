@@ -193,6 +193,17 @@ def test_bp_spread_trims_groups_and_generates_six_month_signal():
     pd.testing.assert_frame_equal(constituents, original_constituents)
 
 
+def test_bp_spread_excludes_non_positive_pb():
+    price, constituents = make_spread_inputs()
+    price.loc[price["symbol"].isin(["A", "E"]), "pb_mrq"] = -1.0
+
+    out = calculate_bp_spread(price, constituents, make_config(trim_ratio=0.0))
+
+    assert out.loc["2024-01-31", "constituent_count"] == 3
+    assert out.loc["2024-01-31", "non_constituent_count"] == 3
+    assert out.loc["2024-01-31", "bp_spread"] == pytest.approx(0.0)
+
+
 def test_bp_spread_uses_latest_snapshot_and_latest_valid_monthly_pb():
     price, constituents = make_spread_inputs()
     price = pd.concat(
@@ -284,4 +295,3 @@ def test_strategy_3_config_and_dataset_catalog():
         requires_dates=False,
     )
     assert dataset.primary_key == ("effective_date", "index_code", "symbol")
-

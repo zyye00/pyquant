@@ -48,14 +48,13 @@ def calculate_bp_spread(
     period_ends = get_period_end_dates(price_data["date"])
     valuation_dates = pd.Series(period_ends, index=period_ends.to_period("M"))
     price_data = price_data[
-        np.isfinite(price_data["pb_mrq"]) & price_data["pb_mrq"].ne(0)
+        np.isfinite(price_data["pb_mrq"]) & price_data["pb_mrq"].gt(0)
     ]
     price_data = (
         price_data.sort_values(["date", "symbol"])
         .groupby(["month", "symbol"], as_index=False)
         .tail(1)
     )
-
     snapshots = {
         effective_date: frozenset(snapshot["symbol"])
         for effective_date, snapshot in constituent_data.groupby(
@@ -113,8 +112,6 @@ def calculate_bp_spread(
         out["lower_band"].notna() & out["bp_spread"].lt(out["lower_band"])
     )
     return out[SPREAD_COLUMNS]
-
-
 def backtest_valuation_spread_timing(
     signal: pd.DataFrame,
     benchmark: pd.Series,
