@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import duckdb
 import numpy as np
@@ -32,29 +34,102 @@ MINUTE_TASK_INVALID_CODE = 6
 MINUTE_TASK_QUOTA_STOPPED = 7
 
 
+@dataclass(frozen=True)
+class _EntitySpec:
+    reference_table: str
+    value_column: str
+    id_column: str
+    coverage_table: str
+    daily_fact_table: str
+    normalize: Callable[[object], str]
+    deduplicate_daily: bool = False
+    id_limit: int | None = None
+    id_limit_message: str | None = None
+
+
+_SECURITY_SPEC = _EntitySpec(
+    reference_table="ref.security",
+    value_column="symbol",
+    id_column="security_id",
+    coverage_table="meta.stock_daily_coverage",
+    daily_fact_table="core.stock_daily",
+    normalize=normalize_security_symbol,
+)
+_INDEX_SPEC = _EntitySpec(
+    reference_table="ref.market_index",
+    value_column="index_code",
+    id_column="index_id",
+    coverage_table="meta.index_daily_coverage",
+    daily_fact_table="core.index_daily",
+    normalize=normalize_index_code,
+    deduplicate_daily=True,
+    id_limit=np.iinfo(np.uint16).max,
+    id_limit_message="ref.market_index has exhausted USMALLINT IDs",
+)
+
+
+@contextmanager
+def _transaction(connection: duckdb.DuckDBPyConnection):
+    connection.begin()
+    try:
+        yield
+    except Exception:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+@contextmanager
+def _registered_frame(
+    connection: duckdb.DuckDBPyConnection,
+    name: str,
+    data: pd.DataFrame,
+):
+    connection.register(name, data)
+    try:
+        yield
+    finally:
+        connection.unregister(name)
+
+
+def _ensure_reference_ids(
+    connection: duckdb.DuckDBPyConnection,
+    values: Iterable[object],
+    spec: _EntitySpec,
+) -> dict[str, int]:
+    normalized = sorted({spec.normalize(value) for value in values})
+    if not normalized:
+        return {}
+    existing = dict(
+        connection.execute(
+            f"SELECT {spec.value_column}, {spec.id_column} FROM {spec.reference_table}"
+        ).fetchall()
+    )
+    next_id = connection.execute(
+        f"SELECT COALESCE(MAX({spec.id_column}), 0) + 1 FROM {spec.reference_table}"
+    ).fetchone()[0]
+    rows = []
+    for value in normalized:
+        if value not in existing:
+            if spec.id_limit is not None and next_id > spec.id_limit:
+                raise OverflowError(spec.id_limit_message)
+            existing[value] = next_id
+            rows.append((next_id, value))
+            next_id += 1
+    if rows:
+        connection.executemany(
+            f"INSERT INTO {spec.reference_table} VALUES (?, ?)", rows
+        )
+    return {value: existing[value] for value in normalized}
+
+
 def ensure_securities(
     connection: duckdb.DuckDBPyConnection,
     symbols: Iterable[object],
 ) -> dict[str, int]:
     """Append unseen symbols and return stable symbol-to-ID mappings."""
-    normalized = sorted({normalize_security_symbol(symbol) for symbol in symbols})
-    if not normalized:
-        return {}
-    existing = dict(
-        connection.execute("SELECT symbol, security_id FROM ref.security").fetchall()
-    )
-    next_id = connection.execute(
-        "SELECT COALESCE(MAX(security_id), 0) + 1 FROM ref.security"
-    ).fetchone()[0]
-    rows = []
-    for symbol in normalized:
-        if symbol not in existing:
-            existing[symbol] = next_id
-            rows.append((next_id, symbol))
-            next_id += 1
-    if rows:
-        connection.executemany("INSERT INTO ref.security VALUES (?, ?)", rows)
-    return {symbol: existing[symbol] for symbol in normalized}
+    return _ensure_reference_ids(connection, symbols, _SECURITY_SPEC)
 
 
 def ensure_market_indices(
@@ -62,28 +137,26 @@ def ensure_market_indices(
     index_codes: Iterable[object],
 ) -> dict[str, int]:
     """Append unseen market indices and return stable code-to-ID mappings."""
-    normalized = sorted({normalize_index_code(code) for code in index_codes})
-    if not normalized:
-        return {}
-    existing = dict(
-        connection.execute(
-            "SELECT index_code, index_id FROM ref.market_index"
-        ).fetchall()
-    )
-    next_id = connection.execute(
-        "SELECT COALESCE(MAX(index_id), 0) + 1 FROM ref.market_index"
-    ).fetchone()[0]
-    rows = []
-    for code in normalized:
-        if code not in existing:
-            if next_id > np.iinfo(np.uint16).max:
-                raise OverflowError("ref.market_index has exhausted USMALLINT IDs")
-            existing[code] = next_id
-            rows.append((next_id, code))
-            next_id += 1
-    if rows:
-        connection.executemany("INSERT INTO ref.market_index VALUES (?, ?)", rows)
-    return {code: existing[code] for code in normalized}
+    return _ensure_reference_ids(connection, index_codes, _INDEX_SPEC)
+
+
+def _daily_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    code: str,
+    field_set_id: int,
+    spec: _EntitySpec,
+) -> list[tuple[str, str]]:
+    rows = connection.execute(
+        f"""
+        SELECT CAST(c.start_date AS VARCHAR), CAST(c.end_date AS VARCHAR)
+        FROM {spec.coverage_table} AS c
+        JOIN {spec.reference_table} AS r USING ({spec.id_column})
+        WHERE r.{spec.value_column} = ? AND c.field_set_id = ?
+        ORDER BY c.start_date
+        """,
+        [spec.normalize(code), field_set_id],
+    ).fetchall()
+    return [(start, end) for start, end in rows]
 
 
 def stock_daily_coverage(
@@ -92,18 +165,7 @@ def stock_daily_coverage(
     field_set_id: int = STOCK_DAILY_FIELD_SET_ID,
 ) -> list[tuple[str, str]]:
     """Return completed daily ranges for one source code."""
-    symbol = normalize_security_symbol(code)
-    rows = connection.execute(
-        """
-        SELECT CAST(c.start_date AS VARCHAR), CAST(c.end_date AS VARCHAR)
-        FROM meta.stock_daily_coverage AS c
-        JOIN ref.security AS s USING (security_id)
-        WHERE s.symbol = ? AND c.field_set_id = ?
-        ORDER BY c.start_date
-        """,
-        [symbol, field_set_id],
-    ).fetchall()
-    return [(start, end) for start, end in rows]
+    return _daily_coverage(connection, code, field_set_id, _SECURITY_SPEC)
 
 
 def index_daily_coverage(
@@ -112,17 +174,7 @@ def index_daily_coverage(
     field_set_id: int,
 ) -> list[tuple[str, str]]:
     """Return completed daily ranges for one index and field set."""
-    rows = connection.execute(
-        """
-        SELECT CAST(c.start_date AS VARCHAR), CAST(c.end_date AS VARCHAR)
-        FROM meta.index_daily_coverage AS c
-        JOIN ref.market_index AS i USING (index_id)
-        WHERE i.index_code = ? AND c.field_set_id = ?
-        ORDER BY c.start_date
-        """,
-        [normalize_index_code(index_code), field_set_id],
-    ).fetchall()
-    return [(start, end) for start, end in rows]
+    return _daily_coverage(connection, index_code, field_set_id, _INDEX_SPEC)
 
 
 def dividend_coverage(
@@ -205,8 +257,7 @@ def create_minute_download_task(
     end = pd.Timestamp(end_date).date()
     if start > end:
         raise ValueError("start_date must not be after end_date")
-    connection.begin()
-    try:
+    with _transaction(connection):
         security_id = ensure_securities(connection, [symbol])[symbol]
         existing = connection.execute(
             """
@@ -231,7 +282,6 @@ def create_minute_download_task(
             ],
         ).fetchone()
         if existing is not None:
-            connection.commit()
             return int(existing[0])
         task_id = connection.execute(
             "SELECT COALESCE(MAX(task_id), 0) + 1 FROM meta.minute_download_task"
@@ -251,10 +301,6 @@ def create_minute_download_task(
                 MINUTE_TASK_PENDING,
             ],
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
     return int(task_id)
 
 
@@ -404,10 +450,7 @@ def write_minute_request(
     else:
         task_status = MINUTE_TASK_PARTIAL
 
-    connection.begin()
-    registered_minute = False
-    registered_daily = False
-    try:
+    with _transaction(connection):
         security_id = ensure_securities(connection, [symbol])[symbol]
         if retain_raw:
             connection.execute(
@@ -420,25 +463,26 @@ def write_minute_request(
                 [security_id, start, end + pd.Timedelta(days=1)],
             )
             if not incoming_minute.empty:
-                connection.register("incoming_stock_minute_1m", incoming_minute)
-                registered_minute = True
-                connection.execute(
-                    """
-                    INSERT INTO core.stock_minute_1m
-                    SELECT
-                        ?,
-                        CAST(datetime AS TIMESTAMP),
-                        CAST(open AS FLOAT),
-                        CAST(high AS FLOAT),
-                        CAST(low AS FLOAT),
-                        CAST(close AS FLOAT),
-                        CAST(volume AS DOUBLE),
-                        CAST(total_turnover AS DOUBLE)
-                    FROM incoming_stock_minute_1m
-                    ORDER BY datetime
-                    """,
-                    [security_id],
-                )
+                with _registered_frame(
+                    connection, "incoming_stock_minute_1m", incoming_minute
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO core.stock_minute_1m
+                        SELECT
+                            ?,
+                            CAST(datetime AS TIMESTAMP),
+                            CAST(open AS FLOAT),
+                            CAST(high AS FLOAT),
+                            CAST(low AS FLOAT),
+                            CAST(close AS FLOAT),
+                            CAST(volume AS DOUBLE),
+                            CAST(total_turnover AS DOUBLE)
+                        FROM incoming_stock_minute_1m
+                        ORDER BY datetime
+                        """,
+                        [security_id],
+                    )
         connection.execute(
             """
             DELETE FROM feature.intraday_volatility_daily
@@ -449,75 +493,74 @@ def write_minute_request(
             [security_id, start, end],
         )
         if not incoming_daily.empty:
-            connection.register("incoming_minute_daily", incoming_daily)
-            registered_daily = True
-            feature_columns = {
-                row[1]
-                for row in connection.execute(
-                    "PRAGMA table_info('feature.intraday_volatility_daily')"
-                ).fetchall()
-            }
-            targets = ["security_id", "trade_date", "volatility"]
-            values = [
-                "?",
-                "CAST(trade_date AS DATE)",
-                "CAST(volatility AS FLOAT)",
-            ]
-            legacy = {
-                "vol_daily": "CAST(volatility AS FLOAT)",
-                "bar_count": "CAST(bar_count AS USMALLINT)",
-                "return_count": "CAST(return_count AS USMALLINT)",
-                "is_valid": "TRUE",
-            }
-            for column, expression in legacy.items():
-                if column in feature_columns:
-                    targets.append(column)
-                    values.append(expression)
-            connection.execute(
-                f"""
-                INSERT INTO feature.intraday_volatility_daily (
-                    {", ".join(targets)}
+            with _registered_frame(connection, "incoming_minute_daily", incoming_daily):
+                feature_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info('feature.intraday_volatility_daily')"
+                    ).fetchall()
+                }
+                targets = ["security_id", "trade_date", "volatility"]
+                values = [
+                    "?",
+                    "CAST(trade_date AS DATE)",
+                    "CAST(volatility AS FLOAT)",
+                ]
+                legacy = {
+                    "vol_daily": "CAST(volatility AS FLOAT)",
+                    "bar_count": "CAST(bar_count AS USMALLINT)",
+                    "return_count": "CAST(return_count AS USMALLINT)",
+                    "is_valid": "TRUE",
+                }
+                for column, expression in legacy.items():
+                    if column in feature_columns:
+                        targets.append(column)
+                        values.append(expression)
+                connection.execute(
+                    f"""
+                    INSERT INTO feature.intraday_volatility_daily (
+                        {", ".join(targets)}
+                    )
+                    SELECT
+                        {", ".join(values)}
+                    FROM incoming_minute_daily
+                    WHERE status = ?
+                    """,
+                    [security_id, MINUTE_DAY_VALID],
                 )
-                SELECT
-                    {", ".join(values)}
-                FROM incoming_minute_daily
-                WHERE status = ?
-                """,
-                [security_id, MINUTE_DAY_VALID],
-            )
-            connection.execute(
-                """
-                DELETE FROM meta.minute_day_status
-                WHERE security_id = ?
-                  AND field_set_id = ?
-                  AND trade_date IN (
-                      SELECT CAST(trade_date AS DATE) FROM incoming_minute_daily
-                  )
-                """,
-                [security_id, field_set_id],
-            )
-            connection.execute(
-                """
-                INSERT INTO meta.minute_day_status
-                SELECT
-                    ?,
-                    CAST(trade_date AS DATE),
-                    ?,
-                    CAST(status AS UTINYINT),
-                    CAST(bar_count AS USMALLINT),
-                    CAST(return_count AS USMALLINT),
-                    TRUE,
-                    status IN (?, ?),
-                    now()
-                FROM incoming_minute_daily
-                """,
-                [
-                    security_id,
-                    field_set_id,
-                    MINUTE_DAY_VALID,
-                    MINUTE_DAY_NO_DATA_CONFIRMED,
-                ],
-            )
+                connection.execute(
+                    """
+                    DELETE FROM meta.minute_day_status
+                    WHERE security_id = ?
+                      AND field_set_id = ?
+                      AND trade_date IN (
+                          SELECT CAST(trade_date AS DATE) FROM incoming_minute_daily
+                      )
+                    """,
+                    [security_id, field_set_id],
+                )
+                connection.execute(
+                    """
+                    INSERT INTO meta.minute_day_status
+                    SELECT
+                        ?,
+                        CAST(trade_date AS DATE),
+                        ?,
+                        CAST(status AS UTINYINT),
+                        CAST(bar_count AS USMALLINT),
+                        CAST(return_count AS USMALLINT),
+                        TRUE,
+                        status IN (?, ?),
+                        now()
+                    FROM incoming_minute_daily
+                    """,
+                    [
+                        security_id,
+                        field_set_id,
+                        MINUTE_DAY_VALID,
+                        MINUTE_DAY_NO_DATA_CONFIRMED,
+                    ],
+                )
         changed = connection.execute(
             """
             UPDATE meta.minute_download_task
@@ -541,15 +584,6 @@ def write_minute_request(
         ).fetchone()
         if changed is None:
             raise ValueError(f"Minute task {task_id} does not match {symbol}")
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        if registered_minute:
-            connection.unregister("incoming_stock_minute_1m")
-        if registered_daily:
-            connection.unregister("incoming_minute_daily")
 
 
 def write_minute_request_failure(
@@ -563,8 +597,7 @@ def write_minute_request_failure(
     """Atomically record failed minute days and their terminal task attempt."""
     symbol = normalize_security_symbol(symbol)
     dates = sorted({pd.Timestamp(trade_date).date() for trade_date in trading_dates})
-    connection.begin()
-    try:
+    with _transaction(connection):
         task = connection.execute(
             """
             SELECT t.security_id
@@ -614,10 +647,6 @@ def write_minute_request_failure(
             """,
             [MINUTE_TASK_FAILED, type(error).__name__, str(error), task_id],
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
 
 
 def write_stock_daily_request(
@@ -629,57 +658,18 @@ def write_stock_daily_request(
 ) -> None:
     """Persist one daily source response and its merged coverage atomically."""
     symbol = normalize_security_symbol(code)
-    security_id = ensure_securities(connection, [symbol])[symbol]
     incoming = _prepare_stock_daily(data)
-    connection.begin()
-    try:
-        if not incoming.empty:
-            connection.register("incoming_stock_daily", incoming)
-            connection.execute(
-                """
-                DELETE FROM core.stock_daily
-                WHERE security_id = ?
-                  AND trade_date IN (
-                      SELECT CAST(date AS DATE) FROM incoming_stock_daily
-                  )
-                """,
-                [security_id],
-            )
-            connection.execute(
-                """
-                INSERT INTO core.stock_daily
-                SELECT
-                    ?,
-                    CAST(date AS DATE),
-                    open,
-                    high,
-                    low,
-                    close,
-                    preclose,
-                    volume,
-                    amount,
-                    turn,
-                    peTTM,
-                    pbMRQ,
-                    psTTM,
-                    pcfNcfTTM,
-                    isST
-                FROM incoming_stock_daily
-                """,
-                [security_id],
-            )
-            connection.unregister("incoming_stock_daily")
-        _replace_stock_coverage(
+    with _transaction(connection):
+        security_id = ensure_securities(connection, [symbol])[symbol]
+        _replace_daily_facts(connection, security_id, incoming, _SECURITY_SPEC)
+        _replace_daily_coverage(
             connection,
             security_id,
             start_date,
             end_date,
             STOCK_DAILY_FIELD_SET_ID,
+            _SECURITY_SPEC,
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
 
 
 def write_index_daily_request(
@@ -698,52 +688,12 @@ def write_index_daily_request(
         raise ValueError(f"Unsupported index daily field set: {field_set_id}")
     code = normalize_index_code(index_code)
     incoming = _prepare_index_daily(data)
-    connection.begin()
-    registered = False
-    try:
+    with _transaction(connection):
         index_id = ensure_market_indices(connection, [code])[code]
-        if not incoming.empty:
-            connection.register("incoming_index_daily", incoming)
-            registered = True
-            if field_set_id == BAOSTOCK_INDEX_DAILY_FIELD_SET_ID:
-                connection.execute(
-                    """
-                    DELETE FROM core.index_daily
-                    WHERE index_id = ?
-                      AND trade_date IN (
-                          SELECT CAST(date AS DATE) FROM incoming_index_daily
-                      )
-                    """,
-                    [index_id],
-                )
-                connection.execute(
-                    """
-                    INSERT INTO core.index_daily
-                    SELECT
-                        ?,
-                        CAST(date AS DATE),
-                        open,
-                        high,
-                        low,
-                        close,
-                        preclose,
-                        volume,
-                        amount,
-                        turn,
-                        pe_ttm,
-                        pb_mrq,
-                        ps_ttm,
-                        pcf_ncf_ttm,
-                        is_st
-                    FROM incoming_index_daily
-                    QUALIFY ROW_NUMBER() OVER (
-                        PARTITION BY CAST(date AS DATE)
-                        ORDER BY CAST(date AS DATE)
-                    ) = 1
-                    """,
-                    [index_id],
-                )
-            else:
+        if field_set_id == BAOSTOCK_INDEX_DAILY_FIELD_SET_ID:
+            _replace_daily_facts(connection, index_id, incoming, _INDEX_SPEC)
+        elif not incoming.empty:
+            with _registered_frame(connection, "incoming_index_daily", incoming):
                 connection.execute(
                     """
                     UPDATE core.index_daily AS target
@@ -779,20 +729,14 @@ def write_index_daily_request(
                     """,
                     [index_id, index_id],
                 )
-        _replace_index_coverage(
+        _replace_daily_coverage(
             connection,
             index_id,
             start_date,
             end_date,
             field_set_id,
+            _INDEX_SPEC,
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        if registered:
-            connection.unregister("incoming_index_daily")
 
 
 def write_index_constituents(
@@ -817,9 +761,7 @@ def write_index_constituents(
     if incoming[["effective_date", "symbol"]].isna().any().any():
         raise ValueError("Index constituents must not contain missing keys")
     incoming = incoming.drop_duplicates(["effective_date", "index_code", "symbol"])
-    connection.begin()
-    registered = False
-    try:
+    with _transaction(connection):
         index_id = ensure_market_indices(connection, [code])[code]
         security_ids = ensure_securities(connection, incoming["symbol"])
         incoming["security_id"] = incoming["symbol"].map(security_ids)
@@ -828,26 +770,18 @@ def write_index_constituents(
             [index_id],
         )
         if not incoming.empty:
-            connection.register("incoming_index_constituent", incoming)
-            registered = True
-            connection.execute(
-                """
-                INSERT INTO core.index_constituent
-                SELECT
-                    ?,
-                    CAST(effective_date AS DATE),
-                    security_id
-                FROM incoming_index_constituent
-                """,
-                [index_id],
-            )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        if registered:
-            connection.unregister("incoming_index_constituent")
+            with _registered_frame(connection, "incoming_index_constituent", incoming):
+                connection.execute(
+                    """
+                    INSERT INTO core.index_constituent
+                    SELECT
+                        ?,
+                        CAST(effective_date AS DATE),
+                        security_id
+                    FROM incoming_index_constituent
+                    """,
+                    [index_id],
+                )
 
 
 def write_dividend_request(
@@ -858,7 +792,6 @@ def write_dividend_request(
 ) -> None:
     """Persist one before-tax dividend response and its coverage atomically."""
     symbol = normalize_security_symbol(code)
-    security_id = ensure_securities(connection, [symbol])[symbol]
     incoming = data.loc[
         data["cash_dividend_before_tax"].notna(),
         [
@@ -871,36 +804,35 @@ def write_dividend_request(
     ].copy()
     if incoming["cash_dividend_before_tax"].lt(0).any():
         raise ValueError("cash_dividend_before_tax must not be negative")
-    connection.begin()
-    try:
+    with _transaction(connection):
+        security_id = ensure_securities(connection, [symbol])[symbol]
         if not incoming.empty:
-            connection.register("incoming_dividend", incoming)
-            connection.execute(
-                """
-                INSERT INTO core.dividend
-                SELECT DISTINCT
-                    ?,
-                    CAST(announce_date AS DATE),
-                    CAST(record_date AS DATE),
-                    CAST(operate_date AS DATE),
-                    CAST(payment_date AS DATE),
-                    CAST(cash_dividend_before_tax AS FLOAT)
-                FROM incoming_dividend AS i
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM core.dividend AS d
-                    WHERE d.security_id = ?
-                      AND d.announce_date IS NOT DISTINCT FROM CAST(i.announce_date AS DATE)
-                      AND d.record_date IS NOT DISTINCT FROM CAST(i.record_date AS DATE)
-                      AND d.ex_date IS NOT DISTINCT FROM CAST(i.operate_date AS DATE)
-                      AND d.payment_date IS NOT DISTINCT FROM CAST(i.payment_date AS DATE)
-                      AND d.cash_dividend_before_tax IS NOT DISTINCT FROM
-                          CAST(i.cash_dividend_before_tax AS FLOAT)
+            with _registered_frame(connection, "incoming_dividend", incoming):
+                connection.execute(
+                    """
+                    INSERT INTO core.dividend
+                    SELECT DISTINCT
+                        ?,
+                        CAST(announce_date AS DATE),
+                        CAST(record_date AS DATE),
+                        CAST(operate_date AS DATE),
+                        CAST(payment_date AS DATE),
+                        CAST(cash_dividend_before_tax AS FLOAT)
+                    FROM incoming_dividend AS i
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM core.dividend AS d
+                        WHERE d.security_id = ?
+                          AND d.announce_date IS NOT DISTINCT FROM CAST(i.announce_date AS DATE)
+                          AND d.record_date IS NOT DISTINCT FROM CAST(i.record_date AS DATE)
+                          AND d.ex_date IS NOT DISTINCT FROM CAST(i.operate_date AS DATE)
+                          AND d.payment_date IS NOT DISTINCT FROM CAST(i.payment_date AS DATE)
+                          AND d.cash_dividend_before_tax IS NOT DISTINCT FROM
+                              CAST(i.cash_dividend_before_tax AS FLOAT)
+                    )
+                    """,
+                    [security_id, security_id],
                 )
-                """,
-                [security_id, security_id],
-            )
-            connection.unregister("incoming_dividend")
         connection.execute(
             """
             INSERT OR IGNORE INTO meta.dividend_coverage
@@ -908,10 +840,6 @@ def write_dividend_request(
             """,
             [security_id, year, DIVIDEND_BEFORE_TAX_FIELD_SET_ID],
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
 
 
 def write_share_capital_request(
@@ -923,36 +851,34 @@ def write_share_capital_request(
 ) -> None:
     """Persist one quarterly-share response and its coverage atomically."""
     symbol = normalize_security_symbol(code)
-    security_id = ensure_securities(connection, [symbol])[symbol]
     incoming = _prepare_share_capital(data)
-    connection.begin()
-    try:
+    with _transaction(connection):
+        security_id = ensure_securities(connection, [symbol])[symbol]
         if not incoming.empty:
-            connection.register("incoming_share_capital", incoming)
-            connection.execute(
-                """
-                DELETE FROM core.share_capital_quarterly
-                WHERE security_id = ?
-                  AND report_date IN (
-                      SELECT CAST(report_date AS DATE)
-                      FROM incoming_share_capital
-                  )
-                """,
-                [security_id],
-            )
-            connection.execute(
-                """
-                INSERT INTO core.share_capital_quarterly
-                SELECT DISTINCT
-                    ?,
-                    CAST(report_date AS DATE),
-                    CAST(publish_date AS DATE),
-                    CAST(total_shares AS BIGINT)
-                FROM incoming_share_capital
-                """,
-                [security_id],
-            )
-            connection.unregister("incoming_share_capital")
+            with _registered_frame(connection, "incoming_share_capital", incoming):
+                connection.execute(
+                    """
+                    DELETE FROM core.share_capital_quarterly
+                    WHERE security_id = ?
+                      AND report_date IN (
+                          SELECT CAST(report_date AS DATE)
+                          FROM incoming_share_capital
+                      )
+                    """,
+                    [security_id],
+                )
+                connection.execute(
+                    """
+                    INSERT INTO core.share_capital_quarterly
+                    SELECT DISTINCT
+                        ?,
+                        CAST(report_date AS DATE),
+                        CAST(publish_date AS DATE),
+                        CAST(total_shares AS BIGINT)
+                    FROM incoming_share_capital
+                    """,
+                    [security_id],
+                )
         connection.execute(
             """
             INSERT OR IGNORE INTO meta.share_capital_coverage
@@ -960,71 +886,53 @@ def write_share_capital_request(
             """,
             [security_id, year, quarter],
         )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
+
+
+_DAILY_COLUMNS = [
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "preclose",
+    "volume",
+    "amount",
+    "turn",
+    "pe_ttm",
+    "pb_mrq",
+    "ps_ttm",
+    "pcf_ncf_ttm",
+    "is_st",
+]
+_DAILY_VALUE_COLUMNS = _DAILY_COLUMNS[1:]
+_DAILY_RENAMES = {
+    "peTTM": "pe_ttm",
+    "pbMRQ": "pb_mrq",
+    "psTTM": "ps_ttm",
+    "pcfNcfTTM": "pcf_ncf_ttm",
+    "isST": "is_st",
+}
+
+
+def _prepare_daily(data: pd.DataFrame) -> pd.DataFrame:
+    out = data.rename(columns=_DAILY_RENAMES).copy()
+    for column in _DAILY_COLUMNS:
+        if column not in out:
+            out[column] = pd.NA
+    return out[_DAILY_COLUMNS]
 
 
 def _prepare_stock_daily(data: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "date",
-        "open",
-        "high",
-        "low",
-        "close",
-        "preclose",
-        "volume",
-        "amount",
-        "turn",
-        "peTTM",
-        "pbMRQ",
-        "psTTM",
-        "pcfNcfTTM",
-        "isST",
-    ]
-    out = data.copy()
-    for column in columns:
-        if column not in out:
-            out[column] = pd.NA
-    return out[columns]
+    return _prepare_daily(data)
 
 
 def _prepare_index_daily(data: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "date",
-        "open",
-        "high",
-        "low",
-        "close",
-        "preclose",
-        "volume",
-        "amount",
-        "turn",
-        "pe_ttm",
-        "pb_mrq",
-        "ps_ttm",
-        "pcf_ncf_ttm",
-        "is_st",
-    ]
-    out = data.rename(
-        columns={
-            "peTTM": "pe_ttm",
-            "pbMRQ": "pb_mrq",
-            "psTTM": "ps_ttm",
-            "pcfNcfTTM": "pcf_ncf_ttm",
-            "isST": "is_st",
-        }
-    ).copy()
-    if out.empty:
-        return pd.DataFrame(columns=columns)
-    if "date" not in out:
-        raise ValueError("Index daily data missing required column: date")
-    if "close" not in out:
-        raise ValueError("Index daily data missing required column: close")
-    for column in columns:
-        if column not in out:
-            out[column] = pd.NA
+    if data.empty:
+        return pd.DataFrame(columns=_DAILY_COLUMNS)
+    for column in ["date", "close"]:
+        if column not in data:
+            raise ValueError(f"Index daily data missing required column: {column}")
+    out = _prepare_daily(data)
     out["date"] = pd.to_datetime(out["date"], errors="raise")
     if out["date"].isna().any():
         raise ValueError("Index daily dates must not be missing")
@@ -1032,7 +940,7 @@ def _prepare_index_daily(data: pd.DataFrame) -> pd.DataFrame:
     if out["close"].isna().any():
         raise ValueError("Index daily close values must not be missing")
     return (
-        out[columns]
+        out[_DAILY_COLUMNS]
         .drop_duplicates("date", keep="last")
         .sort_values("date")
         .reset_index(drop=True)
@@ -1052,69 +960,80 @@ def _prepare_share_capital(data: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["report_date"])
 
 
-def _replace_stock_coverage(
+def _replace_daily_facts(
     connection: duckdb.DuckDBPyConnection,
-    security_id: int,
+    entity_id: int,
+    incoming: pd.DataFrame,
+    spec: _EntitySpec,
+) -> None:
+    if incoming.empty:
+        return
+    with _registered_frame(connection, "incoming_daily", incoming):
+        connection.execute(
+            f"""
+            DELETE FROM {spec.daily_fact_table}
+            WHERE {spec.id_column} = ?
+              AND trade_date IN (
+                  SELECT CAST(date AS DATE) FROM incoming_daily
+              )
+            """,
+            [entity_id],
+        )
+        deduplication = (
+            """
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY CAST(date AS DATE)
+                ORDER BY CAST(date AS DATE)
+            ) = 1
+            """
+            if spec.deduplicate_daily
+            else ""
+        )
+        connection.execute(
+            f"""
+            INSERT INTO {spec.daily_fact_table}
+            SELECT
+                ?,
+                CAST(date AS DATE),
+                {", ".join(_DAILY_VALUE_COLUMNS)}
+            FROM incoming_daily
+            {deduplication}
+            """,
+            [entity_id],
+        )
+
+
+def _replace_daily_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    entity_id: int,
     start_date: str,
     end_date: str,
     field_set_id: int,
+    spec: _EntitySpec,
 ) -> None:
     rows = connection.execute(
-        """
+        f"""
         SELECT start_date, end_date
-        FROM meta.stock_daily_coverage
-        WHERE security_id = ? AND field_set_id = ?
+        FROM {spec.coverage_table}
+        WHERE {spec.id_column} = ? AND field_set_id = ?
         ORDER BY start_date
         """,
-        [security_id, field_set_id],
+        [entity_id, field_set_id],
     ).fetchall()
     rows.append((pd.Timestamp(start_date).date(), pd.Timestamp(end_date).date()))
     merged = _merge_date_ranges(rows)
     connection.execute(
-        """
-        DELETE FROM meta.stock_daily_coverage
-        WHERE security_id = ? AND field_set_id = ?
+        f"""
+        DELETE FROM {spec.coverage_table}
+        WHERE {spec.id_column} = ? AND field_set_id = ?
         """,
-        [security_id, field_set_id],
+        [entity_id, field_set_id],
     )
     connection.executemany(
-        "INSERT INTO meta.stock_daily_coverage VALUES (?, ?, ?, ?)",
+        f"INSERT INTO {spec.coverage_table} VALUES (?, ?, ?, ?)",
         [
-            (security_id, range_start, range_end, field_set_id)
+            (entity_id, range_start, range_end, field_set_id)
             for range_start, range_end in merged
-        ],
-    )
-
-
-def _replace_index_coverage(
-    connection: duckdb.DuckDBPyConnection,
-    index_id: int,
-    start_date: str,
-    end_date: str,
-    field_set_id: int,
-) -> None:
-    rows = connection.execute(
-        """
-        SELECT start_date, end_date
-        FROM meta.index_daily_coverage
-        WHERE index_id = ? AND field_set_id = ?
-        ORDER BY start_date
-        """,
-        [index_id, field_set_id],
-    ).fetchall()
-    rows.append((pd.Timestamp(start_date).date(), pd.Timestamp(end_date).date()))
-    connection.execute(
-        """
-        DELETE FROM meta.index_daily_coverage
-        WHERE index_id = ? AND field_set_id = ?
-        """,
-        [index_id, field_set_id],
-    )
-    connection.executemany(
-        "INSERT INTO meta.index_daily_coverage VALUES (?, ?, ?, ?)",
-        [
-            (index_id, range_start, range_end, field_set_id)
-            for range_start, range_end in _merge_date_ranges(rows)
         ],
     )
 

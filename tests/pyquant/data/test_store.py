@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+from pyquant.data import store as store_module
 from pyquant.data.duckdb import (
     connect_database,
     initialize_database,
@@ -13,11 +14,14 @@ from pyquant.data.store import (
     create_minute_download_task,
     ensure_market_indices,
     ensure_securities,
+    index_daily_coverage,
+    stock_daily_coverage,
     write_dividend_request,
     write_index_constituents,
     write_index_daily_request,
     write_minute_request,
     write_share_capital_request,
+    write_stock_daily_request,
 )
 
 
@@ -96,6 +100,104 @@ def test_index_ids_are_stable_and_field_set_coverage_isolated(tmp_path):
     assert second["sh.000300"] == first["sh.000300"]
     assert second["H20269"] > max(first.values())
     assert coverage == [("H30269", 2), ("sh.000300", 1)]
+
+
+def test_daily_coverage_merges_adjacent_stock_and_index_ranges(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            make_stock_daily().iloc[:1],
+            "2024-01-02",
+            "2024-01-03",
+        )
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            pd.DataFrame(),
+            "2024-01-04",
+            "2024-01-05",
+        )
+        write_index_daily_request(
+            connection,
+            "H30269",
+            make_stock_daily().iloc[:1],
+            "2024-01-02",
+            "2024-01-03",
+            BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
+        )
+        write_index_daily_request(
+            connection,
+            "H30269",
+            pd.DataFrame(),
+            "2024-01-04",
+            "2024-01-05",
+            BAOSTOCK_INDEX_DAILY_FIELD_SET_ID,
+        )
+
+        stock_coverage = stock_daily_coverage(connection, "sh.600000")
+        index_coverage = index_daily_coverage(
+            connection, "H30269", BAOSTOCK_INDEX_DAILY_FIELD_SET_ID
+        )
+
+    assert stock_coverage == [("2024-01-02", "2024-01-05")]
+    assert index_coverage == [("2024-01-02", "2024-01-05")]
+
+
+def test_stock_daily_write_preserves_standardized_fact_fields(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            make_stock_daily().iloc[:1],
+            "2024-01-02",
+            "2024-01-02",
+        )
+        row = connection.execute(
+            """
+            SELECT open, close, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st
+            FROM api.stock_daily
+            """
+        ).fetchone()
+
+    assert row[:6] == pytest.approx((10.0, 10.5, 8.0, 1.0, 2.0, 3.0))
+    assert row[6] is False
+
+
+def test_stock_daily_write_rolls_back_reference_and_fact_on_failure(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+
+    def fail_coverage(*args):
+        raise RuntimeError("coverage write failed")
+
+    monkeypatch.setattr(store_module, "_replace_daily_coverage", fail_coverage)
+    with connect_database(database_path) as connection:
+        with pytest.raises(RuntimeError, match="coverage write failed"):
+            write_stock_daily_request(
+                connection,
+                "sh.600000",
+                make_stock_daily().iloc[:1],
+                "2024-01-02",
+                "2024-01-02",
+            )
+        reference_count = connection.execute(
+            "SELECT COUNT(*) FROM ref.security"
+        ).fetchone()[0]
+        fact_count = connection.execute(
+            "SELECT COUNT(*) FROM core.stock_daily"
+        ).fetchone()[0]
+
+    assert reference_count == 0
+    assert fact_count == 0
 
 
 def test_index_constituents_are_replaced_and_exposed_as_standard_symbols(tmp_path):
