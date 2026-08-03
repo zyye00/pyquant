@@ -2,15 +2,14 @@
 
 import numpy as np
 import pandas as pd
-from typing import Optional
 
 
 def calc_metrics(
     returns: pd.Series,
-    benchmark_returns: Optional[pd.Series] = None,
+    benchmark_returns: pd.Series | None = None,
     periods_per_year: int = 252,
 ) -> dict:
-    """计算年化收益、波动、夏普、最大回撤等基础指标。"""
+    """Calculate annualized return, volatility, Sharpe ratio, and drawdown."""
     r = returns.dropna().astype(float)
     if r.empty:
         raise ValueError("returns is empty")
@@ -29,7 +28,9 @@ def calc_metrics(
     }
 
     if benchmark_returns is not None:
-        aligned_r, aligned_b = r.align(benchmark_returns.dropna().astype(float), join="inner")
+        aligned_r, aligned_b = r.align(
+            benchmark_returns.dropna().astype(float), join="inner"
+        )
         active = aligned_r - aligned_b
         result["excess_return"] = float(active.mean() * periods_per_year)
         result["tracking_error"] = float(active.std(ddof=0) * np.sqrt(periods_per_year))

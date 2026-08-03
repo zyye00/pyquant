@@ -33,11 +33,13 @@ def test_strategy_1_notebooks_split_downloads_from_calculation():
 
 
 def test_strategy_3_notebook_and_download_entry_are_separated():
-    notebooks = load_notebooks("download.ipynb", "strategy_3_valuation_spread_timing.ipynb")
+    notebooks = load_notebooks(
+        "download.ipynb", "strategy_3_valuation_spread_timing.ipynb"
+    )
 
     download_notebook = str(notebooks["download.ipynb"])
     strategy_notebook = str(notebooks["strategy_3_valuation_spread_timing.ipynb"])
-    assert "'index_constituents'" in download_notebook
+    assert "index_constituents" in download_notebook
     assert "constituent_job.wait()" in download_notebook
     assert "conda run" not in download_notebook
     assert "subprocess" not in download_notebook

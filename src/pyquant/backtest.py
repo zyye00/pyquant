@@ -56,9 +56,7 @@ def run_backtest(
                 "Missing or non-positive prices for held symbols; "
                 f"examples: {invalid[:5]}"
             )
-        normalized_shares = held_weights[held_symbols].div(
-            interval_prices.loc[start]
-        )
+        normalized_shares = held_weights[held_symbols].div(interval_prices.loc[start])
         end_positions = interval_prices.loc[end].mul(normalized_shares)
         dividend_cash = _interval_cash(
             cash_data,
@@ -139,9 +137,7 @@ def _prepare_cash_events(cash_events: pd.DataFrame | None) -> pd.DataFrame:
     out = cash_events.loc[:, columns].copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["symbol"] = out["symbol"].astype(str)
-    out["cash_per_share"] = pd.to_numeric(
-        out["cash_per_share"], errors="coerce"
-    )
+    out["cash_per_share"] = pd.to_numeric(out["cash_per_share"], errors="coerce")
     if out[["date", "symbol", "cash_per_share"]].isna().any().any():
         raise ValueError("cash_events must not contain invalid values")
     if out["cash_per_share"].lt(0).any():
@@ -162,8 +158,5 @@ def _interval_cash(
         & cash_events["cash_per_share"].gt(0)
     ]
     return float(
-        events["symbol"]
-        .map(normalized_shares)
-        .mul(events["cash_per_share"])
-        .sum()
+        events["symbol"].map(normalized_shares).mul(events["cash_per_share"]).sum()
     )

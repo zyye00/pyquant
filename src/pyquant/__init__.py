@@ -15,12 +15,14 @@ from pyquant.io import ensure_dir, save_output
 from pyquant.metrics import calc_metrics
 from pyquant.transforms import transform_factor
 from pyquant.universe import (
+    DIVIDEND_AFTER_TAX_RATIO,
     build_dividend_low_vol_universe,
     build_universe,
     prepare_dividend_low_vol_universe_inputs,
 )
 
 __all__ = [
+    "DIVIDEND_AFTER_TAX_RATIO",
     "MinuteRequest",
     "UpdateJob",
     "build_dividend_low_vol_universe",

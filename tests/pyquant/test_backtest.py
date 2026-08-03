@@ -57,9 +57,7 @@ def test_run_backtest_keeps_cash_distributions_until_rebalance():
 
     assert out.loc["2024-02-29", "dividend_cash"] == pytest.approx(0.1)
     assert out.loc["2024-02-29", "turnover"] == pytest.approx(1.0 / 11.0)
-    assert out.loc["2024-02-29", "transaction_cost"] == pytest.approx(
-        1.0 / 11_000.0
-    )
+    assert out.loc["2024-02-29", "transaction_cost"] == pytest.approx(1.0 / 11_000.0)
 
 
 def test_run_backtest_rejects_invalid_target_weights():

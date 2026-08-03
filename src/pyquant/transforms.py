@@ -1,15 +1,14 @@
 """Common factor transforms."""
 
 import pandas as pd
-from typing import Optional
 
 
 def transform_factor(
     factor: pd.Series,
-    winsor_n: Optional[float] = 3.0,
+    winsor_n: float | None = 3.0,
     zscore: bool = True,
 ) -> pd.Series:
-    """按日期做横截面去极值和标准化，输入输出索引保持一致。"""
+    """Winsorize and standardize a factor cross-section by date."""
     if not isinstance(factor.index, pd.MultiIndex) or factor.index.nlevels < 2:
         raise ValueError("factor must use a MultiIndex with date and symbol levels")
 

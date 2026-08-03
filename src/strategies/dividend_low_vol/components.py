@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from pyquant import (
+    DIVIDEND_AFTER_TAX_RATIO,
     MinuteRequest,
     build_dividend_low_vol_universe,
     get_period_end_dates,
@@ -11,7 +12,6 @@ from pyquant import (
     prepare_dividend_low_vol_universe_inputs,
     run_backtest,
 )
-from pyquant.universe import DIVIDEND_AFTER_TAX_RATIO
 
 
 CONSTITUENT_COLUMNS = [
@@ -235,17 +235,11 @@ def calculate_high_frequency_volatility_factor(
         raise ValueError("market_cap contains duplicate symbol-date rows")
     as_of_date = pd.Timestamp(as_of_date).normalize()
     volatility = daily_volatility.copy()
-    volatility["trade_date"] = pd.to_datetime(
-        volatility["trade_date"], errors="raise"
-    )
-    volatility["volatility"] = pd.to_numeric(
-        volatility["volatility"], errors="coerce"
-    )
+    volatility["trade_date"] = pd.to_datetime(volatility["trade_date"], errors="raise")
+    volatility["volatility"] = pd.to_numeric(volatility["volatility"], errors="coerce")
     caps = market_cap.copy()
     caps["trade_date"] = pd.to_datetime(caps["trade_date"], errors="raise")
-    caps["total_market_cap"] = pd.to_numeric(
-        caps["total_market_cap"], errors="coerce"
-    )
+    caps["total_market_cap"] = pd.to_numeric(caps["total_market_cap"], errors="coerce")
     window_dates = (
         caps.loc[caps["trade_date"].le(as_of_date), "trade_date"]
         .drop_duplicates()
@@ -255,8 +249,7 @@ def calculate_high_frequency_volatility_factor(
     if len(window_dates) < lookback_trading_days:
         raise ValueError("Not enough market-cap trading dates for the factor lookback")
     volatility = volatility[
-        volatility["trade_date"].isin(window_dates)
-        & volatility["volatility"].gt(0)
+        volatility["trade_date"].isin(window_dates) & volatility["volatility"].gt(0)
     ].sort_values(["symbol", "trade_date"])
     rows = []
     for symbol, history in volatility.groupby("symbol", sort=False):
@@ -272,10 +265,7 @@ def calculate_high_frequency_volatility_factor(
         columns=["symbol", "intraday_volatility_cv"],
     )
     caps = (
-        caps[
-            caps["trade_date"].le(as_of_date)
-            & caps["total_market_cap"].gt(0)
-        ]
+        caps[caps["trade_date"].le(as_of_date) & caps["total_market_cap"].gt(0)]
         .sort_values(["symbol", "trade_date"])
         .groupby("symbol", sort=False)
         .tail(1)
@@ -287,19 +277,22 @@ def calculate_high_frequency_volatility_factor(
         validate="one_to_one",
     )
     if len(factors) < 2:
-        raise ValueError("At least two eligible symbols are required for neutralization")
+        raise ValueError(
+            "At least two eligible symbols are required for neutralization"
+        )
     factors["log_market_cap"] = np.log(factors["total_market_cap"])
     design = np.column_stack(
         [np.ones(len(factors)), factors["log_market_cap"].to_numpy()]
     )
-    fitted = design @ np.linalg.lstsq(
-        design,
-        factors["intraday_volatility_cv"].to_numpy(),
-        rcond=None,
-    )[0]
-    factors["minute_return_volatility"] = (
-        factors["intraday_volatility_cv"] - fitted
+    fitted = (
+        design
+        @ np.linalg.lstsq(
+            design,
+            factors["intraday_volatility_cv"].to_numpy(),
+            rcond=None,
+        )[0]
     )
+    factors["minute_return_volatility"] = factors["intraday_volatility_cv"] - fitted
     factors["as_of_date"] = as_of_date
     return factors.set_index("symbol")[
         [

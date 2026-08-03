@@ -91,7 +91,9 @@ def query_stock_minute_1m(
             market=_MINUTE["market"],
         )
     except Exception as exc:
-        raise RuntimeError(f"RQData minute request failed for {rq_symbol}: {exc}") from exc
+        raise RuntimeError(
+            f"RQData minute request failed for {rq_symbol}: {exc}"
+        ) from exc
     return extract_minute_prices(data, symbol)
 
 

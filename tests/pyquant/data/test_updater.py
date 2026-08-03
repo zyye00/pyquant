@@ -1082,9 +1082,7 @@ def test_minute_planner_merges_by_trading_day_and_subtracts_completed():
         MinuteRequest("600000.SH", date(2024, 1, 5), date(2024, 1, 9)),
         MinuteRequest("600000.SH", date(2024, 1, 8), date(2024, 1, 10)),
     ]
-    calendar = pd.to_datetime(
-        ["2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10"]
-    )
+    calendar = pd.to_datetime(["2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10"])
 
     out = plan_missing_minute_requests(
         requests,
@@ -1118,9 +1116,18 @@ class FakeMinuteRQData:
         for trade_date in pd.bdate_range(kwargs["start_date"], kwargs["end_date"]):
             rows.extend(
                 [
-                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=31)),
-                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=32)),
-                    (kwargs["order_book_ids"], trade_date + pd.Timedelta(hours=9, minutes=33)),
+                    (
+                        kwargs["order_book_ids"],
+                        trade_date + pd.Timedelta(hours=9, minutes=31),
+                    ),
+                    (
+                        kwargs["order_book_ids"],
+                        trade_date + pd.Timedelta(hours=9, minutes=32),
+                    ),
+                    (
+                        kwargs["order_book_ids"],
+                        trade_date + pd.Timedelta(hours=9, minutes=33),
+                    ),
                 ]
             )
         index = pd.MultiIndex.from_tuples(

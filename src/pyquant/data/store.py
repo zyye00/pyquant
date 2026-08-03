@@ -383,18 +383,21 @@ def write_minute_request(
     end = pd.Timestamp(end_date).normalize()
     if start > end:
         raise ValueError("start_date must not be after end_date")
-    if not daily["status"].isin(
-        [MINUTE_DAY_VALID, MINUTE_DAY_NO_DATA_CONFIRMED, MINUTE_DAY_INCOMPLETE]
-    ).all():
+    if (
+        not daily["status"]
+        .isin([MINUTE_DAY_VALID, MINUTE_DAY_NO_DATA_CONFIRMED, MINUTE_DAY_INCOMPLETE])
+        .all()
+    ):
         raise ValueError("daily data contains unsupported minute-day statuses")
     incoming_minute = minute.drop(columns="symbol").copy()
     incoming_daily = daily.drop(columns="symbol").copy()
     terminal = incoming_daily["status"].isin(
         [MINUTE_DAY_VALID, MINUTE_DAY_NO_DATA_CONFIRMED]
     )
-    if terminal.all() and incoming_daily["status"].eq(
-        MINUTE_DAY_NO_DATA_CONFIRMED
-    ).all():
+    if (
+        terminal.all()
+        and incoming_daily["status"].eq(MINUTE_DAY_NO_DATA_CONFIRMED).all()
+    ):
         task_status = MINUTE_TASK_NO_DATA
     elif terminal.all():
         task_status = MINUTE_TASK_SUCCESS
@@ -559,12 +562,7 @@ def write_minute_request_failure(
 ) -> None:
     """Atomically record failed minute days and their terminal task attempt."""
     symbol = normalize_security_symbol(symbol)
-    dates = sorted(
-        {
-            pd.Timestamp(trade_date).date()
-            for trade_date in trading_dates
-        }
-    )
+    dates = sorted({pd.Timestamp(trade_date).date() for trade_date in trading_dates})
     connection.begin()
     try:
         task = connection.execute(
@@ -587,10 +585,7 @@ def write_minute_request_failure(
                   AND trade_date = ?
                   AND field_set_id = ?
                 """,
-                [
-                    (security_id, trade_date, field_set_id)
-                    for trade_date in dates
-                ],
+                [(security_id, trade_date, field_set_id) for trade_date in dates],
             )
             connection.executemany(
                 """

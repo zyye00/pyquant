@@ -1,7 +1,6 @@
 """Universe construction helpers."""
 
 from math import floor
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -14,11 +13,11 @@ DIVIDEND_AFTER_TAX_RATIO = 0.9
 
 def build_universe(
     price: pd.DataFrame,
-    symbols: Optional[list[str]] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    symbols: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> pd.DataFrame:
-    """从标准行情长表生成逐日股票池。"""
+    """Build a daily universe from standardized long-format price data."""
     required = {"date", "symbol"}
     missing = required - set(price.columns)
     if missing:

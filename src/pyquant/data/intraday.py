@@ -73,9 +73,9 @@ def normalize_minute_bars(
     out[["open", "high", "low", "close"]] = out[
         ["open", "high", "low", "close"]
     ].astype("float32")
-    out[["volume", "total_turnover"]] = out[
-        ["volume", "total_turnover"]
-    ].astype("float64")
+    out[["volume", "total_turnover"]] = out[["volume", "total_turnover"]].astype(
+        "float64"
+    )
     return out.sort_values("datetime").reset_index(drop=True)
 
 
@@ -115,9 +115,9 @@ def calculate_daily_intraday_volatility(
     out["trade_date"] = out["datetime"].dt.normalize()
     if not out["trade_date"].isin(dates).all():
         raise ValueError("Minute bars contain dates outside the trading calendar")
-    out["minute_return"] = out.groupby(
-        ["symbol", "trade_date"], sort=False
-    )["close"].pct_change(fill_method=None)
+    out["minute_return"] = out.groupby(["symbol", "trade_date"], sort=False)[
+        "close"
+    ].pct_change(fill_method=None)
     grouped = out.groupby("trade_date", sort=False)
     daily = pd.DataFrame(
         {

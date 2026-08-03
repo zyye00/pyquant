@@ -21,9 +21,7 @@ calculate_monthly_rebalanced_index = (
 select_constituents = COMPONENTS.select_dividend_low_vol_constituents
 select_download_symbols = COMPONENTS.select_dividend_low_vol_download_symbols
 build_minute_requests = COMPONENTS.build_intraday_minute_requests
-calculate_high_frequency_factor = (
-    COMPONENTS.calculate_high_frequency_volatility_factor
-)
+calculate_high_frequency_factor = COMPONENTS.calculate_high_frequency_volatility_factor
 
 
 def make_config(

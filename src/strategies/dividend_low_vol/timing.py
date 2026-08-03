@@ -104,14 +104,15 @@ def calculate_bp_spread(
 
     out = pd.DataFrame(rows).set_index("date")
     rolling = out["bp_spread"].rolling(strategy["band_window_months"])
-    out["lower_band"] = (
-        rolling.mean()
-        - strategy["band_std_multiplier"] * rolling.std(ddof=0)
+    out["lower_band"] = rolling.mean() - strategy["band_std_multiplier"] * rolling.std(
+        ddof=0
     )
-    out["bearish_signal"] = (
-        out["lower_band"].notna() & out["bp_spread"].lt(out["lower_band"])
+    out["bearish_signal"] = out["lower_band"].notna() & out["bp_spread"].lt(
+        out["lower_band"]
     )
     return out[SPREAD_COLUMNS]
+
+
 def backtest_valuation_spread_timing(
     signal: pd.DataFrame,
     benchmark: pd.Series,
@@ -269,9 +270,7 @@ def _trimmed_mean(
     trim_count = int(np.floor(len(values) * trim_ratio))
     trimmed = values.iloc[trim_count : len(values) - trim_count or None]
     if trimmed.empty:
-        raise ValueError(
-            f"No {group_name} BP values remain at {valuation_date.date()}"
-        )
+        raise ValueError(f"No {group_name} BP values remain at {valuation_date.date()}")
     return float(trimmed["bp"].mean()), len(trimmed)
 
 
