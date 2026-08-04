@@ -6,8 +6,10 @@ from pyquant.data.sources.rqdata import (
     extract_changed_snapshots,
     project_symbol_to_rqdata,
     query_rqdata_quota_remaining,
+    query_rqdata_stock_symbols,
     query_rqdata_trading_dates,
     query_stock_minute_1m,
+    query_stock_pb_daily,
 )
 
 
@@ -64,6 +66,45 @@ class FakeRQData:
             index=index,
         )
 
+    def get_factor(self, order_book_ids, factors, **kwargs):
+        self.calls.append(("factor", order_book_ids, factors, kwargs))
+        index = pd.MultiIndex.from_tuples(
+            [(order_book_ids[0], pd.Timestamp("2024-01-02"))],
+            names=["order_book_id", "date"],
+        )
+        return pd.DataFrame(
+            {factor: [float(position + 1)] for position, factor in enumerate(factors)},
+            index=index,
+        )
+
+    def all_instruments(self, type, market):
+        self.calls.append(("instruments", type, market))
+        return pd.DataFrame(
+            {
+                "order_book_id": [
+                    "600000.XSHG",
+                    "000001.XSHE",
+                    "000002.XSHE",
+                    "000003.XSHE",
+                    "000004.XSHE",
+                ],
+                "listed_date": [
+                    "2010-01-01",
+                    "2010-01-01",
+                    "2018-01-01",
+                    "2020-01-01",
+                    "2010-01-01",
+                ],
+                "de_listed_date": [
+                    "0000-00-00",
+                    "2018-06-01",
+                    "0000-00-00",
+                    "0000-00-00",
+                    "2016-12-31",
+                ],
+            }
+        )
+
 
 def test_minute_query_uses_unadjusted_skip_suspended_contract():
     client = FakeRQData()
@@ -89,6 +130,58 @@ def test_minute_query_uses_unadjusted_skip_suspended_contract():
         "volume",
         "total_turnover",
     ]
+
+
+def test_pb_query_requests_all_configured_factor_conventions():
+    client = FakeRQData()
+
+    out = query_stock_pb_daily(
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-02",
+        client=client,
+    )
+
+    _, symbols, factors, arguments = client.calls[-1]
+    assert symbols == ["600000.XSHG"]
+    assert factors == [
+        "pb_ratio_lf",
+        "pb_ratio_lyr",
+        "pb_ratio_ttm",
+        "pb_ratio_1_lf",
+        "pb_ratio_1_lyr",
+        "pb_ratio_1_ttm",
+    ]
+    assert arguments == {
+        "start_date": "2024-01-02",
+        "end_date": "2024-01-02",
+        "expect_df": True,
+        "market": "cn",
+    }
+    assert out.columns.tolist() == [
+        "date",
+        "symbol",
+        "pb_ratio_lf",
+        "pb_ratio_lyr",
+        "pb_ratio_ttm",
+        "pb_ratio_1_lf",
+        "pb_ratio_1_lyr",
+        "pb_ratio_1_ttm",
+    ]
+    assert out.loc[0, "symbol"] == "600000.SH"
+
+
+def test_stock_symbols_cover_historical_interval_and_exclude_non_overlapping_rows():
+    client = FakeRQData()
+
+    symbols = query_rqdata_stock_symbols(
+        "2017-01-01",
+        "2019-01-01",
+        client=client,
+    )
+
+    assert symbols == ["000001.SZ", "000002.SZ", "600000.SH"]
+    assert client.calls[-1] == ("instruments", "CS", "cn")
 
 
 def test_calendar_and_quota_are_normalized():

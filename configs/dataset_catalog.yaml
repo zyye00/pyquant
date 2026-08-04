@@ -6,13 +6,25 @@ stock_daily:
     path: data/pyquant.duckdb
     relation: api.stock_daily
     requires_dates: true
-  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st]
   required: [date, symbol, close, amount, pe_ttm]
   primary_key: [date, symbol]
   date_column: date
   date_columns: [date]
-  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm]
   update: {kind: history, target: stock, pool: true}
+
+stock_pb_daily:
+  description: Daily PB factors from RQData in all supported accounting conventions.
+  source: rqdata
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.stock_pb_daily, requires_dates: true}
+  columns: [date, symbol, pb_ratio_lf, pb_ratio_lyr, pb_ratio_ttm, pb_ratio_1_lf, pb_ratio_1_lyr, pb_ratio_1_ttm]
+  required: [date, symbol]
+  primary_key: [date, symbol]
+  date_column: date
+  date_columns: [date]
+  numeric_columns: [pb_ratio_lf, pb_ratio_lyr, pb_ratio_ttm, pb_ratio_1_lf, pb_ratio_1_lyr, pb_ratio_1_ttm]
+  update: {kind: stock_pb, pool: true}
 
 stock_minute_1m:
   description: Unadjusted one-minute stock bars downloaded from RQData.
@@ -45,12 +57,12 @@ index_daily:
     relation: api.index_daily
     requires_dates: true
     normalize_symbols: false
-  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
+  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st]
   required: [date, symbol, close]
   primary_key: [date, symbol]
   date_column: date
   date_columns: [date]
-  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
+  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm]
   update: {kind: history, target: index, pool: false}
 
 csindex_daily:

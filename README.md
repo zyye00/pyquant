@@ -42,6 +42,7 @@ notebooks/dividend_low_vol/
 
 ```text
 stock_daily
+stock_pb_daily
 index_daily
 csindex_daily
 index_constituents
@@ -74,6 +75,11 @@ price = load_dataset(
     start="2023-01-01",
     end="2024-12-31",
 )
+pb = load_dataset(
+    "stock_pb_daily",
+    start="2023-01-01",
+    end="2024-12-31",
+)
 dividends = load_dataset("dividend")
 dividend_queries = load_dataset("dividend_queries")
 shares = load_dataset("stock_profit_quarterly")
@@ -95,6 +101,13 @@ job = update_dataset(
     start="2024-01-02",
     end="2024-01-03",
     pool="all",
+)
+
+pb_job = update_dataset(
+    "stock_pb_daily",
+    start="2023-01-01",
+    end="2024-12-31",
+    pool=["600000.SH", "000001.SZ"],
 )
 ```
 

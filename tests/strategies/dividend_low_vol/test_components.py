@@ -631,6 +631,16 @@ def test_strategy_config_contains_original_index_parameters_only():
     }
 
 
+def test_strategy_config_defines_component_output_columns():
+    with STRATEGY_CONFIG.open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+
+    assert config["output_columns"]["constituent"] == COMPONENTS.CONSTITUENT_COLUMNS
+    assert config["output_columns"]["candidate"] == COMPONENTS.CANDIDATE_COLUMNS
+    assert config["output_columns"]["index"] == COMPONENTS.INDEX_COLUMNS
+    assert config["output_columns"]["monthly_index"] == COMPONENTS.MONTHLY_INDEX_COLUMNS
+
+
 def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
     symbols = [f"S{index:03d}" for index in range(3)]
     dates = pd.bdate_range("2024-01-02", periods=45)

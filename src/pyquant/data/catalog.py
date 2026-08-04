@@ -18,6 +18,7 @@ KNOWN_UPDATE_KINDS = {
     "history",
     "index_constituents",
     "profit_quarterly",
+    "stock_pb",
 }
 
 
@@ -118,7 +119,7 @@ def _update_from_mapping(
     allowed = {
         "akshare": {"csindex_history"},
         "baostock": {"dividend", "history", "profit_quarterly"},
-        "rqdata": {"index_constituents"},
+        "rqdata": {"index_constituents", "stock_pb"},
     }
     if kind not in allowed[source]:
         raise ValueError(

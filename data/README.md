@@ -30,10 +30,22 @@
 | `volume` | `BIGINT` | 成交量 |
 | `amount` | `DOUBLE` | 成交额，单位为元 |
 | `turn` | `FLOAT` | 换手率 |
-| `pe_ttm`、`pb_mrq`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | 估值字段 |
+| `pe_ttm`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | BaoStock 日行情估值字段 |
 | `is_st` | `BOOLEAN` | 是否为 ST 股票 |
 
 `pct_chg` 不在核心表重复保存，由 `api.stock_daily` 使用 `100 × (close / preclose - 1)` 动态计算，单位为百分比。
+
+### `core.stock_pb_daily`
+
+主键语义为 `security_id + trade_date`，六列 PB 均来自 RQData `get_factor`，保存为 DuckDB `DOUBLE`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pb_ratio_lf`、`pb_ratio_lyr`、`pb_ratio_ttm` | 归属母公司股东权益分别按 LF、LYR、TTM 口径计算的市净率 |
+| `pb_ratio_1_lf`、`pb_ratio_1_lyr`、`pb_ratio_1_ttm` | 剔除其他权益工具后的对应市净率 |
+
+策略 3 默认使用 `pb_ratio_lf`，可通过 `src/strategies/dividend_low_vol/config.yaml` 的
+`strategy_3.pb_factor` 切换到其他五列。`book_to_market_ratio_*` 是 PB 的倒数，不属于本数据集。
 
 ### `core.index_daily`
 
@@ -48,7 +60,7 @@
 | `volume` | `BIGINT` | 成交量 |
 | `amount` | `DOUBLE` | 成交额 |
 | `turn` | `FLOAT` | 换手率 |
-| `pe_ttm`、`pb_mrq`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | 指数估值字段 |
+| `pe_ttm`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | 指数估值字段 |
 | `is_st` | `BOOLEAN` | 源字段；指数通常为 `NULL` |
 
 `api.index_daily` 动态计算 `pct_chg = close / preclose - 1`。`csindex_daily` 目前只提供 `date, symbol, close`，其他行情字段保持空值。
@@ -95,6 +107,7 @@ DuckDB。
 | 表 | 覆盖键 |
 | --- | --- |
 | `meta.stock_daily_coverage` | `security_id + start_date + end_date + field_set_id` |
+| `meta.stock_pb_daily_coverage` | `security_id + start_date + end_date + field_set_id` |
 | `meta.index_daily_coverage` | `index_id + start_date + end_date + field_set_id` |
 | `meta.dividend_coverage` | `security_id + query_year + field_set_id` |
 | `meta.share_capital_coverage` | `security_id + report_year + report_quarter` |
@@ -117,6 +130,11 @@ price = load_dataset(
     "stock_daily",
     start="2024-01-01",
     end="2024-12-31",
+)
+pb = load_dataset(
+    "stock_pb_daily",
+    start="2014-01-01",
+    end="2023-06-30",
 )
 dividends = load_dataset("dividend")
 shares = load_dataset("stock_profit_quarterly")

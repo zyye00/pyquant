@@ -140,6 +140,59 @@ class FakeClient:
         return FakeResult(["code", "pubDate", "statDate", "totalShare"], rows)
 
 
+class FakePBClient:
+    def __init__(self):
+        self.calls = []
+
+    def init(self):
+        self.calls.append(("init",))
+
+    def all_instruments(self, type, market):
+        self.calls.append(("instruments", type, market))
+        return pd.DataFrame(
+            {
+                "order_book_id": [
+                    "600000.XSHG",
+                    "000001.XSHE",
+                    "000002.XSHE",
+                    "000003.XSHE",
+                    "000004.XSHE",
+                ],
+                "listed_date": [
+                    "2010-01-01",
+                    "2010-01-01",
+                    "2018-01-01",
+                    "2020-01-01",
+                    "2010-01-01",
+                ],
+                "de_listed_date": [
+                    "0000-00-00",
+                    "2018-06-01",
+                    "0000-00-00",
+                    "0000-00-00",
+                    "2016-12-31",
+                ],
+            }
+        )
+
+    def get_factor(self, symbols, factors, **kwargs):
+        self.calls.append((symbols, factors, kwargs))
+        index = pd.MultiIndex.from_tuples(
+            [
+                (symbol, pd.Timestamp(kwargs["start_date"]))
+                for symbol in symbols
+            ],
+            names=["order_book_id", "date"],
+        )
+        return pd.DataFrame(
+            {
+                factor: [float(position + 1)] * len(symbols)
+                for position, factor in enumerate(factors)
+            },
+            index=index,
+        )
+
+
 class FailingHistoryClient(FakeClient):
     def query_history_k_data_plus(
         self, code, fields, start_date, end_date, frequency, adjustflag
@@ -921,6 +974,73 @@ def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
 
     assert out[["year", "status"]].values.tolist() == [[2022, "success"]]
     assert client.calls == [("sh.600000", "2022", "operate")]
+
+
+def test_update_dataset_dispatches_rqdata_pb_in_bounded_ranges(tmp_path):
+    client = FakePBClient()
+    data_root = tmp_path / "data"
+
+    out = update_dataset(
+        "stock_pb_daily",
+        start="2024-01-01",
+        end="2024-12-31",
+        pool=["600000.SH", "000001.SZ"],
+        max_tasks=1,
+        client=client,
+        data_root=data_root,
+    )
+
+    assert out[["start_date", "end_date", "symbol_count", "row_count"]].to_dict(
+        "records"
+    ) == [
+        {
+            "start_date": "2024-01-01",
+            "end_date": "2024-06-30",
+            "symbol_count": 2,
+            "row_count": 2,
+        }
+    ]
+    assert client.calls[0] == ("init",)
+    assert client.calls[1][0] == ["000001.XSHE", "600000.XSHG"]
+    assert not any(call[0] == "instruments" for call in client.calls)
+    with connect_database(data_root / "pyquant.duckdb") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM api.stock_pb_daily"
+        ).fetchone() == (2,)
+
+
+def test_update_dataset_resolves_historical_rqdata_pb_universe(tmp_path):
+    client = FakePBClient()
+
+    out = update_dataset(
+        "stock_pb_daily",
+        start="2017-01-01",
+        end="2019-01-01",
+        pool="all",
+        max_tasks=1,
+        client=client,
+        data_root=tmp_path / "data",
+    )
+
+    assert out.iloc[0]["symbol_count"] == 3
+    assert client.calls[0] == ("init",)
+    assert client.calls[1] == ("instruments", "CS", "cn")
+    assert client.calls[2][0] == ["000001.XSHE", "000002.XSHE", "600000.XSHG"]
+
+
+def test_update_dataset_rejects_unsupported_rqdata_pb_named_pool(tmp_path):
+    client = FakePBClient()
+
+    with pytest.raises(ValueError, match="only supports the named pool 'all'"):
+        update_dataset(
+            "stock_pb_daily",
+            start="2017-01-01",
+            pool="hs300",
+            client=client,
+            data_root=tmp_path / "data",
+        )
+
+    assert client.calls == []
 
 
 def test_update_dataset_validates_options_before_requests(tmp_path):

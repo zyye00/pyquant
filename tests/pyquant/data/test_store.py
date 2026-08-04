@@ -16,12 +16,14 @@ from pyquant.data.store import (
     ensure_securities,
     index_daily_coverage,
     stock_daily_coverage,
+    stock_pb_coverage,
     write_dividend_request,
     write_index_constituents,
     write_index_daily_request,
     write_minute_request,
     write_share_capital_request,
     write_stock_daily_request,
+    write_stock_pb_request,
 )
 
 
@@ -39,10 +41,24 @@ def make_stock_daily() -> pd.DataFrame:
             "turn": [1.0, 2.0],
             "pctChg": [5.0, 4.7619],
             "peTTM": [8.0, 9.0],
-            "pbMRQ": [1.0, 1.1],
             "psTTM": [2.0, 2.1],
             "pcfNcfTTM": [3.0, 3.1],
             "isST": [False, False],
+        }
+    )
+
+
+def make_stock_pb() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["600000.SH", "600000.SH"],
+            "pb_ratio_lf": [1.0, 1.1],
+            "pb_ratio_lyr": [1.2, 1.3],
+            "pb_ratio_ttm": [1.4, 1.5],
+            "pb_ratio_1_lf": [0.9, 1.0],
+            "pb_ratio_1_lyr": [1.1, 1.2],
+            "pb_ratio_1_ttm": [1.3, 1.4],
         }
     )
 
@@ -161,13 +177,13 @@ def test_stock_daily_write_preserves_standardized_fact_fields(tmp_path):
         )
         row = connection.execute(
             """
-            SELECT open, close, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st
+                SELECT open, close, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st
             FROM api.stock_daily
             """
         ).fetchone()
 
-    assert row[:6] == pytest.approx((10.0, 10.5, 8.0, 1.0, 2.0, 3.0))
-    assert row[6] is False
+    assert row[:5] == pytest.approx((10.0, 10.5, 8.0, 2.0, 3.0))
+    assert row[5] is False
 
 
 def test_stock_daily_write_rolls_back_reference_and_fact_on_failure(
@@ -198,6 +214,41 @@ def test_stock_daily_write_rolls_back_reference_and_fact_on_failure(
 
     assert reference_count == 0
     assert fact_count == 0
+
+
+def test_stock_pb_write_persists_all_factors_and_merges_empty_coverage(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        write_stock_pb_request(
+            connection,
+            ["sh.600000"],
+            make_stock_pb(),
+            "2024-01-02",
+            "2024-01-03",
+        )
+        write_stock_pb_request(
+            connection,
+            ["sh.600000"],
+            pd.DataFrame(columns=make_stock_pb().columns),
+            "2024-01-04",
+            "2024-01-05",
+        )
+        row = connection.execute(
+            """
+            SELECT symbol, date, pb_ratio_lf, pb_ratio_1_ttm
+            FROM api.stock_pb_daily
+            ORDER BY date
+            """
+        ).fetchall()
+        coverage = stock_pb_coverage(connection, "sh.600000")
+
+    assert row == [
+        ("600000.SH", pd.Timestamp("2024-01-02").date(), 1.0, 1.3),
+        ("600000.SH", pd.Timestamp("2024-01-03").date(), 1.1, 1.4),
+    ]
+    assert coverage == [("2024-01-02", "2024-01-05")]
 
 
 def test_index_constituents_are_replaced_and_exposed_as_standard_symbols(tmp_path):

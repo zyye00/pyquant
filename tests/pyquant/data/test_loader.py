@@ -21,6 +21,7 @@ from pyquant.data.duckdb import connect_database, initialize_database
 from pyquant.data.store import (
     CSINDEX_DAILY_FIELD_SET_ID,
     write_index_daily_request,
+    write_stock_pb_request,
     write_stock_daily_request,
 )
 
@@ -40,6 +41,50 @@ def test_standardize_price_renames_required_fields():
     assert list(out.columns) == ["date", "symbol", "close", "volume"]
     assert out.loc[0, "symbol"] == "1"
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
+
+
+def test_load_stock_pb_daily_returns_all_float64_factors(tmp_path):
+    initialize_database(tmp_path / "pyquant.duckdb")
+    data = pd.DataFrame(
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "600000.SH",
+            "pb_ratio_lf": 1,
+            "pb_ratio_lyr": 2,
+            "pb_ratio_ttm": 3,
+            "pb_ratio_1_lf": 4,
+            "pb_ratio_1_lyr": 5,
+            "pb_ratio_1_ttm": 6,
+        },
+        index=[0],
+    )
+    with connect_database(tmp_path / "pyquant.duckdb") as connection:
+        write_stock_pb_request(
+            connection,
+            ["600000.SH"],
+            data,
+            "2024-01-02",
+            "2024-01-02",
+        )
+
+    out = load_dataset(
+        "stock_pb_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        data_root=tmp_path,
+    )
+
+    assert out.columns.tolist() == [
+        "date",
+        "symbol",
+        "pb_ratio_lf",
+        "pb_ratio_lyr",
+        "pb_ratio_ttm",
+        "pb_ratio_1_lf",
+        "pb_ratio_1_lyr",
+        "pb_ratio_1_ttm",
+    ]
+    assert all(out[column].dtype == "float64" for column in out.columns[2:])
 
 
 def test_five_minute_dataset_is_not_available():

@@ -4,8 +4,8 @@ baostock:
   stock_pool_queries: {sz50: query_sz50_stocks, hs300: query_hs300_stocks, zz500: query_zz500_stocks}
   request_log_fields: [date, time, endpoint, code, frequency, start_date, end_date]
   history:
-    daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM, isST]
-    float32: [open, high, low, close, preclose, turn, pctChg, peTTM, pbMRQ, psTTM, pcfNcfTTM]
+    daily: [date, code, open, high, low, close, preclose, volume, amount, adjustflag, turn, tradestatus, pctChg, peTTM, psTTM, pcfNcfTTM, isST]
+    float32: [open, high, low, close, preclose, turn, pctChg, peTTM, psTTM, pcfNcfTTM]
     result: [code, start_date, end_date, target_path, status, row_count, error]
   dividend:
     data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
@@ -23,7 +23,7 @@ csindex:
   field_map: {日期: date, 指数代码: symbol, 收盘: close}
 
 rqdata:
-  exchange_prefixes: {XSHG: SH, XSHE: SZ}
+  exchange_prefixes: {XSHG: SH, XSHE: SZ, XBEI: BJ}
   project_exchanges: {SH: XSHG, SZ: XSHE, BJ: XBEI}
   stock_minute_1m:
     frequency: 1m
@@ -32,6 +32,13 @@ rqdata:
     market: cn
     fields: [open, high, low, close, volume, total_turnover]
     result: [symbol, start_date, end_date, status, row_count, day_count, error]
+  stock_pb_daily:
+    market: cn
+    instrument_type: CS
+    factors: [pb_ratio_lf, pb_ratio_lyr, pb_ratio_ttm, pb_ratio_1_lf, pb_ratio_1_lyr, pb_ratio_1_ttm]
+    field_set_id: 1
+    request_months: 6
+    result: [start_date, end_date, status, symbol_count, row_count, error]
 
 price:
   columns: [date, symbol, open, high, low, close, volume, amount]

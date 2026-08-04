@@ -239,6 +239,10 @@ minute_return_volatility_i,t = residual(cv_vol_i,t ~ log_market_cap_i,t)
 BP = 1 / PB
 ```
 
+PB 来自 RQData `get_factor` 的六种口径：普通股东权益和剔除其他权益工具后的股东权益，
+分别采用 LF、LYR、TTM。策略配置默认使用 `pb_ratio_lf`，该口径最接近原 BaoStock
+`pbMRQ`；实际使用列由 `strategy_3.pb_factor` 指定。
+
 ### 5.3 指标构建流程
 
 每月末执行：

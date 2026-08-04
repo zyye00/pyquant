@@ -2,34 +2,21 @@
 
 from __future__ import annotations
 
+from importlib.resources import files
+
 import numpy as np
 import pandas as pd
+import yaml
 
 from pyquant import get_period_end_dates
 
 
-SPREAD_COLUMNS = [
-    "constituent_effective_date",
-    "constituent_count",
-    "non_constituent_count",
-    "constituent_trimmed_count",
-    "non_constituent_trimmed_count",
-    "bp_low",
-    "bp_high",
-    "bp_spread",
-    "lower_band",
-    "bearish_signal",
-]
-BACKTEST_COLUMNS = [
-    "signal_date",
-    "benchmark_return",
-    "bearish_position",
-    "cash_timing_return",
-    "short_timing_return",
-    "benchmark_nav",
-    "cash_timing_nav",
-    "short_timing_nav",
-]
+config_file = files("strategies.dividend_low_vol").joinpath("config.yaml")
+with config_file.open(encoding="utf-8") as _config_stream:
+    _OUTPUT_COLUMNS = yaml.safe_load(_config_stream)["output_columns"]
+
+SPREAD_COLUMNS = _OUTPUT_COLUMNS["timing_spread"]
+BACKTEST_COLUMNS = _OUTPUT_COLUMNS["timing_backtest"]
 
 
 def calculate_bp_spread(
@@ -39,7 +26,7 @@ def calculate_bp_spread(
 ) -> pd.DataFrame:
     """Calculate monthly constituent/non-constituent BP spread and lower band."""
     strategy = _validate_strategy_config(config)
-    price_data = _prepare_price(price)
+    price_data = _prepare_price(price, strategy["pb_factor"])
     constituent_data = _prepare_constituents(
         constituents,
         strategy["index_code"],
@@ -48,7 +35,7 @@ def calculate_bp_spread(
     period_ends = get_period_end_dates(price_data["date"])
     valuation_dates = pd.Series(period_ends, index=period_ends.to_period("M"))
     price_data = price_data[
-        np.isfinite(price_data["pb_mrq"]) & price_data["pb_mrq"].gt(0)
+        np.isfinite(price_data["pb"]) & price_data["pb"].gt(0)
     ]
     price_data = (
         price_data.sort_values(["date", "symbol"])
@@ -72,7 +59,7 @@ def calculate_bp_spread(
             )
         effective_date = snapshot_dates[position]
         monthly = price_data[price_data["month"].eq(month)].copy()
-        monthly["bp"] = 1.0 / monthly["pb_mrq"]
+        monthly["bp"] = 1.0 / monthly["pb"]
         is_constituent = monthly["symbol"].isin(snapshots[effective_date])
         low = monthly.loc[is_constituent, ["symbol", "bp"]]
         high = monthly.loc[~is_constituent, ["symbol", "bp"]]
@@ -170,6 +157,7 @@ def _validate_strategy_config(config: dict) -> dict:
         trim_ratio = float(strategy["trim_ratio"])
         band_window = int(strategy["band_window_months"])
         band_multiplier = float(strategy["band_std_multiplier"])
+        pb_factor = str(strategy["pb_factor"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Invalid strategy_3 configuration") from exc
     if not index_code:
@@ -180,23 +168,27 @@ def _validate_strategy_config(config: dict) -> dict:
         raise ValueError("band_window_months must be positive")
     if band_multiplier < 0:
         raise ValueError("band_std_multiplier must not be negative")
+    if not pb_factor:
+        raise ValueError("pb_factor must not be empty")
     return {
         "index_code": index_code,
         "trim_ratio": trim_ratio,
         "band_window_months": band_window,
         "band_std_multiplier": band_multiplier,
+        "pb_factor": pb_factor,
     }
 
 
-def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:
-    required = {"date", "symbol", "pb_mrq"}
+def _prepare_price(price: pd.DataFrame, pb_factor: str) -> pd.DataFrame:
+    required = {"date", "symbol", pb_factor}
     _require_columns(price, required, "price")
-    out = price.loc[:, sorted(required)].copy()
+    out = price.loc[:, ["date", "symbol", pb_factor]].copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     if out["date"].isna().any():
         raise ValueError("price date must not contain invalid values")
     out["symbol"] = out["symbol"].astype(str)
-    out["pb_mrq"] = pd.to_numeric(out["pb_mrq"], errors="coerce")
+    out = out.rename(columns={pb_factor: "pb"})
+    out["pb"] = pd.to_numeric(out["pb"], errors="coerce")
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
     return out.sort_values(["date", "symbol"]).reset_index(drop=True)

@@ -8,11 +8,13 @@ from typing import Any
 
 import pandas as pd
 
+from pyquant.data.identifiers import normalize_security_symbol
 from pyquant.data.resources import load_source_protocols
 
 
 _RQDATA = load_source_protocols()["rqdata"]
 _MINUTE = _RQDATA["stock_minute_1m"]
+_PB = _RQDATA["stock_pb_daily"]
 _INITIALIZED_CLIENTS: list[Any] = []
 
 
@@ -38,6 +40,124 @@ def project_symbol_to_rqdata(symbol: str) -> str:
     if len(code) != 6 or not code.isdigit():
         raise ValueError(f"Unsupported project stock identifier: {symbol!r}")
     return f"{code}.{suffix}"
+
+
+def query_rqdata_stock_symbols(
+    start_date: str,
+    end_date: str,
+    *,
+    client: Any | None = None,
+) -> list[str]:
+    """Return stocks listed during one inclusive historical interval."""
+    start_at = pd.Timestamp(start_date)
+    end_at = pd.Timestamp(end_date)
+    if start_at > end_at:
+        raise ValueError("start_date must not be after end_date")
+    client = _resolve_client(client)
+    try:
+        data = client.all_instruments(
+            type=_PB["instrument_type"],
+            market=_PB["market"],
+        )
+    except Exception as exc:
+        raise RuntimeError(f"RQData instrument-list request failed: {exc}") from exc
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("RQData instrument-list response must be a DataFrame")
+    required = {"order_book_id", "listed_date", "de_listed_date"}
+    missing = sorted(required - set(data.columns))
+    if missing:
+        raise ValueError(f"RQData instrument-list response missing fields: {missing}")
+    listed = pd.to_datetime(data["listed_date"], errors="coerce")
+    de_listed = data["de_listed_date"].astype("string")
+    open_ended = de_listed.isna() | de_listed.isin(["0000-00-00", ""])
+    de_listed_at = pd.to_datetime(de_listed.mask(open_ended), errors="coerce")
+    invalid_dates = listed.isna() | (~open_ended & de_listed_at.isna())
+    if invalid_dates.any():
+        raise ValueError("RQData instrument-list response contains invalid listing dates")
+    selected = data.loc[
+        listed.le(end_at) & (open_ended | de_listed_at.gt(start_at)), "order_book_id"
+    ]
+    if selected.isna().any():
+        raise ValueError("RQData instrument-list response contains invalid identifiers")
+    try:
+        return sorted({rqdata_symbol_to_project(symbol) for symbol in selected})
+    except ValueError as exc:
+        raise ValueError("RQData instrument-list response contains unsupported identifiers") from exc
+
+
+def extract_stock_pb_daily(
+    data: pd.DataFrame | None,
+    symbols: Sequence[str],
+) -> pd.DataFrame:
+    """Normalize one RQData multi-factor PB response."""
+    columns = ["date", "symbol", *_PB["factors"]]
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("RQData PB response must be a DataFrame")
+    out = data.reset_index()
+    order_book_column = next(
+        (column for column in ["order_book_id", "level_0"] if column in out),
+        None,
+    )
+    date_column = next(
+        (column for column in ["date", "level_1"] if column in out),
+        None,
+    )
+    if order_book_column is None or date_column is None:
+        raise ValueError("RQData PB response must have order_book_id and date")
+    missing = sorted(set(_PB["factors"]) - set(out))
+    if missing:
+        raise ValueError(f"RQData PB response missing factors: {missing}")
+    expected = {project_symbol_to_rqdata(normalize_security_symbol(symbol)) for symbol in symbols}
+    actual = set(out[order_book_column].dropna().astype(str))
+    unexpected = sorted(actual - expected)
+    if unexpected:
+        raise ValueError(f"RQData PB response contains unexpected symbols: {unexpected}")
+    out = out.rename(columns={order_book_column: "rq_symbol", date_column: "date"})
+    out["symbol"] = out["rq_symbol"].map(rqdata_symbol_to_project)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if out[["date", "symbol"]].isna().any().any():
+        raise ValueError("RQData PB response contains invalid identifiers or dates")
+    for factor in _PB["factors"]:
+        out[factor] = pd.to_numeric(out[factor], errors="coerce").astype("float64")
+    out = out[columns]
+    if out.duplicated(["date", "symbol"]).any():
+        raise ValueError("RQData PB response contains duplicate (date, symbol) rows")
+    return out.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def query_stock_pb_daily(
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+    *,
+    client: Any | None = None,
+) -> pd.DataFrame:
+    """Query all configured daily PB factors for a security collection."""
+    normalized = sorted({normalize_security_symbol(symbol) for symbol in symbols})
+    if not normalized:
+        raise ValueError("RQData PB query requires at least one symbol")
+    start_at = pd.Timestamp(start_date)
+    end_at = pd.Timestamp(end_date)
+    if start_at > end_at:
+        raise ValueError("start_date must not be after end_date")
+    client = _resolve_client(client)
+    rq_symbols = [project_symbol_to_rqdata(symbol) for symbol in normalized]
+    try:
+        data = client.get_factor(
+            rq_symbols,
+            list(_PB["factors"]),
+            start_date=start_at.strftime("%Y-%m-%d"),
+            end_date=end_at.strftime("%Y-%m-%d"),
+            expect_df=True,
+            market=_PB["market"],
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"RQData PB request failed for {start_date} to {end_date}: {exc}"
+        ) from exc
+    return extract_stock_pb_daily(data, normalized)
 
 
 def extract_minute_prices(data: pd.DataFrame, symbol: str) -> pd.DataFrame:

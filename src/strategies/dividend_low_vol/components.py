@@ -1,7 +1,10 @@
 """Original dividend low-volatility index components."""
 
+from importlib.resources import files
+
 import numpy as np
 import pandas as pd
+import yaml
 
 from pyquant import (
     DIVIDEND_AFTER_TAX_RATIO,
@@ -14,47 +17,14 @@ from pyquant import (
 )
 
 
-CONSTITUENT_COLUMNS = [
-    "as_of_date",
-    "price_date",
-    "avg_market_cap_240d",
-    "avg_amount_240d",
-    "dividend_yield_ttm",
-    "payout_ratio",
-    "dividend_growth_slope",
-    "avg_dividend_yield_3y",
-    "volatility_240d",
-    "dividend_yield_rank",
-    "volatility_rank",
-    "weight",
-]
-CANDIDATE_COLUMNS = [
-    "as_of_date",
-    "price_date",
-    "avg_market_cap_240d",
-    "avg_amount_240d",
-    "dividend_yield_ttm",
-    "payout_ratio",
-    "dividend_growth_slope",
-    "avg_dividend_yield_3y",
-    "dividend_yield_rank",
-]
-INDEX_COLUMNS = [
-    "price_return",
-    "total_return",
-    "dividend_cash",
-    "price_index",
-    "total_return_index",
-]
-MONTHLY_INDEX_COLUMNS = [
-    "price_return",
-    "total_return",
-    "dividend_cash",
-    "turnover",
-    "transaction_cost",
-    "price_index",
-    "total_return_index",
-]
+config_file = files("strategies.dividend_low_vol").joinpath("config.yaml")
+with config_file.open(encoding="utf-8") as _config_stream:
+    _OUTPUT_COLUMNS = (yaml.safe_load(_config_stream) or {})["output_columns"]
+
+CONSTITUENT_COLUMNS = _OUTPUT_COLUMNS["constituent"]
+CANDIDATE_COLUMNS = _OUTPUT_COLUMNS["candidate"]
+INDEX_COLUMNS = _OUTPUT_COLUMNS["index"]
+MONTHLY_INDEX_COLUMNS = _OUTPUT_COLUMNS["monthly_index"]
 
 
 def select_dividend_low_vol_download_symbols(

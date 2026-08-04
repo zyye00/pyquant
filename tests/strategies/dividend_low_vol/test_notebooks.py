@@ -41,11 +41,24 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
     strategy_notebook = str(notebooks["strategy_3_valuation_spread_timing.ipynb"])
     assert "index_constituents" in download_notebook
     assert "constituent_job.wait()" in download_notebook
+    assert "stock_pb_daily" in download_notebook
+    assert "pb_job.wait()" in download_notebook
+    assert 'pool="all"' in download_notebook
+    assert "valuation_symbols" not in download_notebook
+    cells = notebooks["download.ipynb"]["cells"]
+    pb_index = next(index for index, cell in enumerate(cells) if cell["id"] == "download_pb_daily")
+    price_index = next(
+        index
+        for index, cell in enumerate(cells)
+        if 'price = load_dataset(' in "".join(cell.get("source", []))
+    )
+    assert pb_index < price_index
     assert "conda run" not in download_notebook
     assert "subprocess" not in download_notebook
     assert "rqdatac" not in strategy_notebook
     assert "update_dataset" not in strategy_notebook
     assert "calculate_bp_spread" in strategy_notebook
+    assert "stock_pb_daily" in strategy_notebook
     assert "backtest_valuation_spread_timing" in strategy_notebook
     assert "估值差BP_spread与对应下个月红利低波全收益指数月度收益" in strategy_notebook
     assert "twinx" in strategy_notebook

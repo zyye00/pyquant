@@ -26,6 +26,7 @@ def make_config(
     trim_ratio: float = 0.25,
     band_window_months: int = 6,
     band_std_multiplier: float = 1.5,
+    pb_factor: str = "pb_ratio_lf",
 ) -> dict:
     return {
         "strategy_3": {
@@ -33,6 +34,7 @@ def make_config(
             "trim_ratio": trim_ratio,
             "band_window_months": band_window_months,
             "band_std_multiplier": band_std_multiplier,
+            "pb_factor": pb_factor,
         }
     }
 
@@ -67,7 +69,7 @@ def make_spread_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
             {
                 "date": date,
                 "symbol": symbol,
-                "pb_mrq": 1.0 / bp,
+                "pb_ratio_lf": 1.0 / bp,
             }
             for symbol, bp in zip(symbols, bp_values, strict=True)
         )
@@ -195,7 +197,7 @@ def test_bp_spread_trims_groups_and_generates_six_month_signal():
 
 def test_bp_spread_excludes_non_positive_pb():
     price, constituents = make_spread_inputs()
-    price.loc[price["symbol"].isin(["A", "E"]), "pb_mrq"] = -1.0
+    price.loc[price["symbol"].isin(["A", "E"]), "pb_ratio_lf"] = -1.0
 
     out = calculate_bp_spread(price, constituents, make_config(trim_ratio=0.0))
 
@@ -213,7 +215,7 @@ def test_bp_spread_uses_latest_snapshot_and_latest_valid_monthly_pb():
                 {
                     "date": [pd.Timestamp("2024-06-03")],
                     "symbol": ["A"],
-                    "pb_mrq": [100.0],
+                    "pb_ratio_lf": [100.0],
                 }
             ),
         ],
@@ -285,10 +287,13 @@ def test_strategy_3_config_and_dataset_catalog():
 
     assert config["strategy_3"] == {
         "index_code": "H30269",
+        "pb_factor": "pb_ratio_lf",
         "trim_ratio": 0.1,
         "band_window_months": 6,
         "band_std_multiplier": 1.5,
     }
+    assert config["output_columns"]["timing_spread"] == TIMING.SPREAD_COLUMNS
+    assert config["output_columns"]["timing_backtest"] == TIMING.BACKTEST_COLUMNS
     assert dataset.storage == DuckDBStorage(
         path="data/pyquant.duckdb",
         relation="api.index_constituents",
