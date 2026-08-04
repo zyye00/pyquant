@@ -16,23 +16,23 @@ from pyquant.metrics import calc_metrics
 from pyquant.transforms import transform_factor
 from pyquant.universe import (
     DIVIDEND_AFTER_TAX_RATIO,
-    build_dividend_low_vol_universe,
+    build_div_low_vol_universe,
     build_universe,
-    prepare_dividend_low_vol_universe_inputs,
+    prepare_div_low_vol_universe_inputs,
 )
 
 __all__ = [
     "DIVIDEND_AFTER_TAX_RATIO",
     "MinuteRequest",
     "UpdateJob",
-    "build_dividend_low_vol_universe",
+    "build_div_low_vol_universe",
     "build_universe",
     "calc_metrics",
     "ensure_dir",
     "get_period_end_dates",
     "load_dataset",
     "normalize_query_years",
-    "prepare_dividend_low_vol_universe_inputs",
+    "prepare_div_low_vol_universe_inputs",
     "run_backtest",
     "save_output",
     "standardize_price",

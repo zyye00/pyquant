@@ -11,7 +11,7 @@ import yaml
 from pyquant import get_period_end_dates
 
 
-config_file = files("strategies.dividend_low_vol").joinpath("config.yaml")
+config_file = files("strategies.div_low_vol").joinpath("config.yaml")
 with config_file.open(encoding="utf-8") as _config_stream:
     _OUTPUT_COLUMNS = yaml.safe_load(_config_stream)["output_columns"]
 

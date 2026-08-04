@@ -291,16 +291,16 @@ bearish_signal_t = BP_spread_t < lower_band_t
 if bearish_signal_t:
     next_month_return = 0
 else:
-    next_month_return = dividend_low_vol_total_return_next_month
+    next_month_return = div_low_vol_total_return_next_month
 ```
 
 #### 情形 B：看空后卖空
 
 ```text
 if bearish_signal_t:
-    next_month_return = -dividend_low_vol_total_return_next_month
+    next_month_return = -div_low_vol_total_return_next_month
 else:
-    next_month_return = dividend_low_vol_total_return_next_month
+    next_month_return = div_low_vol_total_return_next_month
 ```
 
 ### 5.6 回测结果

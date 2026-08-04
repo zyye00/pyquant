@@ -43,7 +43,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "pyquant.data" = ["sql/*.sql"]
-"strategies.dividend_low_vol" = ["config.yaml"]
+"strategies.div_low_vol" = ["config.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -37,7 +37,7 @@ def build_universe(
     return out.set_index(["date", "symbol"])
 
 
-def build_dividend_low_vol_universe(
+def build_div_low_vol_universe(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -52,9 +52,9 @@ def build_dividend_low_vol_universe(
     This applies only the sample-space and dividend-quality filters. The
     strategy remains responsible for factor ranking and portfolio weights.
     """
-    _validate_dividend_low_vol_config(config, price_history_lookback_days)
+    _validate_div_low_vol_config(config, price_history_lookback_days)
     as_of_date = pd.Timestamp(as_of_date)
-    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+    prepared = prepared or prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
     price_data = prepared["price"]
@@ -64,14 +64,14 @@ def build_dividend_low_vol_universe(
     dividend_data = prepared["dividends"]
     query_data = prepared["dividend_queries"]
     market_data = prepared["market_data"]
-    snapshot = _dividend_low_vol_market_snapshot(
+    snapshot = _div_low_vol_market_snapshot(
         price_data, market_data, as_of_date, config["lookback_days"]
     )
     symbols = sorted(
-        _top_dividend_low_vol_symbols(
+        _top_div_low_vol_symbols(
             snapshot, "avg_market_cap_240d", config["market_cap_keep_ratio"]
         )
-        & _top_dividend_low_vol_symbols(
+        & _top_div_low_vol_symbols(
             snapshot, "avg_amount_240d", config["amount_keep_ratio"]
         )
         & set(
@@ -88,20 +88,20 @@ def build_dividend_low_vol_universe(
         raise ValueError(
             "No symbols passed the market, liquidity, and price-history filters"
         )
-    _require_dividend_low_vol_query_coverage(
+    _require_div_low_vol_query_coverage(
         query_data,
         symbols,
-        _dividend_low_vol_continuous_years(as_of_date, config["dividend_years"]),
+        _div_low_vol_continuous_years(as_of_date, config["dividend_years"]),
         f"selection at {as_of_date.date()}",
     )
-    metrics = _add_dividend_low_vol_metrics(
+    metrics = _add_div_low_vol_metrics(
         snapshot[snapshot["symbol"].isin(symbols)].copy(),
         dividend_data,
         as_of_date,
         config["dividend_years"],
     )
     metrics = metrics[metrics["consecutive_dividends"]].copy()
-    high_payout = _top_dividend_low_vol_symbols(
+    high_payout = _top_div_low_vol_symbols(
         metrics, "payout_ratio", config["payout_exclude_ratio"]
     )
     return metrics.loc[
@@ -111,15 +111,15 @@ def build_dividend_low_vol_universe(
     ].set_index("symbol")
 
 
-def prepare_dividend_low_vol_universe_inputs(
+def prepare_div_low_vol_universe_inputs(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
     shares: pd.DataFrame,
 ) -> dict[str, pd.DataFrame]:
     """Prepare reusable inputs for repeated dividend low-volatility selections."""
-    price_data = _prepare_dividend_low_vol_price(price)
-    share_data = _prepare_dividend_low_vol_shares(shares)
+    price_data = _prepare_div_low_vol_price(price)
+    share_data = _prepare_div_low_vol_shares(shares)
     market_data = pd.merge_asof(
         price_data.sort_values(["date", "symbol"]),
         share_data.sort_values(["publish_date", "symbol"]),
@@ -133,14 +133,14 @@ def prepare_dividend_low_vol_universe_inputs(
     price_counts["observation_count"] = price_counts.groupby("symbol").cumcount() + 1
     return {
         "price": price_data,
-        "dividends": _prepare_dividend_low_vol_dividends(dividends),
+        "dividends": _prepare_div_low_vol_dividends(dividends),
         "dividend_queries": normalize_query_years(dividend_queries),
         "market_data": market_data,
         "price_counts": price_counts,
     }
 
 
-def _validate_dividend_low_vol_config(config: dict, price_history_days: int) -> None:
+def _validate_div_low_vol_config(config: dict, price_history_days: int) -> None:
     required = {
         "lookback_days",
         "market_cap_keep_ratio",
@@ -148,7 +148,7 @@ def _validate_dividend_low_vol_config(config: dict, price_history_days: int) -> 
         "dividend_years",
         "payout_exclude_ratio",
     }
-    _require_dividend_low_vol_columns(config, required, "config")
+    _require_div_low_vol_columns(config, required, "config")
     if config["lookback_days"] <= 0 or config["dividend_years"] < 2:
         raise ValueError("lookback_days must be positive and dividend_years at least 2")
     if price_history_days <= 0:
@@ -160,9 +160,9 @@ def _validate_dividend_low_vol_config(config: dict, price_history_days: int) -> 
         raise ValueError("payout_exclude_ratio must be in [0, 1)")
 
 
-def _prepare_dividend_low_vol_price(price: pd.DataFrame) -> pd.DataFrame:
+def _prepare_div_low_vol_price(price: pd.DataFrame) -> pd.DataFrame:
     required = {"date", "symbol", "close", "amount", "pe_ttm"}
-    _require_dividend_low_vol_columns(price, required, "price")
+    _require_div_low_vol_columns(price, required, "price")
     out = price.loc[:, sorted(required)].copy()
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("price contains duplicate (date, symbol) rows")
@@ -172,9 +172,9 @@ def _prepare_dividend_low_vol_price(price: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _prepare_dividend_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
+def _prepare_div_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "announce_date", "cash_dividend_before_tax"}
-    _require_dividend_low_vol_columns(dividends, required, "dividends")
+    _require_div_low_vol_columns(dividends, required, "dividends")
     out = (
         dividends.loc[:, sorted(required)]
         .dropna(subset=["announce_date", "cash_dividend_before_tax"])
@@ -184,9 +184,9 @@ def _prepare_dividend_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame
     return out
 
 
-def _prepare_dividend_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
+def _prepare_div_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
     required = {"symbol", "publish_date", "total_shares"}
-    _require_dividend_low_vol_columns(shares, required, "shares")
+    _require_div_low_vol_columns(shares, required, "shares")
     out = shares.copy()
     if "report_date" in out:
         out = out.sort_values(["symbol", "publish_date", "report_date"])
@@ -196,7 +196,7 @@ def _prepare_dividend_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _dividend_low_vol_market_snapshot(
+def _div_low_vol_market_snapshot(
     price: pd.DataFrame,
     market_data: pd.DataFrame,
     as_of_date: pd.Timestamp,
@@ -226,7 +226,7 @@ def _dividend_low_vol_market_snapshot(
     return snapshot.merge(average, on="symbol", how="left")
 
 
-def _add_dividend_low_vol_metrics(
+def _add_div_low_vol_metrics(
     metrics: pd.DataFrame,
     dividends: pd.DataFrame,
     as_of_date: pd.Timestamp,
@@ -244,7 +244,7 @@ def _add_dividend_low_vol_metrics(
         .sum()
         .mul(DIVIDEND_AFTER_TAX_RATIO)
     )
-    years = _dividend_low_vol_continuous_years(as_of_date, dividend_years)
+    years = _div_low_vol_continuous_years(as_of_date, dividend_years)
     metrics["consecutive_dividends"] = metrics["symbol"].map(
         lambda symbol: all(annual.get((symbol, year), 0.0) > 0 for year in years)
     )
@@ -267,7 +267,7 @@ def _add_dividend_low_vol_metrics(
     return metrics
 
 
-def _dividend_low_vol_continuous_years(
+def _div_low_vol_continuous_years(
     as_of_date: pd.Timestamp, dividend_years: int
 ) -> range:
     start = (
@@ -278,7 +278,7 @@ def _dividend_low_vol_continuous_years(
     return range(start, start + dividend_years)
 
 
-def _require_dividend_low_vol_query_coverage(
+def _require_div_low_vol_query_coverage(
     queries: pd.DataFrame, symbols: list[str], years: range, context: str
 ) -> None:
     missing = sorted(
@@ -291,7 +291,7 @@ def _require_dividend_low_vol_query_coverage(
         )
 
 
-def _top_dividend_low_vol_symbols(
+def _top_div_low_vol_symbols(
     data: pd.DataFrame, column: str, keep_ratio: float
 ) -> set[str]:
     data = data.dropna(subset=[column])
@@ -302,7 +302,7 @@ def _top_dividend_low_vol_symbols(
     )
 
 
-def _require_dividend_low_vol_columns(
+def _require_div_low_vol_columns(
     data: pd.DataFrame | dict, required: set[str], name: str
 ) -> None:
     missing = sorted(required - set(data))

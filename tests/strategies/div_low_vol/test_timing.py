@@ -12,10 +12,10 @@ from pyquant.data.sources.rqdata import (
     rqdata_symbol_to_project,
 )
 from pyquant.data.updater import _run_update_dataset
-from strategies.dividend_low_vol import timing as TIMING
+from strategies.div_low_vol import timing as TIMING
 
 
-STRATEGY_CONFIG = files("strategies.dividend_low_vol").joinpath("config.yaml")
+STRATEGY_CONFIG = files("strategies.div_low_vol").joinpath("config.yaml")
 calculate_bp_spread = TIMING.calculate_bp_spread
 backtest_timing = TIMING.backtest_valuation_spread_timing
 

@@ -1,5 +1,5 @@
 strategy:
-  name: dividend_low_vol
+  name: div_low_vol
   type: cross_sectional
 
 output_columns:

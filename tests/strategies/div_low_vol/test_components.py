@@ -5,21 +5,21 @@ import pandas as pd
 import pytest
 import yaml
 
-from pyquant import build_dividend_low_vol_universe
-from strategies.dividend_low_vol import components as COMPONENTS
+from pyquant import build_div_low_vol_universe
+from strategies.div_low_vol import components as COMPONENTS
 
 
-STRATEGY_CONFIG = files("strategies.dividend_low_vol").joinpath("config.yaml")
+STRATEGY_CONFIG = files("strategies.div_low_vol").joinpath("config.yaml")
 
 CONSTITUENT_COLUMNS = COMPONENTS.CONSTITUENT_COLUMNS
 INDEX_COLUMNS = COMPONENTS.INDEX_COLUMNS
-calculate_index = COMPONENTS.calculate_dividend_low_vol_index
-calculate_rebalanced_index = COMPONENTS.calculate_dividend_low_vol_rebalanced_index
+calculate_index = COMPONENTS.calculate_div_low_vol_index
+calculate_rebalanced_index = COMPONENTS.calculate_div_low_vol_rebalanced_index
 calculate_monthly_rebalanced_index = (
-    COMPONENTS.calculate_dividend_low_vol_monthly_rebalanced_index
+    COMPONENTS.calculate_div_low_vol_monthly_rebalanced_index
 )
-select_constituents = COMPONENTS.select_dividend_low_vol_constituents
-select_download_symbols = COMPONENTS.select_dividend_low_vol_download_symbols
+select_constituents = COMPONENTS.select_div_low_vol_constituents
+select_download_symbols = COMPONENTS.select_div_low_vol_download_symbols
 build_minute_requests = COMPONENTS.build_intraday_minute_requests
 calculate_high_frequency_factor = COMPONENTS.calculate_high_frequency_volatility_factor
 
@@ -240,7 +240,7 @@ def test_percentage_rankings_exclude_missing_metrics_before_counting():
     )
     config = make_config(market_cap_keep_ratio=0.5, amount_keep_ratio=0.5)
 
-    out = build_dividend_low_vol_universe(
+    out = build_div_low_vol_universe(
         price,
         make_dividends(symbols),
         make_queries(symbols),
@@ -310,7 +310,7 @@ def test_public_universe_uses_common_dates_and_exact_date_population():
     price["date"] = pd.to_datetime(price["date"]).astype("datetime64[ms]")
     shares = make_shares(["A", "B"], {"A": 100.0, "B": 200.0})
 
-    snapshot = build_dividend_low_vol_universe(
+    snapshot = build_div_low_vol_universe(
         price,
         make_dividends(["A", "B"]),
         make_queries(["A", "B"]),
@@ -337,7 +337,7 @@ def test_public_universe_requires_a_full_market_calendar_window():
     price = make_price(["A"], dates=pd.bdate_range("2024-11-25", periods=3))
 
     with pytest.raises(ValueError, match="Only 3 market dates are available"):
-        build_dividend_low_vol_universe(
+        build_div_low_vol_universe(
             price,
             make_dividends(["A"]),
             make_queries(["A"]),
@@ -390,7 +390,7 @@ def test_payout_percentage_excludes_missing_values_before_counting():
     pe_ttm = {"S37": 90.0, "S38": 100.0, "S39": float("nan")}
     config = make_config(payout_exclude_ratio=0.05)
 
-    out = build_dividend_low_vol_universe(
+    out = build_div_low_vol_universe(
         make_price(symbols, pe_ttm=pe_ttm),
         make_dividends(symbols),
         make_queries(symbols),
@@ -521,7 +521,7 @@ def test_public_universe_applies_december_annual_dividend_cutoff(as_of, is_eligi
     )
     shares = make_shares(["A"])
     shares["publish_date"] = pd.Timestamp("2009-01-01").as_unit("ms")
-    out = build_dividend_low_vol_universe(
+    out = build_div_low_vol_universe(
         price,
         dividends,
         make_queries(["A"], range(2010, 2014)),
@@ -704,7 +704,7 @@ def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(
         return pd.DataFrame({"weight": [1.0]}, index=pd.Index([symbol], name="symbol"))
 
     monkeypatch.setattr(
-        COMPONENTS, "select_dividend_low_vol_constituents", select_constituents
+        COMPONENTS, "select_div_low_vol_constituents", select_constituents
     )
     index, _ = calculate_monthly_rebalanced_index(
         make_price(symbols, dates=dates),
@@ -746,7 +746,7 @@ def test_monthly_rebalance_includes_dividend_cash_in_turnover(monkeypatch):
         return pd.DataFrame({"weight": [1.0]}, index=pd.Index(["A"], name="symbol"))
 
     monkeypatch.setattr(
-        COMPONENTS, "select_dividend_low_vol_constituents", select_constituents
+        COMPONENTS, "select_div_low_vol_constituents", select_constituents
     )
     index, _ = calculate_monthly_rebalanced_index(
         make_price(symbols, dates=dates),

@@ -44,7 +44,7 @@
 | `pb_ratio_lf`、`pb_ratio_lyr`、`pb_ratio_ttm` | 归属母公司股东权益分别按 LF、LYR、TTM 口径计算的市净率 |
 | `pb_ratio_1_lf`、`pb_ratio_1_lyr`、`pb_ratio_1_ttm` | 剔除其他权益工具后的对应市净率 |
 
-策略 3 默认使用 `pb_ratio_lf`，可通过 `src/strategies/dividend_low_vol/config.yaml` 的
+策略 3 默认使用 `pb_ratio_lf`，可通过 `src/strategies/div_low_vol/config.yaml` 的
 `strategy_3.pb_factor` 切换到其他五列。`book_to_market_ratio_*` 是 PB 的倒数，不属于本数据集。
 
 ### `core.index_daily`

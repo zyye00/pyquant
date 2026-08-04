@@ -9,15 +9,15 @@ import yaml
 from pyquant import (
     DIVIDEND_AFTER_TAX_RATIO,
     MinuteRequest,
-    build_dividend_low_vol_universe,
+    build_div_low_vol_universe,
     get_period_end_dates,
     normalize_query_years,
-    prepare_dividend_low_vol_universe_inputs,
+    prepare_div_low_vol_universe_inputs,
     run_backtest,
 )
 
 
-config_file = files("strategies.dividend_low_vol").joinpath("config.yaml")
+config_file = files("strategies.div_low_vol").joinpath("config.yaml")
 with config_file.open(encoding="utf-8") as _config_stream:
     _OUTPUT_COLUMNS = (yaml.safe_load(_config_stream) or {})["output_columns"]
 
@@ -27,7 +27,7 @@ INDEX_COLUMNS = _OUTPUT_COLUMNS["index"]
 MONTHLY_INDEX_COLUMNS = _OUTPUT_COLUMNS["monthly_index"]
 
 
-def select_dividend_low_vol_download_symbols(
+def select_div_low_vol_download_symbols(
     price: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
@@ -48,7 +48,7 @@ def select_dividend_low_vol_download_symbols(
     )
 
 
-def select_dividend_low_vol_constituents(
+def select_div_low_vol_constituents(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -58,10 +58,10 @@ def select_dividend_low_vol_constituents(
     prepared: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
-    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+    prepared = prepared or prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
-    metrics = select_dividend_low_vol_candidates(
+    metrics = select_div_low_vol_candidates(
         price,
         dividends,
         dividend_queries,
@@ -94,7 +94,7 @@ def select_dividend_low_vol_constituents(
     return metrics.set_index("symbol")[CONSTITUENT_COLUMNS]
 
 
-def select_dividend_low_vol_candidates(
+def select_div_low_vol_candidates(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -107,13 +107,13 @@ def select_dividend_low_vol_candidates(
     _validate_selection_config(config)
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
-    prepared = prepared or prepare_dividend_low_vol_universe_inputs(
+    prepared = prepared or prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
     price_data = prepared["price"]
     price_data = price_data[price_data["date"] <= as_of_date]
     dividend_data = prepared["dividends"]
-    metrics = build_dividend_low_vol_universe(
+    metrics = build_div_low_vol_universe(
         price_data,
         dividends,
         dividend_queries,
@@ -274,7 +274,7 @@ def calculate_high_frequency_volatility_factor(
     ].sort_index()
 
 
-def calculate_dividend_low_vol_index(
+def calculate_div_low_vol_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -349,7 +349,7 @@ def calculate_dividend_low_vol_index(
     return out[INDEX_COLUMNS]
 
 
-def calculate_dividend_low_vol_rebalanced_index(
+def calculate_div_low_vol_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -378,7 +378,7 @@ def calculate_dividend_low_vol_rebalanced_index(
     if not schedule:
         raise ValueError("No annual rebalance effective date falls within the period")
 
-    return _calculate_dividend_low_vol_rebalanced_index(
+    return _calculate_div_low_vol_rebalanced_index(
         price,
         dividends,
         dividend_queries,
@@ -389,7 +389,7 @@ def calculate_dividend_low_vol_rebalanced_index(
     )
 
 
-def calculate_dividend_low_vol_monthly_rebalanced_index(
+def calculate_div_low_vol_monthly_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -426,7 +426,7 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
     rebalance_dates = get_period_end_dates(calendar)
     if rebalance_dates.empty:
         raise ValueError("No monthly rebalance effective date falls within the period")
-    return _calculate_dividend_low_vol_monthly_index(
+    return _calculate_div_low_vol_monthly_index(
         price,
         dividends,
         dividend_queries,
@@ -437,7 +437,7 @@ def calculate_dividend_low_vol_monthly_rebalanced_index(
     )
 
 
-def _calculate_dividend_low_vol_monthly_index(
+def _calculate_div_low_vol_monthly_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -446,7 +446,7 @@ def _calculate_dividend_low_vol_monthly_index(
     rebalance_dates: pd.DatetimeIndex,
     transaction_cost_rate: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    prepared = prepare_dividend_low_vol_universe_inputs(
+    prepared = prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
     index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
@@ -454,7 +454,7 @@ def _calculate_dividend_low_vol_monthly_index(
     constituent_weights = {}
 
     for rebalance_date in rebalance_dates:
-        constituents = select_dividend_low_vol_constituents(
+        constituents = select_div_low_vol_constituents(
             price,
             dividends,
             dividend_queries,
@@ -492,7 +492,7 @@ def _calculate_dividend_low_vol_monthly_index(
     return index[MONTHLY_INDEX_COLUMNS], pd.concat(constituent_snapshots).sort_index()
 
 
-def _calculate_dividend_low_vol_rebalanced_index(
+def _calculate_div_low_vol_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
@@ -501,14 +501,14 @@ def _calculate_dividend_low_vol_rebalanced_index(
     config: dict,
     schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    prepared = prepare_dividend_low_vol_universe_inputs(
+    prepared = prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
     index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
     index_segments = []
     constituent_snapshots = []
     for position, (as_of_date, effective_date) in enumerate(schedule):
-        constituents = select_dividend_low_vol_constituents(
+        constituents = select_div_low_vol_constituents(
             price,
             dividends,
             dividend_queries,
@@ -525,7 +525,7 @@ def _calculate_dividend_low_vol_rebalanced_index(
         segment_end = (
             schedule[position + 1][1] if position + 1 < len(schedule) else end_date
         )
-        segment = calculate_dividend_low_vol_index(
+        segment = calculate_div_low_vol_index(
             price,
             dividends,
             dividend_queries,

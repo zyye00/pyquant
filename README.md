@@ -15,15 +15,15 @@
 统一位于 `notebooks/{strategy_name}/`。以红利低波策略为例：
 
 ```text
-src/strategies/dividend_low_vol/
+src/strategies/div_low_vol/
 ├─ config.yaml
 ├─ components.py
 └─ timing.py
 
-notebooks/dividend_low_vol/
+notebooks/div_low_vol/
 ├─ download.ipynb
-├─ strategy_1_monthly_rebalance.ipynb
-└─ strategy_3_valuation_spread_timing.ipynb
+├─ 1_rebalance.ipynb
+└─ 3_timing.ipynb
 ```
 
 从仓库根目录启动 notebook。它会将 `src/` 加入导入路径，并从 `strategies` 与 `pyquant` 包读取
