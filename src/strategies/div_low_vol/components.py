@@ -418,7 +418,7 @@ def calculate_div_low_vol_monthly_rebalanced_index(
         raise ValueError("Missing strategy_1 configuration") from exc
     _validate_selection_config(strategy_config)
     transaction_cost_rate = strategy_config["selection"].get(
-        "transaction_cost_rate", 0.001
+        "transaction_cost_rate", 0.0
     )
     if not 0 <= transaction_cost_rate < 1:
         raise ValueError("transaction_cost_rate must be in [0, 1)")
@@ -495,7 +495,7 @@ def _calculate_div_low_vol_monthly_index(
     adjusted_prices = adjusted_price.pivot(
         index="date", columns="symbol", values="close"
     )
-    monthly_prices = adjusted_prices.reindex(rebalance_dates).ffill()
+    monthly_prices = adjusted_prices.ffill().reindex(rebalance_dates)
     monthly_prices = monthly_prices.reindex(columns=target_weights.columns)
     fee_matrix = pd.DataFrame(
         transaction_cost_rate / 2.0,

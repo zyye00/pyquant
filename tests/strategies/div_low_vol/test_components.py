@@ -742,6 +742,60 @@ def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(
     )
 
 
+def test_monthly_rebalance_uses_last_valid_price_before_month_end(monkeypatch):
+    dates = pd.to_datetime(
+        ["2024-01-30", "2024-01-31", "2024-02-01", "2024-02-28", "2024-02-29"]
+    )
+    symbols = ["A", "B"]
+    config = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=4,
+        dividend_top_n=2,
+        volatility_lookback_days=4,
+        final_n=1,
+    )
+    strategy_config = {"universe": config["universe"], "strategy_1": config["selection"]}
+    dividends = make_dividends(symbols)
+    dividends["payment_date"] = pd.NaT
+    factors, coverage = make_adjustment_data(symbols)
+    price = make_price(
+        symbols,
+        dates=dates,
+        closes={"A": [10.0, 10.0, 20.0, 20.0, 20.0], "B": [10.0] * len(dates)},
+    )
+    price = price.loc[~(price["symbol"].eq("A") & price["date"].eq(dates[-1]))]
+
+    def select_constituents(*args):
+        symbol = "A" if pd.Timestamp(args[4]).month == 1 else "B"
+        return pd.DataFrame({"weight": [1.0]}, index=pd.Index([symbol], name="symbol"))
+
+    monkeypatch.setattr(
+        COMPONENTS, "select_div_low_vol_constituents", select_constituents
+    )
+    index, _ = calculate_monthly_rebalanced_index(
+        price,
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+        factors,
+        coverage,
+    )
+
+    assert index.loc[pd.Timestamp("2024-02-29"), "total_return"] == pytest.approx(1.0)
+    assert index.loc[pd.Timestamp("2024-02-29"), "total_return_index"] == pytest.approx(
+        2.0
+    )
+
+
+def test_strategy_1_config_defaults_to_zero_transaction_cost():
+    config = yaml.safe_load(STRATEGY_CONFIG.read_text(encoding="utf-8"))
+
+    assert config["strategy_1"]["transaction_cost_rate"] == 0.0
+
+
 def test_monthly_rebalance_includes_dividend_cash_in_turnover(monkeypatch):
     symbols = ["A", "B", "C"]
     dates = pd.bdate_range("2024-01-02", periods=45)

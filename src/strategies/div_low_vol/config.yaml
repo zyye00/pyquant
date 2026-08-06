@@ -79,7 +79,7 @@ strategy_1:
   dividend_top_n: 150
   final_n: 50
   volatility_lookback_days: 20
-  transaction_cost_rate: 0.001
+  transaction_cost_rate: 0.0
 
 minute_data:
   lookback_trading_days: 20
