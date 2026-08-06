@@ -57,16 +57,16 @@ def load_relation(
     conditions = []
     parameters: list[Any] = []
     if date_column is not None and start is not None:
-        conditions.append(f"{date_column} >= ?")
+        conditions.append(f"{_quote_identifier(date_column)} >= ?")
         parameters.append(
             start.to_pydatetime() if date_column == "datetime" else start.date()
         )
     if date_column is not None and end is not None:
         if date_column == "datetime":
-            conditions.append(f"{date_column} < ?")
+            conditions.append(f"{_quote_identifier(date_column)} < ?")
             parameters.append((end.normalize() + pd.Timedelta(days=1)).to_pydatetime())
         else:
-            conditions.append(f"{date_column} <= ?")
+            conditions.append(f"{_quote_identifier(date_column)} <= ?")
             parameters.append(end.date())
     if symbols:
         normalized = [
@@ -74,9 +74,14 @@ def load_relation(
             for symbol in symbols
         ]
         placeholders = ", ".join("?" for _ in normalized)
-        conditions.append(f"symbol IN ({placeholders})")
+        conditions.append(f"{_quote_identifier('symbol')} IN ({placeholders})")
         parameters.extend(normalized)
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-    query = f"SELECT {', '.join(columns)} FROM {relation}{where}"
+    query = f"SELECT {', '.join(_quote_identifier(column) for column in columns)} FROM {relation}{where}"
     with connect_database(database_path, read_only=True) as connection:
         return connection.execute(query, parameters).df()
+
+
+def _quote_identifier(name: str) -> str:
+    """Quote a trusted catalog identifier, including reserved words."""
+    return ".".join(f'"{part.replace(chr(34), chr(34) * 2)}"' for part in name.split("."))

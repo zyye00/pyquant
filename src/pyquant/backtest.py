@@ -1,113 +1,107 @@
-"""Minimal weight return backtest."""
+"""VectorBT-backed target-weight portfolio construction."""
 
+from __future__ import annotations
+
+import numpy as np
 import pandas as pd
+from typing import TYPE_CHECKING
 
-
-REBALANCED_BACKTEST_COLUMNS = [
-    "price_return",
-    "total_return",
-    "dividend_cash",
-    "turnover",
-    "transaction_cost",
-    "price_index",
-    "total_return_index",
-]
+if TYPE_CHECKING:
+    import vectorbt as vbt
 
 
 def run_backtest(
-    prices: pd.DataFrame,
+    close: pd.DataFrame,
     target_weights: pd.DataFrame,
-    cash_events: pd.DataFrame | None = None,
-    fee_rate: float = 0.0,
-) -> pd.DataFrame:
-    """Backtest periodic target weights with cash events and one-way costs.
+    *,
+    execution_price: pd.DataFrame | None = None,
+    fees: float | pd.DataFrame = 0.0,
+    slippage: float = 0.0,
+    init_cash: float = 1_000_000.0,
+    freq: str | pd.Timedelta = "ME",
+) -> vbt.Portfolio:
+    """Run a target-weight portfolio with VectorBT.
 
-    Each weight row is formed at that row's close and held until the next
-    weight date. Cash events are credited over ``(start, end]`` and reinvested
-    at the ending rebalance. Initial portfolio construction is cost-free.
+    ``target_weights`` is interpreted as a portfolio percentage at each
+    timestamp.  All orders share one cash account and are sequenced
+    automatically so switches between constituents are fully funded.  The
+    A scalar fee is applied after the free initial construction.  A fee matrix
+    can override this row-by-row behavior for more specific execution rules.
     """
-    if fee_rate < 0:
-        raise ValueError("fee_rate must not be negative")
-    price_data = _prepare_price_panel(prices)
-    weight_data = _prepare_target_weights(target_weights)
-    cash_data = _prepare_cash_events(cash_events)
-    rebalance_prices = (
-        price_data.reindex(price_data.index.union(weight_data.index))
-        .sort_index()
-        .ffill()
-        .reindex(weight_data.index)
-    )
-    result = pd.DataFrame(
-        0.0,
-        index=weight_data.index,
-        columns=REBALANCED_BACKTEST_COLUMNS[:-2],
-    )
+    import vectorbt as vbt
 
-    for position, start in enumerate(weight_data.index[:-1]):
-        end = weight_data.index[position + 1]
-        held_weights = weight_data.loc[start]
-        held_symbols = held_weights[held_weights.gt(0)].index
-        interval_prices = rebalance_prices.loc[[start, end], held_symbols]
-        invalid = interval_prices.columns[
-            interval_prices.isna().any() | interval_prices.le(0).any()
-        ].tolist()
-        if invalid:
-            raise ValueError(
-                "Missing or non-positive prices for held symbols; "
-                f"examples: {invalid[:5]}"
-            )
-        normalized_shares = held_weights[held_symbols].div(interval_prices.loc[start])
-        end_positions = interval_prices.loc[end].mul(normalized_shares)
-        dividend_cash = _interval_cash(
-            cash_data,
-            normalized_shares,
-            start,
-            end,
+    close_data = _prepare_panel(close, "close")
+    weights = _prepare_target_weights(target_weights, close_data.columns)
+    if not weights.index.isin(close_data.index).all():
+        raise ValueError("target_weights dates must be present in close")
+    close_data = close_data.reindex(close_data.index.union(weights.index)).sort_index()
+    close_data = close_data.ffill().reindex(columns=weights.columns)
+    held_weights = weights.reindex(close_data.index).ffill().fillna(0.0)
+    if (close_data.isna() & held_weights.gt(0)).any().any():
+        raise ValueError("close is missing while a target symbol is held")
+    close_data = close_data.bfill()
+    if close_data.isna().any().any() or close_data.le(0).any().any():
+        raise ValueError("close must contain positive prices for all target symbols")
+    price = None
+    if execution_price is not None:
+        price = _prepare_panel(execution_price, "execution_price")
+        if not price.index.equals(close_data.index) or not price.columns.equals(
+            close_data.columns
+        ):
+            price = price.reindex(index=close_data.index, columns=close_data.columns)
+        if price.isna().any().any() or price.le(0).any().any():
+            raise ValueError("execution_price must contain positive prices")
+    if isinstance(fees, (int, float, np.number)):
+        fee_data = pd.DataFrame(
+            float(fees), index=close_data.index, columns=close_data.columns
         )
-        gross_value = end_positions.sum() + dividend_cash
-        if gross_value <= 0:
-            raise ValueError("Portfolio gross value must remain positive")
+        fee_data.iloc[0] = 0.0
+    else:
+        fee_data = fees.reindex(index=close_data.index, columns=close_data.columns)
+        if fee_data.isna().any().any():
+            raise ValueError("fees must cover all close dates and symbols")
+    if fee_data.lt(0).any().any():
+        raise ValueError("fees must not be negative")
+    if slippage < 0:
+        raise ValueError("slippage must not be negative")
+    if init_cash <= 0:
+        raise ValueError("init_cash must be positive")
 
-        pre_trade_weights = end_positions.div(gross_value)
-        target = weight_data.loc[end]
-        symbols = pre_trade_weights.index.union(target.index)
-        turnover = 0.5 * (
-            pre_trade_weights.reindex(symbols, fill_value=0.0)
-            .sub(target.reindex(symbols, fill_value=0.0))
-            .abs()
-            .sum()
-            + dividend_cash / gross_value
-        )
-        transaction_cost = turnover * fee_rate
-        result.loc[end] = [
-            end_positions.sum() - 1.0,
-            gross_value * (1.0 - transaction_cost) - 1.0,
-            dividend_cash,
-            turnover,
-            transaction_cost,
-        ]
-
-    result["price_index"] = (1.0 + result["price_return"]).cumprod()
-    result["total_return_index"] = (1.0 + result["total_return"]).cumprod()
-    return result[REBALANCED_BACKTEST_COLUMNS]
+    return vbt.Portfolio.from_orders(
+        close_data,
+        size=held_weights,
+        size_type="targetpercent",
+        direction="longonly",
+        price=price,
+        fees=fee_data,
+        slippage=slippage,
+        init_cash=init_cash,
+        cash_sharing=True,
+        call_seq="auto",
+        group_by=True,
+        freq=freq,
+    )
 
 
-def _prepare_price_panel(prices: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(prices, pd.DataFrame):
-        raise TypeError("prices must be a DataFrame")
-    out = prices.copy()
+def _prepare_panel(data: pd.DataFrame, name: str) -> pd.DataFrame:
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError(f"{name} must be a DataFrame")
+    out = data.copy()
     out.index = pd.to_datetime(out.index, errors="coerce")
-    if out.index.hasnans:
-        raise ValueError("prices index must not contain invalid dates")
+    if out.empty or out.index.hasnans:
+        raise ValueError(f"{name} must contain valid dates")
     if out.index.has_duplicates:
-        raise ValueError("prices index must be unique")
+        raise ValueError(f"{name} index must be unique")
     if out.columns.has_duplicates:
-        raise ValueError("prices columns must be unique")
+        raise ValueError(f"{name} columns must be unique")
     out.columns = out.columns.astype(str)
     return out.apply(pd.to_numeric, errors="coerce").sort_index()
 
 
-def _prepare_target_weights(target_weights: pd.DataFrame) -> pd.DataFrame:
+def _prepare_target_weights(
+    target_weights: pd.DataFrame,
+    close_columns: pd.Index,
+) -> pd.DataFrame:
     if not isinstance(target_weights, pd.DataFrame):
         raise TypeError("target_weights must be a DataFrame")
     out = target_weights.copy()
@@ -119,44 +113,12 @@ def _prepare_target_weights(target_weights: pd.DataFrame) -> pd.DataFrame:
     if out.columns.has_duplicates:
         raise ValueError("target_weights columns must be unique")
     out.columns = out.columns.astype(str)
+    unsupported = sorted(set(out.columns) - set(close_columns))
+    if unsupported:
+        raise ValueError(f"target_weights symbols missing from close: {unsupported}")
     out = out.apply(pd.to_numeric, errors="coerce").fillna(0.0).sort_index()
     if out.lt(0).any().any():
         raise ValueError("target_weights must not be negative")
     if not out.sum(axis=1).sub(1.0).abs().le(1e-10).all():
         raise ValueError("Each target_weights row must sum to 1")
     return out
-
-
-def _prepare_cash_events(cash_events: pd.DataFrame | None) -> pd.DataFrame:
-    columns = ["date", "symbol", "cash_per_share"]
-    if cash_events is None:
-        return pd.DataFrame(columns=columns)
-    missing = sorted(set(columns) - set(cash_events))
-    if missing:
-        raise ValueError(f"cash_events missing required columns: {missing}")
-    out = cash_events.loc[:, columns].copy()
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out["symbol"] = out["symbol"].astype(str)
-    out["cash_per_share"] = pd.to_numeric(out["cash_per_share"], errors="coerce")
-    if out[["date", "symbol", "cash_per_share"]].isna().any().any():
-        raise ValueError("cash_events must not contain invalid values")
-    if out["cash_per_share"].lt(0).any():
-        raise ValueError("cash_per_share must not be negative")
-    return out.sort_values(["date", "symbol"]).reset_index(drop=True)
-
-
-def _interval_cash(
-    cash_events: pd.DataFrame,
-    normalized_shares: pd.Series,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> float:
-    events = cash_events.loc[
-        cash_events["symbol"].isin(normalized_shares.index)
-        & cash_events["date"].gt(start)
-        & cash_events["date"].le(end)
-        & cash_events["cash_per_share"].gt(0)
-    ]
-    return float(
-        events["symbol"].map(normalized_shares).mul(events["cash_per_share"]).sum()
-    )

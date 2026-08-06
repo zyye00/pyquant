@@ -98,6 +98,33 @@ def clean_baostock_dividends(
     return out[list(fields["data"])]
 
 
+def clean_baostock_adjust_factors(
+    data: pd.DataFrame,
+    code: str,
+) -> pd.DataFrame:
+    """Normalize BaoStock cumulative adjustment-factor events."""
+    fields = _BAOSTOCK["adjust_factor"]
+    out = data.rename(
+        columns={
+            key: value for key, value in fields["field_map"].items() if key != "code"
+        }
+    ).copy()
+    for column in fields["data"]:
+        if column not in out:
+            out[column] = pd.NA
+    out["code"] = out["code"].fillna(code).astype(str)
+    out["operate_date"] = pd.to_datetime(out["operate_date"], errors="coerce")
+    if out["operate_date"].isna().any():
+        raise ValueError("Adjustment-factor operate_date must not be missing")
+    for column in fields["numeric"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+        if out[column].isna().any() or (~out[column].gt(0)).any():
+            raise ValueError(f"{column} must contain positive numbers")
+    if out.duplicated("operate_date").any():
+        raise ValueError("Adjustment factors contain duplicate operate dates")
+    return out[list(fields["data"])].sort_values("operate_date").reset_index(drop=True)
+
+
 def clean_baostock_profit(
     data: pd.DataFrame,
     code: str,
@@ -342,6 +369,25 @@ def query_baostock_dividends(code: str, year: int, client: Any) -> pd.DataFrame:
     try:
         return baostock_result_to_frame(
             client.bs.query_dividend_data(code, str(year), yearType="operate")
+        )
+    except Exception as exc:
+        raise RuntimeError(f"BaoStock request failed: {exc}") from exc
+
+
+def query_baostock_adjust_factors(
+    code: str,
+    start_date: str,
+    end_date: str,
+    client: Any,
+) -> pd.DataFrame:
+    """Query adjustment-factor events for one security."""
+    try:
+        return baostock_result_to_frame(
+            client.bs.query_adjust_factor(
+                code,
+                start_date=start_date,
+                end_date=end_date,
+            )
         )
     except Exception as exc:
         raise RuntimeError(f"BaoStock request failed: {exc}") from exc

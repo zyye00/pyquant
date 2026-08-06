@@ -15,6 +15,7 @@ KNOWN_SOURCES = {"akshare", "baostock", "generated", "rqdata"}
 KNOWN_UPDATE_KINDS = {
     "csindex_history",
     "dividend",
+    "adjust_factor",
     "history",
     "index_constituents",
     "profit_quarterly",
@@ -118,7 +119,7 @@ def _update_from_mapping(
         raise ValueError(f"Generated dataset {name!r} cannot define updates")
     allowed = {
         "akshare": {"csindex_history"},
-        "baostock": {"dividend", "history", "profit_quarterly"},
+        "baostock": {"adjust_factor", "dividend", "history", "profit_quarterly"},
         "rqdata": {"index_constituents", "stock_pb"},
     }
     if kind not in allowed[source]:

@@ -2,6 +2,7 @@
 
 from pyquant.backtest import run_backtest
 from pyquant.data import (
+    build_back_adjusted_close,
     MinuteRequest,
     UpdateJob,
     get_period_end_dates,
@@ -26,6 +27,7 @@ __all__ = [
     "MinuteRequest",
     "UpdateJob",
     "build_div_low_vol_universe",
+    "build_back_adjusted_close",
     "build_universe",
     "calc_metrics",
     "ensure_dir",

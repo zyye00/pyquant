@@ -14,6 +14,27 @@ stock_daily:
   numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm]
   update: {kind: history, target: stock, pool: true}
 
+stock_adjust_factor:
+  description: BaoStock cumulative stock adjustment-factor events.
+  source: baostock
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.stock_adjust_factor, requires_dates: false}
+  columns: [symbol, operate_date, fore_adjust_factor, back_adjust_factor, adjust_factor]
+  required: [symbol, operate_date, back_adjust_factor]
+  primary_key: [symbol, operate_date]
+  date_column: operate_date
+  date_columns: [operate_date]
+  numeric_columns: [fore_adjust_factor, back_adjust_factor, adjust_factor]
+  update: {kind: adjust_factor, pool: true}
+
+stock_adjust_factor_coverage:
+  description: Completed BaoStock adjustment-factor query ranges.
+  source: generated
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.stock_adjust_factor_coverage, requires_dates: false}
+  columns: [symbol, start, end]
+  required: [symbol, start, end]
+  primary_key: [symbol, start, end]
+  date_columns: [start, end]
+
 stock_pb_daily:
   description: Daily PB factors from RQData in all supported accounting conventions.
   source: rqdata

@@ -29,6 +29,7 @@ from pyquant.data.updater import (
     init_data_storage,
     plan_missing_minute_requests,
     update_dividends,
+    update_adjust_factors,
     update_csindex_daily,
     update_history_dataset,
     update_profit_quarterly,
@@ -132,6 +133,19 @@ class FakeClient:
             rows,
         )
 
+    def query_adjust_factor(self, code, start_date, end_date):
+        self.calls.append(("adjust_factor", code, start_date, end_date))
+        return FakeResult(
+            [
+                "code",
+                "dividOperateDate",
+                "foreAdjustFactor",
+                "backAdjustFactor",
+                "adjustFactor",
+            ],
+            [[code, "2020-01-02", "0.8", "1.25", "1.25"]],
+        )
+
     def query_profit_data(self, code, year, quarter):
         self.calls.append((code, year, quarter))
         rows = (
@@ -157,6 +171,7 @@ class FakePBClient:
                     "000002.XSHE",
                     "000003.XSHE",
                     "000004.XSHE",
+                    "000005.XSHE",
                 ],
                 "listed_date": [
                     "2010-01-01",
@@ -164,6 +179,7 @@ class FakePBClient:
                     "2018-01-01",
                     "2020-01-01",
                     "2010-01-01",
+                    "2999-12-31",
                 ],
                 "de_listed_date": [
                     "0000-00-00",
@@ -171,6 +187,7 @@ class FakePBClient:
                     "0000-00-00",
                     "0000-00-00",
                     "2016-12-31",
+                    "0000-00-00",
                 ],
             }
         )
@@ -320,6 +337,29 @@ def test_update_checks_one_stock_at_a_time_and_counts_multiple_ranges_once(tmp_p
     ]
     assert Path(result.loc[0, "target_path"]).name == "pyquant.duckdb"
     assert progress == [(0, 1), (1, 1)]
+
+
+def test_adjust_factor_update_starts_from_1990_and_merges_coverage(tmp_path):
+    client = FakeClient()
+    result = update_adjust_factors(
+        ["sh.600000"],
+        "2014-01-01",
+        "2020-12-31",
+        tmp_path / "data",
+        10,
+        client=client,
+    )
+
+    assert result[["code", "start_date", "end_date"]].values.tolist() == [
+        ["sh.600000", "1990-01-01", "2020-12-31"]
+    ]
+    assert client.calls == [
+        ("adjust_factor", "sh.600000", "1990-01-01", "2020-12-31")
+    ]
+    assert read_database(
+        tmp_path / "data",
+        "SELECT start_date, end_date FROM meta.stock_adjust_factor_coverage",
+    ) == [(date(1990, 1, 1), date(2020, 12, 31))]
 
 
 def test_history_query_cache_skips_completed_ranges(tmp_path):

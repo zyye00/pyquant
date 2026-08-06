@@ -8,6 +8,7 @@ import yaml
 
 from pyquant import (
     DIVIDEND_AFTER_TAX_RATIO,
+    build_back_adjusted_close,
     MinuteRequest,
     build_div_low_vol_universe,
     get_period_end_dates,
@@ -56,6 +57,7 @@ def select_div_low_vol_constituents(
     as_of_date: str | pd.Timestamp,
     config: dict,
     prepared: dict[str, pd.DataFrame] | None = None,
+    volatility_price: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
     prepared = prepared or prepare_div_low_vol_universe_inputs(
@@ -71,9 +73,15 @@ def select_div_low_vol_constituents(
         prepared,
     ).reset_index()
     selection = config["selection"]
-    price_data = prepared["price"]
-    price_data = price_data[price_data["date"] <= pd.Timestamp(as_of_date)]
-    candidate_price = price_data[price_data["symbol"].isin(metrics["symbol"])]
+    volatility_data = _prepare_index_price(
+        volatility_price if volatility_price is not None else prepared["price"]
+    )
+    volatility_data = volatility_data[
+        volatility_data["date"] <= pd.Timestamp(as_of_date)
+    ]
+    candidate_price = volatility_data[
+        volatility_data["symbol"].isin(metrics["symbol"])
+    ]
     metrics["volatility_240d"] = metrics["symbol"].map(
         _price_volatility(candidate_price, selection["volatility_lookback_days"])
     )
@@ -397,8 +405,10 @@ def calculate_div_low_vol_monthly_rebalanced_index(
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
     config: dict,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Calculate the strategy 1 monthly-rebalanced total-return index."""
+    """Calculate strategy 1 using BaoStock back-adjusted monthly prices."""
     try:
         strategy_config = {
             "universe": config["universe"],
@@ -434,6 +444,8 @@ def calculate_div_low_vol_monthly_rebalanced_index(
         strategy_config,
         rebalance_dates,
         transaction_cost_rate,
+        adjustment_factors,
+        adjustment_factor_coverage,
     )
 
 
@@ -445,11 +457,19 @@ def _calculate_div_low_vol_monthly_index(
     config: dict,
     rebalance_dates: pd.DatetimeIndex,
     transaction_cost_rate: float,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
     )
-    index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
+    adjusted_price = build_back_adjusted_close(
+        price,
+        adjustment_factors,
+        adjustment_factor_coverage,
+    ).loc[:, ["date", "symbol", "adjusted_close"]].rename(
+        columns={"adjusted_close": "close"}
+    )
     constituent_snapshots = []
     constituent_weights = {}
 
@@ -462,6 +482,7 @@ def _calculate_div_low_vol_monthly_index(
             rebalance_date,
             config,
             prepared,
+            adjusted_price,
         )
         constituent_weights[rebalance_date] = constituents["weight"]
         constituent_snapshots.append(
@@ -471,23 +492,30 @@ def _calculate_div_low_vol_monthly_index(
         )
     target_weights = pd.DataFrame(constituent_weights).T.fillna(0.0)
     target_weights.index.name = "date"
-    cash_events = index_inputs["dividend_events"].rename(
-        columns={
-            "payment_date": "date",
-            "cash_dividend_before_tax": "cash_per_share",
-        }
+    adjusted_prices = adjusted_price.pivot(
+        index="date", columns="symbol", values="close"
     )
-    cash_events["cash_per_share"] = (
-        cash_events["cash_per_share"] * DIVIDEND_AFTER_TAX_RATIO
+    monthly_prices = adjusted_prices.reindex(rebalance_dates).ffill()
+    monthly_prices = monthly_prices.reindex(columns=target_weights.columns)
+    fee_matrix = pd.DataFrame(
+        transaction_cost_rate / 2.0,
+        index=monthly_prices.index,
+        columns=monthly_prices.columns,
     )
-    cash_events = cash_events.loc[
-        cash_events["date"].notna() & cash_events["cash_per_share"].gt(0)
-    ]
-    index = run_backtest(
-        index_inputs["prices"],
+    fee_matrix.iloc[0] = 0.0
+    portfolio = run_backtest(
+        monthly_prices,
         target_weights,
-        cash_events[["date", "symbol", "cash_per_share"]],
-        fee_rate=transaction_cost_rate,
+        fees=fee_matrix,
+        freq="ME",
+    )
+    values = portfolio.value()
+    returns = portfolio.returns().rename("total_return")
+    index = pd.DataFrame(
+        {
+            "total_return": returns,
+            "total_return_index": values / values.iloc[0],
+        }
     )
     return index[MONTHLY_INDEX_COLUMNS], pd.concat(constituent_snapshots).sort_index()
 
@@ -635,7 +663,8 @@ def _prepare_index_inputs(
     ]
     if dividends.duplicated(event_key).any():
         raise ValueError(f"dividends contain duplicate event keys: {event_key}")
-    events = dividends.loc[:, sorted(required)].copy()
+    event_columns = sorted(required | {"operate_date"}.intersection(dividends.columns))
+    events = dividends.loc[:, event_columns].copy()
     return {
         "price": price_data,
         "prices": price_data.pivot(index="date", columns="symbol", values="close"),
@@ -644,6 +673,37 @@ def _prepare_index_inputs(
             normalize_query_years(dividend_queries).itertuples(index=False, name=None)
         ),
     }
+
+
+def _prepare_index_cash_events(
+    dividends: pd.DataFrame,
+    date_column: str,
+    symbols: pd.Index | None = None,
+    require_dates: bool = False,
+) -> pd.DataFrame:
+    if date_column not in dividends:
+        raise ValueError(f"dividends must contain {date_column}")
+    events = dividends.loc[:, ["symbol", date_column, "cash_dividend_before_tax"]].copy()
+    if symbols is not None:
+        events = events.loc[events["symbol"].isin(symbols)]
+    positive = events["cash_dividend_before_tax"].gt(0)
+    if require_dates and events.loc[positive, date_column].isna().any():
+        raise ValueError(
+            f"Positive dividends for held symbols must contain {date_column}"
+        )
+    events = events.rename(
+        columns={
+            date_column: "date",
+            "cash_dividend_before_tax": "cash_per_share",
+        }
+    )
+    events["cash_per_share"] = (
+        events["cash_per_share"] * DIVIDEND_AFTER_TAX_RATIO
+    )
+    return events.loc[
+        events["date"].notna() & events["cash_per_share"].gt(0),
+        ["date", "symbol", "cash_per_share"],
+    ]
 
 
 def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:

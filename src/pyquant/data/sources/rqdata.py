@@ -67,15 +67,22 @@ def query_rqdata_stock_symbols(
     missing = sorted(required - set(data.columns))
     if missing:
         raise ValueError(f"RQData instrument-list response missing fields: {missing}")
-    listed = pd.to_datetime(data["listed_date"], errors="coerce")
+    listed = data["listed_date"].astype("string")
+    listed_at = pd.to_datetime(
+        listed.mask(listed.eq("2999-12-31")),
+        errors="coerce",
+    )
     de_listed = data["de_listed_date"].astype("string")
     open_ended = de_listed.isna() | de_listed.isin(["0000-00-00", ""])
     de_listed_at = pd.to_datetime(de_listed.mask(open_ended), errors="coerce")
-    invalid_dates = listed.isna() | (~open_ended & de_listed_at.isna())
+    invalid_dates = (listed.ne("2999-12-31") & listed_at.isna()) | (
+        ~open_ended & de_listed_at.isna()
+    )
     if invalid_dates.any():
         raise ValueError("RQData instrument-list response contains invalid listing dates")
     selected = data.loc[
-        listed.le(end_at) & (open_ended | de_listed_at.gt(start_at)), "order_book_id"
+        listed_at.le(end_at) & (open_ended | de_listed_at.gt(start_at)),
+        "order_book_id",
     ]
     if selected.isna().any():
         raise ValueError("RQData instrument-list response contains invalid identifiers")

@@ -18,6 +18,7 @@ dependencies = [
     "scipy",
     "statsmodels",
     "empyrical-reloaded",
+    "vectorbt>=1.1",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +35,6 @@ notebook = [
     "jupyterlab",
     "ipykernel",
 ]
-backtest = ["vectorbt"]
 report = ["quantstats"]
 factor = ["alphalens-reloaded"]
 

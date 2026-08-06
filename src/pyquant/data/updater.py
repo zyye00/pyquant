@@ -28,11 +28,13 @@ from pyquant.data.sources.baostock import (
     BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
     BaostockClient,
     append_request_log,
+    clean_baostock_adjust_factors,
     clean_baostock_data,
     clean_baostock_dividends,
     clean_baostock_profit,
     normalize_baostock_code,
     query_baostock_dividends,
+    query_baostock_adjust_factors,
     query_baostock_history,
     query_baostock_profit,
     request_count_today,
@@ -61,6 +63,7 @@ from pyquant.data.store import (
     dividend_coverage,
     index_daily_coverage,
     share_capital_coverage,
+    stock_adjust_factor_coverage,
     stock_pb_coverage,
     stock_daily_coverage,
     recover_minute_download_tasks,
@@ -69,6 +72,7 @@ from pyquant.data.store import (
     write_index_constituents,
     write_index_daily_request,
     write_share_capital_request,
+    write_stock_adjust_factor_request,
     write_minute_request,
     write_minute_request_failure,
     write_stock_daily_request,
@@ -749,6 +753,112 @@ def _update_stock_pb(
     return pd.DataFrame(results, columns=_rqdata_pb["result"])
 
 
+def update_adjust_factors(
+    codes: Iterable[str],
+    start_date: str,
+    end_date: str,
+    data_root: Path = Path("data"),
+    max_requests_per_day: int = BAOSTOCK_DEFAULT_SAFE_REQUEST_LIMIT_PER_DAY,
+    client: Any | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
+) -> pd.DataFrame:
+    """Download cumulative BaoStock adjustment-factor events.
+
+    BaoStock's back-adjustment factor is cumulative from the first event.  A
+    request that starts at the strategy's backtest date would therefore lose
+    the history needed to construct a correctly adjusted price.  Every symbol
+    is consequently covered from 1990-01-01 (or an earlier explicit start).
+    Empty source responses are still recorded as coverage.
+    """
+    fields = _fields["adjust_factor"]
+    codes = list(dict.fromkeys(_normalize_baostock_code(code) for code in codes))
+    if not codes:
+        raise ValueError("No security codes were selected")
+    if max_tasks is not None and max_tasks <= 0:
+        raise ValueError("max_tasks must be positive")
+    requested_start = pd.Timestamp(start_date)
+    requested_end = pd.Timestamp(end_date)
+    if requested_start > requested_end:
+        raise ValueError("start_date must not be after end_date")
+    source_start = min(requested_start, pd.Timestamp("1990-01-01"))
+    paths = init_data_storage(data_root)
+    effective_limit = validate_request_limit(max_requests_per_day)
+    context = None if client is not None else BaostockClient()
+    active_client = client if client is not None else context.__enter__()
+    connection = connect_database(paths.database_path)
+    results = []
+    completed = 0
+    tasks = 0
+    if progress is not None:
+        progress(0, len(codes))
+    create_download_lock(data_root)
+    try:
+        for code in codes:
+            if checkpoint is not None and not checkpoint():
+                return pd.DataFrame(results, columns=fields["result"])
+            queried = stock_adjust_factor_coverage(connection, code)
+            missing = missing_baostock_ranges(
+                source_start.strftime("%Y-%m-%d"),
+                requested_end.strftime("%Y-%m-%d"),
+                queried_ranges=queried,
+            )
+            for range_start, range_end in missing:
+                if max_tasks is not None and tasks >= max_tasks:
+                    return pd.DataFrame(results, columns=fields["result"])
+                if request_count_today(paths.request_log_path) >= effective_limit:
+                    return pd.DataFrame(results, columns=fields["result"])
+                if checkpoint is not None and not checkpoint():
+                    return pd.DataFrame(results, columns=fields["result"])
+                tasks += 1
+                append_request_log(
+                    paths.request_log_path,
+                    "query_adjust_factor",
+                    code,
+                    "adjust_factor",
+                    range_start,
+                    range_end,
+                )
+                data = clean_baostock_adjust_factors(
+                    query_baostock_adjust_factors(
+                        code,
+                        range_start,
+                        range_end,
+                        active_client,
+                    ),
+                    code,
+                )
+                write_stock_adjust_factor_request(
+                    connection,
+                    code,
+                    data,
+                    range_start,
+                    range_end,
+                )
+                results.append(
+                    (
+                        code,
+                        range_start,
+                        range_end,
+                        "success",
+                        len(data),
+                        "",
+                    )
+                )
+                if checkpoint is not None and not checkpoint():
+                    return pd.DataFrame(results, columns=fields["result"])
+            completed += 1
+            if progress is not None:
+                progress(completed, len(codes))
+        return pd.DataFrame(results, columns=fields["result"])
+    finally:
+        connection.close()
+        remove_download_lock(data_root)
+        if context is not None:
+            context.__exit__(None, None, None)
+
+
 def update_dividends(
     codes: Iterable[str],
     start_year: int,
@@ -1182,6 +1292,13 @@ def _run_update_dataset(
                 codes,
                 pd.Timestamp(start).year,
                 pd.Timestamp(end_date).year,
+                **common,
+            )
+        if update.kind == "adjust_factor":
+            return update_adjust_factors(
+                codes,
+                start,
+                end_date,
                 **common,
             )
         return update_profit_quarterly(codes, start, end_date, **common)

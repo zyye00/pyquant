@@ -1,5 +1,6 @@
 """Stable research-facing data APIs."""
 
+from pyquant.data.adjustments import build_back_adjusted_close
 from pyquant.data.loader import (
     get_period_end_dates,
     load_dataset,
@@ -14,6 +15,7 @@ from pyquant.data.updater import (
 )
 
 __all__ = [
+    "build_back_adjusted_close",
     "MinuteRequest",
     "UpdateJob",
     "get_period_end_dates",

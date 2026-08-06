@@ -33,12 +33,7 @@ output_columns:
     - price_index
     - total_return_index
   monthly_index:
-    - price_return
     - total_return
-    - dividend_cash
-    - turnover
-    - transaction_cost
-    - price_index
     - total_return_index
   timing_spread:
     - constituent_effective_date
@@ -92,7 +87,7 @@ minute_data:
   min_valid_days: 20
   min_bars_per_day: null
   max_attempts: 3
-  quota_reserve_bytes: 80000000
+  quota_reserve_bytes: 00000000
 
 strategy_3:
   index_code: H30269

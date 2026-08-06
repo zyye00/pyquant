@@ -178,6 +178,24 @@ def stock_daily_coverage(
     return _daily_coverage(connection, code, field_set_id, _SECURITY_SPEC)
 
 
+def stock_adjust_factor_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    code: str,
+) -> list[tuple[str, str]]:
+    """Return completed adjustment-factor query ranges for one security."""
+    rows = connection.execute(
+        """
+        SELECT CAST(c.start_date AS VARCHAR), CAST(c.end_date AS VARCHAR)
+        FROM meta.stock_adjust_factor_coverage AS c
+        JOIN ref.security AS s USING (security_id)
+        WHERE s.symbol = ?
+        ORDER BY c.start_date
+        """,
+        [normalize_security_symbol(code)],
+    ).fetchall()
+    return [(start, end) for start, end in rows]
+
+
 def stock_pb_coverage(
     connection: duckdb.DuckDBPyConnection,
     code: str,
@@ -691,6 +709,65 @@ def write_stock_daily_request(
         )
 
 
+def write_stock_adjust_factor_request(
+    connection: duckdb.DuckDBPyConnection,
+    code: str,
+    data: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+) -> None:
+    """Replace one adjustment-factor response and merge its coverage."""
+    symbol = normalize_security_symbol(code)
+    incoming = _prepare_adjust_factors(data)
+    if not incoming.empty and incoming["operate_date"].duplicated().any():
+        raise ValueError("Adjustment factors contain duplicate operate dates")
+    start_at = pd.Timestamp(start_date)
+    end_at = pd.Timestamp(end_date)
+    if start_at > end_at:
+        raise ValueError("adjustment-factor coverage start must not be after end")
+    if not incoming.empty and not incoming["operate_date"].between(
+        start_at, end_at
+    ).all():
+        raise ValueError("Adjustment factors contain dates outside the request")
+    with _transaction(connection):
+        security_id = ensure_securities(connection, [symbol])[symbol]
+        connection.execute(
+            """
+            DELETE FROM core.stock_adjust_factor
+            WHERE security_id = ? AND operate_date BETWEEN ? AND ?
+            """,
+            [security_id, start_at.date(), end_at.date()],
+        )
+        if not incoming.empty:
+            with _registered_frame(connection, "incoming_adjust_factor", incoming):
+                connection.execute(
+                    """
+                    INSERT INTO core.stock_adjust_factor
+                    SELECT ?, CAST(operate_date AS DATE), fore_adjust_factor,
+                           back_adjust_factor, adjust_factor
+                    FROM incoming_adjust_factor
+                    """,
+                    [security_id],
+                )
+        rows = connection.execute(
+            """
+            SELECT start_date, end_date
+            FROM meta.stock_adjust_factor_coverage
+            WHERE security_id = ?
+            """,
+            [security_id],
+        ).fetchall()
+        merged = _merge_date_ranges([*rows, (start_at.date(), end_at.date())])
+        connection.execute(
+            "DELETE FROM meta.stock_adjust_factor_coverage WHERE security_id = ?",
+            [security_id],
+        )
+        connection.executemany(
+            "INSERT INTO meta.stock_adjust_factor_coverage VALUES (?, ?, ?)",
+            [(security_id, first, last) for first, last in merged],
+        )
+
+
 def write_stock_pb_request(
     connection: duckdb.DuckDBPyConnection,
     symbols: Iterable[str],
@@ -1005,6 +1082,29 @@ def _prepare_daily(data: pd.DataFrame) -> pd.DataFrame:
 
 def _prepare_stock_daily(data: pd.DataFrame) -> pd.DataFrame:
     return _prepare_daily(data)
+
+
+def _prepare_adjust_factors(data: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "operate_date",
+        "fore_adjust_factor",
+        "back_adjust_factor",
+        "adjust_factor",
+    ]
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+    missing = sorted(set(columns) - set(data))
+    if missing:
+        raise ValueError(f"Adjustment factors missing columns: {missing}")
+    out = data[columns].copy()
+    out["operate_date"] = pd.to_datetime(out["operate_date"], errors="coerce")
+    if out["operate_date"].isna().any():
+        raise ValueError("Adjustment-factor dates must not be missing")
+    for column in columns[1:]:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+        if out[column].isna().any() or (~out[column].gt(0)).any():
+            raise ValueError(f"{column} must contain positive numbers")
+    return out.sort_values("operate_date").reset_index(drop=True)
 
 
 def _prepare_stock_pb(data: pd.DataFrame) -> pd.DataFrame:

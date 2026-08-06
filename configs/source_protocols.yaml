@@ -11,6 +11,11 @@ baostock:
     data: [code, year, announce_date, record_date, operate_date, payment_date, cash_dividend_before_tax]
     result: [code, year, status, row_count, error]
     field_map: {dividPlanAnnounceDate: announce_date, dividRegistDate: record_date, dividOperateDate: operate_date, dividPayDate: payment_date, dividCashPsBeforeTax: cash_dividend_before_tax}
+  adjust_factor:
+    data: [code, operate_date, fore_adjust_factor, back_adjust_factor, adjust_factor]
+    result: [code, start_date, end_date, status, row_count, error]
+    field_map: {dividOperateDate: operate_date, foreAdjustFactor: fore_adjust_factor, backAdjustFactor: back_adjust_factor, adjustFactor: adjust_factor}
+    numeric: [fore_adjust_factor, back_adjust_factor, adjust_factor]
   profit_quarterly:
     data: [code, year, quarter, publish_date, report_date, total_shares]
     numeric: [total_shares]
