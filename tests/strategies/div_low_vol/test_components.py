@@ -23,6 +23,15 @@ select_constituents = COMPONENTS.select_div_low_vol_constituents
 select_download_symbols = COMPONENTS.select_div_low_vol_download_symbols
 build_minute_requests = COMPONENTS.build_intraday_minute_requests
 calculate_high_frequency_factor = COMPONENTS.calculate_high_frequency_volatility_factor
+select_high_frequency_constituents = (
+    COMPONENTS.select_high_frequency_div_low_vol_constituents
+)
+calculate_high_frequency_index = (
+    COMPONENTS.calculate_high_frequency_div_low_vol_monthly_rebalanced_index
+)
+calculate_high_frequency_groups = (
+    COMPONENTS.calculate_high_frequency_volatility_candidate_group_indices
+)
 
 
 def make_config(
@@ -1201,6 +1210,218 @@ def test_high_frequency_factor_is_market_cap_neutralized():
         0.0,
         abs=1e-12,
     )
+
+
+def test_high_frequency_factor_excludes_symbols_with_missing_lookback_days():
+    dates = pd.bdate_range("2024-01-01", periods=20)
+    daily = pd.DataFrame(
+        [
+            {"symbol": symbol, "trade_date": date, "volatility": 0.01 + index / 10_000}
+            for symbol in ["A", "B", "C"]
+            for index, date in enumerate(dates)
+            if not (symbol == "C" and date == dates[-1])
+        ]
+    )
+    market_cap = pd.DataFrame(
+        [
+            {"symbol": symbol, "trade_date": date, "total_market_cap": float(index + 1)}
+            for symbol, index in zip(["A", "B", "C"], range(1, 4), strict=True)
+            for date in dates
+        ]
+    )
+
+    out = calculate_high_frequency_factor(daily, market_cap, dates[-1])
+
+    assert out.index.tolist() == ["A", "B"]
+
+
+def test_high_frequency_constituents_sort_factor_and_weight_by_dividend_yield(
+    monkeypatch,
+):
+    config = make_config(dividend_top_n=3, final_n=2)
+    strategy_config = {
+        "universe": config["universe"],
+        "selection": {
+            "dividend_yield_lookback_days": 6,
+            "dividend_top_n": 3,
+            "final_n": 2,
+            "lookback_trading_days": 20,
+            "min_valid_days": 20,
+            "transaction_cost_rate": 0.0,
+        },
+    }
+    metrics = pd.DataFrame(
+        {
+            "symbol": ["B", "A", "C"],
+            "as_of_date": pd.Timestamp("2024-11-29"),
+            "price_date": pd.Timestamp("2024-11-29"),
+            "avg_market_cap_240d": [100.0, 100.0, 100.0],
+            "avg_amount_240d": [100.0, 100.0, 100.0],
+            "dividend_yield_ttm": [0.1, 0.1, 0.1],
+            "payout_ratio": [0.5, 0.5, 0.5],
+            "dividend_growth_slope": [0.0, 0.0, 0.0],
+            "dividend_yield_rank": [2, 1, 3],
+            "avg_dividend_yield_3y": [2.0, 1.0, 3.0],
+            "minute_return_volatility": [0.1, 0.1, 0.2],
+            "intraday_volatility_cv": [0.2, 0.3, 0.4],
+            "log_market_cap": [1.0, 2.0, 3.0],
+        }
+    )
+    monkeypatch.setattr(
+        COMPONENTS,
+        "_calculate_high_frequency_candidate_metrics",
+        lambda *args, **kwargs: metrics.copy(),
+    )
+
+    out = select_high_frequency_constituents(
+        make_price(["A", "B", "C"]),
+        make_dividends(["A", "B", "C"]),
+        make_queries(["A", "B", "C"]),
+        make_shares(["A", "B", "C"]),
+        pd.DataFrame(columns=["symbol", "trade_date", "volatility"]),
+        "2024-11-29",
+        strategy_config,
+    )
+
+    assert out.index.tolist() == ["A", "B"]
+    assert out["volatility_rank"].tolist() == [1, 2]
+    assert out["weight"].tolist() == pytest.approx([1 / 3, 2 / 3])
+
+
+def test_high_frequency_constituents_run_candidate_and_factor_pipeline():
+    symbols = ["A", "B", "C"]
+    dates = pd.bdate_range("2024-11-04", periods=20)
+    base = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        final_n=2,
+    )
+    strategy_config = {
+        "universe": base["universe"],
+        "selection": {
+            "dividend_yield_lookback_days": 6,
+            "dividend_top_n": 3,
+            "final_n": 2,
+            "lookback_trading_days": 20,
+            "min_valid_days": 20,
+            "transaction_cost_rate": 0.0,
+        },
+    }
+    daily_volatility = pd.DataFrame(
+        [
+            {"symbol": symbol, "trade_date": date, "volatility": 0.01 + index * (0.001 + offset / 10_000)}
+            for offset, symbol in enumerate(symbols)
+            for index, date in enumerate(dates)
+        ]
+    )
+
+    out = select_high_frequency_constituents(
+        make_price(symbols, dates=dates),
+        make_dividends(symbols),
+        make_queries(symbols),
+        make_shares(symbols),
+        daily_volatility,
+        dates[-1],
+        strategy_config,
+    )
+
+    assert len(out) == 2
+    assert out["weight"].sum() == pytest.approx(1.0)
+    assert out["minute_return_volatility"].is_monotonic_increasing
+
+
+def test_high_frequency_monthly_index_uses_shared_rebalance_backtest(monkeypatch):
+    symbols = [f"S{index:03d}" for index in range(3)]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    base = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        final_n=2,
+    )
+    config = {"universe": base["universe"], "strategy_2": {
+        "dividend_yield_lookback_days": 6,
+        "dividend_top_n": 3,
+        "final_n": 2,
+        "lookback_trading_days": 20,
+        "min_valid_days": 20,
+        "transaction_cost_rate": 0.0,
+    }}
+    dividends = make_dividends(symbols)
+    factors, coverage = make_adjustment_data(symbols)
+
+    def fake_select(*args):
+        date = pd.Timestamp(args[5])
+        symbol = "S000" if date.month == 1 else "S001"
+        return pd.DataFrame(
+            {"weight": [1.0]}, index=pd.Index([symbol], name="symbol")
+        )
+
+    monkeypatch.setattr(COMPONENTS, "select_high_frequency_div_low_vol_constituents", fake_select)
+    index, constituents = calculate_high_frequency_index(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        pd.DataFrame(columns=["symbol", "trade_date", "volatility"]),
+        dates[0],
+        dates[-1],
+        config,
+        factors,
+        coverage,
+    )
+
+    assert len(index) == 3
+    assert constituents.index.get_level_values("symbol").tolist() == [
+        "S000",
+        "S001",
+        "S001",
+    ]
+
+
+def test_high_frequency_candidate_groups_keep_factor_ic_metadata(monkeypatch):
+    symbols = [f"S{index:02d}" for index in range(10)]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    base = make_config(market_lookback_days=4, dividend_yield_lookback_days=6)
+    config = {"universe": base["universe"], "strategy_2": {
+        "dividend_yield_lookback_days": 6,
+        "dividend_top_n": 10,
+        "final_n": 2,
+        "lookback_trading_days": 20,
+        "min_valid_days": 20,
+        "transaction_cost_rate": 0.0,
+    }}
+    dividends = make_dividends(symbols)
+    factors, coverage = make_adjustment_data(symbols)
+
+    def fake_metrics(*args):
+        return pd.DataFrame({
+            "symbol": symbols,
+            "minute_return_volatility": [float(index) for index in range(10)],
+        })
+
+    monkeypatch.setattr(
+        COMPONENTS,
+        "_calculate_high_frequency_candidate_metrics",
+        fake_metrics,
+    )
+    groups = calculate_high_frequency_groups(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        pd.DataFrame(columns=["symbol", "trade_date", "volatility"]),
+        dates[0],
+        dates[-1],
+        config,
+        factors,
+        coverage,
+    )
+
+    assert groups.columns.tolist() == list(COMPONENTS.TRADITIONAL_VOLATILITY_GROUP_COLUMNS)
+    assert groups.iloc[0].eq(1.0).all()
+    assert groups.attrs["factor_ic"].columns.tolist() == ["ic", "rank_ic"]
 
 
 def test_traditional_volatility_groups_are_balanced_and_stably_sorted():

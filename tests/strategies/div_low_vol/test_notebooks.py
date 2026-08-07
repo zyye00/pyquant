@@ -72,3 +72,18 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
     assert "backtest_valuation_spread_timing" in strategy_notebook
     assert "估值差BP_spread与对应下个月红利低波全收益指数月度收益" in strategy_notebook
     assert "twinx" in strategy_notebook
+
+
+def test_strategy_2_notebook_uses_public_interfaces_and_candidate_pool_scope():
+    notebooks = load_notebooks("download.ipynb", "2_high_frequency.ipynb")
+    download_notebook = str(notebooks["download.ipynb"])
+    strategy_notebook = str(notebooks["2_high_frequency.ipynb"])
+
+    assert "config[\"strategy_2\"]" in download_notebook
+    assert "update_dataset" not in strategy_notebook
+    assert "load_dataset(\"intraday_volatility_daily\"" in strategy_notebook
+    assert "calculate_high_frequency_div_low_vol_monthly_rebalanced_index" in strategy_notebook
+    assert "calculate_high_frequency_volatility_candidate_group_indices" in strategy_notebook
+    assert "候选池" in strategy_notebook
+    assert "不代表研报的全 A 或完整红利股票池结果" in strategy_notebook
+    assert "Rank IC均值" in strategy_notebook

@@ -34,6 +34,9 @@ TRADITIONAL_VOLATILITY_GROUP_COLUMNS = (
     "第5组（高波）",
     "多空对冲（低波-高波）",
 )
+HIGH_FREQUENCY_CONSTITUENT_COLUMNS = _OUTPUT_COLUMNS[
+    "high_frequency_constituent"
+]
 
 
 def select_div_low_vol_download_symbols(
@@ -120,7 +123,7 @@ def select_div_low_vol_candidates(
     prepared: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Select the dividend-ranked candidates before applying a volatility factor."""
-    _validate_selection_config(config)
+    _validate_candidate_config(config)
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
     prepared = prepared or prepare_div_low_vol_universe_inputs(
@@ -290,6 +293,90 @@ def calculate_high_frequency_volatility_factor(
     ].sort_index()
 
 
+def select_high_frequency_div_low_vol_constituents(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    daily_volatility: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    config: dict,
+    prepared: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """Select strategy-2 constituents from the high-frequency factor."""
+    metrics = _calculate_high_frequency_candidate_metrics(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        daily_volatility,
+        as_of_date,
+        config,
+        prepared,
+    )
+    selection = config["selection"]
+    metrics = metrics.sort_values(
+        ["minute_return_volatility", "symbol"], ascending=[True, True]
+    ).head(selection["final_n"])
+    if len(metrics) < selection["final_n"]:
+        raise ValueError(
+            f"Only {len(metrics)} eligible symbols remain on "
+            f"{pd.Timestamp(as_of_date).date()}; at least "
+            f"{selection['final_n']} are required"
+        )
+    metrics["volatility_rank"] = np.arange(1, len(metrics) + 1)
+    weight_total = metrics["avg_dividend_yield_3y"].sum()
+    if not np.isfinite(weight_total) or weight_total <= 0:
+        raise ValueError("Selected dividend yields must sum to a positive value")
+    metrics["weight"] = metrics["avg_dividend_yield_3y"] / weight_total
+    return metrics.set_index("symbol")[list(HIGH_FREQUENCY_CONSTITUENT_COLUMNS)]
+
+
+def _calculate_high_frequency_candidate_metrics(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    daily_volatility: pd.DataFrame,
+    as_of_date: str | pd.Timestamp,
+    config: dict,
+    prepared: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    _validate_strategy_2_config(config)
+    prepared = prepared or prepare_div_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    candidates = select_div_low_vol_candidates(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        as_of_date,
+        config,
+        prepared,
+    ).reset_index()
+    market_cap = prepared["market_data"].loc[
+        :, ["symbol", "date", "total_market_cap"]
+    ].rename(columns={"date": "trade_date"})
+    factor = calculate_high_frequency_volatility_factor(
+        daily_volatility.loc[
+            daily_volatility["symbol"].astype(str).isin(candidates["symbol"])
+        ],
+        market_cap.loc[market_cap["symbol"].astype(str).isin(candidates["symbol"])],
+        as_of_date,
+        lookback_trading_days=config["selection"]["lookback_trading_days"],
+        min_valid_days=config["selection"]["min_valid_days"],
+    ).drop(columns="as_of_date").reset_index()
+    metrics = candidates.merge(factor, on="symbol", how="inner", validate="one_to_one")
+    if len(metrics) < config["selection"]["final_n"]:
+        raise ValueError(
+            f"Only {len(metrics)} eligible symbols remain on "
+            f"{pd.Timestamp(as_of_date).date()}; at least "
+            f"{config['selection']['final_n']} are required"
+        )
+    return metrics
+
+
 def calculate_div_low_vol_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
@@ -457,6 +544,136 @@ def calculate_div_low_vol_monthly_rebalanced_index(
     )
 
 
+def calculate_high_frequency_div_low_vol_monthly_rebalanced_index(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    daily_volatility: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    config: dict,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Calculate strategy 2 with monthly high-frequency-volatility selection."""
+    strategy_config = _strategy_2_selection_config(config)
+    _validate_strategy_2_config(strategy_config)
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    price_data = _prepare_index_price(price)
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(start, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    rebalance_dates = get_period_end_dates(calendar)
+    if rebalance_dates.empty:
+        raise ValueError("No monthly rebalance effective date falls within the period")
+    prepared = prepare_div_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    return _calculate_monthly_index_with_selector(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        strategy_config,
+        rebalance_dates,
+        strategy_config["selection"]["transaction_cost_rate"],
+        adjustment_factors,
+        adjustment_factor_coverage,
+        lambda date, adjusted, shared: select_high_frequency_div_low_vol_constituents(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            daily_volatility,
+            date,
+            strategy_config,
+            shared,
+        ),
+        prepared,
+    )
+
+
+def calculate_high_frequency_volatility_candidate_group_indices(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    daily_volatility: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    config: dict,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate factor groups and IC within monthly top-dividend candidates."""
+    strategy_config = _strategy_2_selection_config(config)
+    _validate_strategy_2_config(strategy_config)
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    price_data = _prepare_index_price(price)
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(start, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    rebalance_dates = get_period_end_dates(calendar)
+    if rebalance_dates.empty:
+        raise ValueError("No monthly rebalance effective date falls within the period")
+    prepared = prepare_div_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    adjusted_price = build_back_adjusted_close(
+        price,
+        adjustment_factors,
+        adjustment_factor_coverage,
+    ).loc[:, ["date", "symbol", "adjusted_close"]].rename(
+        columns={"adjusted_close": "close"}
+    )
+    monthly_prices = (
+        adjusted_price.pivot(index="date", columns="symbol", values="close")
+        .ffill()
+        .reindex(rebalance_dates)
+    )
+    snapshots = []
+    groups = []
+    for rebalance_date in rebalance_dates:
+        metrics = _calculate_high_frequency_candidate_metrics(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            daily_volatility,
+            rebalance_date,
+            strategy_config,
+            prepared,
+        )
+        factor = metrics.set_index("symbol")["minute_return_volatility"]
+        groups.append(
+            _assign_factor_groups(
+                factor.index.tolist(),
+                factor.to_dict(),
+                rebalance_date,
+                "high-frequency candidates",
+            )
+        )
+        snapshots.append(factor)
+    nav = _run_factor_group_backtest(monthly_prices, rebalance_dates, groups)
+    nav.attrs["factor_ic"] = _calculate_factor_ic(
+        monthly_prices, rebalance_dates, snapshots, groups
+    )
+    return nav
+
+
 def calculate_traditional_volatility_group_indices(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
@@ -580,15 +797,25 @@ def _assign_traditional_volatility_groups(
     as_of_date: pd.Timestamp | None = None,
     pool_name: str = "pool",
 ) -> pd.Series:
-    """Sort low-to-high volatility and assign five balanced groups."""
+    """Sort traditional volatility low-to-high into five balanced groups."""
+    return _assign_factor_groups(symbols, volatility, as_of_date, pool_name)
+
+
+def _assign_factor_groups(
+    symbols: list[str],
+    factor: dict[str, float],
+    as_of_date: pd.Timestamp | None = None,
+    pool_name: str = "pool",
+) -> pd.Series:
+    """Sort a factor low-to-high and assign five balanced groups."""
     ranked = pd.DataFrame(
         {
             "symbol": [str(symbol) for symbol in symbols],
-            "volatility": [volatility.get(str(symbol), np.nan) for symbol in symbols],
+            "factor": [factor.get(str(symbol), np.nan) for symbol in symbols],
         }
-    ).dropna(subset=["volatility"])
-    ranked = ranked.loc[np.isfinite(ranked["volatility"])]
-    ranked = ranked.sort_values(["volatility", "symbol"], kind="mergesort")
+    ).dropna(subset=["factor"])
+    ranked = ranked.loc[np.isfinite(ranked["factor"])]
+    ranked = ranked.sort_values(["factor", "symbol"], kind="mergesort")
     if len(ranked) < 5:
         date_text = "" if as_of_date is None else f" on {pd.Timestamp(as_of_date).date()}"
         raise ValueError(
@@ -632,6 +859,14 @@ def _run_traditional_volatility_group_backtest(
     rebalance_dates: pd.DatetimeIndex,
     groups: list[pd.Series],
 ) -> pd.DataFrame:
+    return _run_factor_group_backtest(monthly_prices, rebalance_dates, groups)
+
+
+def _run_factor_group_backtest(
+    monthly_prices: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    groups: list[pd.Series],
+) -> pd.DataFrame:
     symbols = sorted({symbol for snapshot in groups for symbol in snapshot.index})
     prices = monthly_prices.reindex(index=rebalance_dates, columns=symbols)
     group_returns = {}
@@ -663,12 +898,26 @@ def _calculate_traditional_volatility_ic(
     volatility_snapshots: dict[pd.Timestamp, dict[str, float]],
     groups: list[pd.Series],
 ) -> pd.DataFrame:
+    return _calculate_factor_ic(
+        monthly_prices,
+        rebalance_dates,
+        [volatility_snapshots[date] for date in rebalance_dates],
+        groups,
+    )
+
+
+def _calculate_factor_ic(
+    monthly_prices: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    factor_snapshots: list[dict[str, float] | pd.Series],
+    groups: list[pd.Series],
+) -> pd.DataFrame:
     records = []
     for position, rebalance_date in enumerate(rebalance_dates[:-1]):
         symbols = groups[position].index
         factor = pd.Series(
             {
-                symbol: volatility_snapshots[rebalance_date].get(symbol, np.nan)
+                symbol: factor_snapshots[position].get(symbol, np.nan)
                 for symbol in symbols
             },
             dtype=float,
@@ -711,9 +960,45 @@ def _calculate_div_low_vol_monthly_index(
     adjustment_factors: pd.DataFrame,
     adjustment_factor_coverage: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return _calculate_monthly_index_with_selector(
+        price,
+        dividends,
+        dividend_queries,
+        shares,
+        config,
+        rebalance_dates,
+        transaction_cost_rate,
+        adjustment_factors,
+        adjustment_factor_coverage,
+        lambda date, adjusted, prepared: select_div_low_vol_constituents(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            date,
+            config,
+            prepared,
+            adjusted,
+        ),
+    )
+
+
+def _calculate_monthly_index_with_selector(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    config: dict,
+    rebalance_dates: pd.DatetimeIndex,
+    transaction_cost_rate: float,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
+    selector,
+    prepared: dict[str, pd.DataFrame] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = prepare_div_low_vol_universe_inputs(
         price, dividends, dividend_queries, shares
-    )
+    ) if prepared is None else prepared
     adjusted_price = build_back_adjusted_close(
         price,
         adjustment_factors,
@@ -725,16 +1010,7 @@ def _calculate_div_low_vol_monthly_index(
     constituent_weights = {}
 
     for rebalance_date in rebalance_dates:
-        constituents = select_div_low_vol_constituents(
-            price,
-            dividends,
-            dividend_queries,
-            shares,
-            rebalance_date,
-            config,
-            prepared,
-            adjusted_price,
-        )
+        constituents = selector(rebalance_date, adjusted_price, prepared)
         constituent_weights[rebalance_date] = constituents["weight"]
         constituent_snapshots.append(
             constituents.reset_index()
@@ -845,6 +1121,16 @@ def _annual_rebalance_schedule(
 
 
 def _validate_selection_config(config: dict) -> None:
+    _validate_candidate_config(config)
+    selection = config["selection"]
+    for name in ["volatility_lookback_days", "final_n"]:
+        if selection[name] <= 0:
+            raise ValueError(f"{name} must be positive")
+    if selection["dividend_top_n"] < selection["final_n"]:
+        raise ValueError("dividend_top_n must not be smaller than final_n")
+
+
+def _validate_candidate_config(config: dict) -> None:
     try:
         universe = config["universe"]
         selection = config["selection"]
@@ -859,16 +1145,33 @@ def _validate_selection_config(config: dict) -> None:
             raise ValueError("Universe keep ratios must be in (0, 1]")
     if not 0 <= universe["payout_exclude_ratio"] < 1:
         raise ValueError("payout_exclude_ratio must be in [0, 1)")
-    for name in [
-        "dividend_yield_lookback_days",
-        "dividend_top_n",
-        "volatility_lookback_days",
-        "final_n",
-    ]:
+    for name in ["dividend_yield_lookback_days", "dividend_top_n"]:
+        if selection[name] <= 0:
+            raise ValueError(f"{name} must be positive")
+
+
+def _validate_strategy_2_config(config: dict) -> None:
+    _validate_candidate_config(config)
+    selection = config["selection"]
+    for name in ["final_n", "lookback_trading_days", "min_valid_days"]:
         if selection[name] <= 0:
             raise ValueError(f"{name} must be positive")
     if selection["dividend_top_n"] < selection["final_n"]:
         raise ValueError("dividend_top_n must not be smaller than final_n")
+    if selection["min_valid_days"] > selection["lookback_trading_days"]:
+        raise ValueError("min_valid_days must not exceed lookback_trading_days")
+    transaction_cost_rate = selection.get("transaction_cost_rate", 0.0)
+    if not 0 <= transaction_cost_rate < 1:
+        raise ValueError("transaction_cost_rate must be in [0, 1)")
+
+
+def _strategy_2_selection_config(config: dict) -> dict:
+    try:
+        if "strategy_2" in config:
+            return {"universe": config["universe"], "selection": config["strategy_2"]}
+        return config
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Missing strategy_2 configuration") from exc
 
 
 def _prepare_price(price: pd.DataFrame) -> pd.DataFrame:

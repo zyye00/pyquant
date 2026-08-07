@@ -32,6 +32,7 @@ from pyquant.data.updater import (
     update_adjust_factors,
     update_csindex_daily,
     update_history_dataset,
+    update_minute_data,
     update_profit_quarterly,
 )
 from pyquant.data.duckdb import connect_database
@@ -1356,12 +1357,13 @@ def test_quota_stopped_minute_task_remains_pending_and_is_reused(tmp_path, capsy
     )
     root = tmp_path / "data"
 
-    stopped = _run_minute_update(
-        [request],
-        data_root=root,
-        client=client,
-        quota_reserve_bytes=100,
-    )
+    with pytest.raises(RuntimeError, match="50 bytes remaining; reserve: 100"):
+        _run_minute_update(
+            [request],
+            data_root=root,
+            client=client,
+            quota_reserve_bytes=100,
+        )
     resumed = _run_minute_update(
         [request],
         data_root=root,
@@ -1369,7 +1371,6 @@ def test_quota_stopped_minute_task_remains_pending_and_is_reused(tmp_path, capsy
         quota_reserve_bytes=0,
     )
 
-    assert stopped.empty
     assert resumed["status"].tolist() == ["success"]
     assert "stopped by quota reserve (50 bytes remaining; reserve: 100)" in (
         capsys.readouterr().out
@@ -1389,21 +1390,27 @@ def test_failed_minute_request_records_retryable_day_statuses(tmp_path):
     client = FailingMinuteRQData()
     root = tmp_path / "data"
 
-    out = _run_minute_update(
-        [
-            MinuteRequest(
-                "600000.SH",
-                date(2024, 1, 2),
-                date(2024, 1, 3),
-            )
-        ],
-        data_root=root,
-        client=client,
-        max_attempts=2,
-        quota_reserve_bytes=0,
-    )
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "600000.SH 2024-01-02 to 2024-01-03 "
+            "after 2/2 attempts:"
+        ),
+    ):
+        _run_minute_update(
+            [
+                MinuteRequest(
+                    "600000.SH",
+                    date(2024, 1, 2),
+                    date(2024, 1, 3),
+                )
+            ],
+            data_root=root,
+            client=client,
+            max_attempts=2,
+            quota_reserve_bytes=0,
+        )
 
-    assert out["status"].tolist() == ["failed"]
     assert client.price_calls == 2
     assert read_database(
         root,
@@ -1417,3 +1424,70 @@ def test_failed_minute_request_records_retryable_day_statuses(tmp_path):
         root,
         "SELECT status, attempts FROM meta.minute_download_task",
     ) == [(5, 2)]
+
+
+def test_failed_minute_request_stops_queue_and_resumes_pending_tasks(tmp_path):
+    class FailingMinuteRQData(FakeMinuteRQData):
+        def get_price(self, **kwargs):
+            self.price_calls += 1
+            raise ConnectionError("simulated minute failure")
+
+    first_client = FailingMinuteRQData()
+    root = tmp_path / "data"
+    requests = [
+        MinuteRequest("000001.SZ", date(2024, 1, 2), date(2024, 1, 2)),
+        MinuteRequest("600000.SH", date(2024, 1, 2), date(2024, 1, 2)),
+    ]
+
+    with pytest.raises(RuntimeError, match="000001.SZ"):
+        _run_minute_update(
+            requests,
+            data_root=root,
+            client=first_client,
+            max_attempts=2,
+            quota_reserve_bytes=0,
+        )
+
+    assert first_client.price_calls == 2
+    assert read_database(
+        root,
+        "SELECT status, attempts FROM meta.minute_download_task ORDER BY task_id",
+    ) == [(5, 2), (0, 0)]
+
+    second_client = FakeMinuteRQData()
+    resumed = _run_minute_update(
+        requests,
+        data_root=root,
+        client=second_client,
+        quota_reserve_bytes=0,
+    )
+
+    assert resumed["status"].tolist() == ["success", "success"]
+    assert second_client.price_calls == 2
+    assert read_database(
+        root,
+        "SELECT status, attempts FROM meta.minute_download_task ORDER BY task_id",
+    ) == [(5, 2), (2, 1), (2, 1)]
+
+
+def test_update_minute_data_wait_reraises_terminal_failure(monkeypatch, tmp_path, capsys):
+    error = RuntimeError("Minute-data request failed for 600000.SH")
+
+    def fake_update(requests, *, progress, **options):
+        progress(0, 1)
+        raise error
+
+    monkeypatch.setattr("pyquant.data.updater._run_minute_update", fake_update)
+    job = update_minute_data(
+        [MinuteRequest("600000.SH", date(2024, 1, 2), date(2024, 1, 2))],
+        data_root=tmp_path / "data",
+        quota_reserve_bytes=0,
+    )
+
+    with pytest.raises(RuntimeError, match="600000.SH") as raised:
+        job.wait()
+
+    assert raised.value is error
+    assert job.state == "failed"
+    assert job.error is error
+    assert "Update failed after 0/1" in capsys.readouterr().out

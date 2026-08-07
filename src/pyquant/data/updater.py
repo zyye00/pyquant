@@ -200,7 +200,10 @@ class UpdateJob:
                 self._show_progress(self._completed, self._total, final=True)
 
     def _show_progress(self, completed: int, total: int, final: bool = False) -> None:
-        message = f"Updated {completed}/{total}"
+        if final and self.state == "failed":
+            message = f"Update failed after {completed}/{total}"
+        else:
+            message = f"Updated {completed}/{total}"
         if self._progress_handle is not None:
             self._progress_handle.update({"text/plain": message}, raw=True)
         else:
@@ -376,7 +379,9 @@ def _run_minute_update(
                         f"quota reserve ({remaining} bytes remaining; "
                         f"reserve: {quota_reserve_bytes})"
                     )
-                    break
+                    message = f"Minute-data update stopped by {exit_reason}."
+                    print(message)
+                    raise RuntimeError(message)
             task_calendar = calendar[
                 (calendar >= pd.Timestamp(request.start_date))
                 & (calendar <= pd.Timestamp(request.end_date))
@@ -434,17 +439,13 @@ def _run_minute_update(
                         task_calendar,
                         exc,
                     )
-                    results.append(
-                        (
-                            request.symbol,
-                            str(request.start_date),
-                            str(request.end_date),
-                            "failed",
-                            0,
-                            0,
-                            str(exc),
-                        )
+                    message = (
+                        "Minute-data request failed for "
+                        f"{request.symbol} {request.start_date} to {request.end_date} "
+                        f"after {attempt + 1}/{max_attempts} attempts: {exc}"
                     )
+                    print(f"Minute-data update stopped: {message}")
+                    raise RuntimeError(message) from exc
                 else:
                     statuses = set(daily["status"])
                     status = (
