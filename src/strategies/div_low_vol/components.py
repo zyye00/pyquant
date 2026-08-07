@@ -26,6 +26,14 @@ CONSTITUENT_COLUMNS = _OUTPUT_COLUMNS["constituent"]
 CANDIDATE_COLUMNS = _OUTPUT_COLUMNS["candidate"]
 INDEX_COLUMNS = _OUTPUT_COLUMNS["index"]
 MONTHLY_INDEX_COLUMNS = _OUTPUT_COLUMNS["monthly_index"]
+TRADITIONAL_VOLATILITY_GROUP_COLUMNS = (
+    "第1组（低波）",
+    "第2组",
+    "第3组",
+    "第4组",
+    "第5组（高波）",
+    "多空对冲（低波-高波）",
+)
 
 
 def select_div_low_vol_download_symbols(
@@ -447,6 +455,249 @@ def calculate_div_low_vol_monthly_rebalanced_index(
         adjustment_factors,
         adjustment_factor_coverage,
     )
+
+
+def calculate_traditional_volatility_group_indices(
+    price: pd.DataFrame,
+    dividends: pd.DataFrame,
+    dividend_queries: pd.DataFrame,
+    shares: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    config: dict,
+    adjustment_factors: pd.DataFrame,
+    adjustment_factor_coverage: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Calculate monthly traditional-volatility quintile NAVs.
+
+    The returned ``all_a`` pool contains every stock with a month-end quote and
+    a complete volatility lookback.  ``dividend_pool`` applies the dividend
+    low-volatility universe quality filters, but deliberately does not apply
+    the strategy's top-dividend ranking or final-N volatility selection.
+    """
+    try:
+        strategy_config = {
+            "universe": config["universe"],
+            "selection": config["strategy_1"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Missing strategy_1 configuration") from exc
+    _validate_selection_config(strategy_config)
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+
+    price_data = _prepare_index_price(price)
+    calendar = pd.Index(
+        price_data.loc[price_data["date"].between(start, end), "date"]
+        .drop_duplicates()
+        .sort_values(),
+        name="date",
+    )
+    rebalance_dates = get_period_end_dates(calendar)
+    if rebalance_dates.empty:
+        raise ValueError("No monthly rebalance effective date falls within the period")
+
+    prepared = prepare_div_low_vol_universe_inputs(
+        price, dividends, dividend_queries, shares
+    )
+    adjusted_price = build_back_adjusted_close(
+        price,
+        adjustment_factors,
+        adjustment_factor_coverage,
+    ).loc[:, ["date", "symbol", "adjusted_close"]].rename(
+        columns={"adjusted_close": "close"}
+    )
+    adjusted_price["symbol"] = adjusted_price["symbol"].astype(str)
+    adjusted_price = adjusted_price.sort_values(["date", "symbol"])
+    monthly_prices = adjusted_price.pivot(
+        index="date", columns="symbol", values="close"
+    ).ffill().reindex(rebalance_dates)
+    volatility_snapshots = _calculate_traditional_volatility_snapshots(
+        adjusted_price,
+        rebalance_dates,
+        strategy_config["selection"]["volatility_lookback_days"],
+    )
+
+    all_a_groups = []
+    dividend_groups = []
+    for rebalance_date in rebalance_dates:
+        volatility = volatility_snapshots[rebalance_date]
+        month_symbols = set(
+            price_data.loc[
+                price_data["date"].eq(rebalance_date), "symbol"
+            ].astype(str)
+        )
+        all_a_groups.append(
+            _assign_traditional_volatility_groups(
+                sorted(month_symbols), volatility, rebalance_date, "all-A"
+            )
+        )
+        dividend_universe = build_div_low_vol_universe(
+            price,
+            dividends,
+            dividend_queries,
+            shares,
+            rebalance_date,
+            strategy_config["universe"],
+            strategy_config["selection"]["dividend_yield_lookback_days"],
+            prepared,
+        )
+        dividend_symbols = sorted(
+            month_symbols.intersection(dividend_universe.index.astype(str))
+        )
+        dividend_groups.append(
+            _assign_traditional_volatility_groups(
+                dividend_symbols, volatility, rebalance_date, "dividend pool"
+            )
+        )
+
+    all_a_nav = _run_traditional_volatility_group_backtest(
+        monthly_prices, rebalance_dates, all_a_groups
+    )
+    dividend_nav = _run_traditional_volatility_group_backtest(
+        monthly_prices, rebalance_dates, dividend_groups
+    )
+    all_a_nav.attrs["factor_ic"] = _calculate_traditional_volatility_ic(
+        monthly_prices,
+        rebalance_dates,
+        volatility_snapshots,
+        all_a_groups,
+    )
+    dividend_nav.attrs["factor_ic"] = _calculate_traditional_volatility_ic(
+        monthly_prices,
+        rebalance_dates,
+        volatility_snapshots,
+        dividend_groups,
+    )
+    return {"all_a": all_a_nav, "dividend_pool": dividend_nav}
+
+
+def _assign_traditional_volatility_groups(
+    symbols: list[str],
+    volatility: dict[str, float],
+    as_of_date: pd.Timestamp | None = None,
+    pool_name: str = "pool",
+) -> pd.Series:
+    """Sort low-to-high volatility and assign five balanced groups."""
+    ranked = pd.DataFrame(
+        {
+            "symbol": [str(symbol) for symbol in symbols],
+            "volatility": [volatility.get(str(symbol), np.nan) for symbol in symbols],
+        }
+    ).dropna(subset=["volatility"])
+    ranked = ranked.loc[np.isfinite(ranked["volatility"])]
+    ranked = ranked.sort_values(["volatility", "symbol"], kind="mergesort")
+    if len(ranked) < 5:
+        date_text = "" if as_of_date is None else f" on {pd.Timestamp(as_of_date).date()}"
+        raise ValueError(
+            f"Only {len(ranked)} symbols in {pool_name}{date_text} have a complete "
+            "volatility lookback; at least 5 are required"
+        )
+    ranked["group"] = np.floor(np.arange(len(ranked)) * 5 / len(ranked)).astype(int) + 1
+    return ranked.set_index("symbol")["group"].astype(int)
+
+
+def _calculate_traditional_volatility_snapshots(
+    adjusted_price: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    lookback_days: int,
+) -> dict[pd.Timestamp, dict[str, float]]:
+    """Calculate exact trailing price-volatility values in one pass per symbol."""
+    if lookback_days < 2:
+        raise ValueError("lookback_days must be at least 2")
+    dates = pd.DatetimeIndex(rebalance_dates)
+    date_set = set(dates)
+    snapshots = {date: {} for date in dates}
+    for symbol, history in adjusted_price.groupby("symbol", sort=False):
+        history = history.loc[:, ["date", "close"]].dropna(subset=["close"])
+        history = history.loc[history["close"].gt(0)].sort_values("date")
+        if len(history) < lookback_days:
+            continue
+        close = pd.Series(
+            history["close"].to_numpy(dtype=float),
+            index=pd.DatetimeIndex(history["date"]),
+        )
+        returns = close.pct_change(fill_method=None)
+        volatility = returns.rolling(lookback_days - 1).std()
+        for date, value in volatility.items():
+            if date in date_set and pd.notna(value):
+                snapshots[date][str(symbol)] = float(value)
+    return snapshots
+
+
+def _run_traditional_volatility_group_backtest(
+    monthly_prices: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    groups: list[pd.Series],
+) -> pd.DataFrame:
+    symbols = sorted({symbol for snapshot in groups for symbol in snapshot.index})
+    prices = monthly_prices.reindex(index=rebalance_dates, columns=symbols)
+    group_returns = {}
+    for group_number, column in enumerate(TRADITIONAL_VOLATILITY_GROUP_COLUMNS[:5], 1):
+        target_weights = pd.DataFrame(0.0, index=rebalance_dates, columns=symbols)
+        for rebalance_date, snapshot in zip(rebalance_dates, groups):
+            members = snapshot.index[snapshot.eq(group_number)]
+            if len(members) == 0:
+                raise ValueError(
+                    f"Volatility group {group_number} is empty on {rebalance_date.date()}"
+                )
+            target_weights.loc[rebalance_date, members] = 1.0 / len(members)
+        portfolio = run_backtest(prices, target_weights, freq="ME")
+        group_returns[column] = portfolio.returns().reindex(rebalance_dates).fillna(0.0)
+
+    returns = pd.DataFrame(group_returns, index=rebalance_dates)
+    returns[TRADITIONAL_VOLATILITY_GROUP_COLUMNS[5]] = (
+        returns[TRADITIONAL_VOLATILITY_GROUP_COLUMNS[0]]
+        - returns[TRADITIONAL_VOLATILITY_GROUP_COLUMNS[4]]
+    )
+    nav = (1.0 + returns).cumprod()
+    nav.index.name = None
+    return nav.loc[:, list(TRADITIONAL_VOLATILITY_GROUP_COLUMNS)]
+
+
+def _calculate_traditional_volatility_ic(
+    monthly_prices: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    volatility_snapshots: dict[pd.Timestamp, dict[str, float]],
+    groups: list[pd.Series],
+) -> pd.DataFrame:
+    records = []
+    for position, rebalance_date in enumerate(rebalance_dates[:-1]):
+        symbols = groups[position].index
+        factor = pd.Series(
+            {
+                symbol: volatility_snapshots[rebalance_date].get(symbol, np.nan)
+                for symbol in symbols
+            },
+            dtype=float,
+        )
+        current = monthly_prices.iloc[position].reindex(symbols)
+        following = monthly_prices.iloc[position + 1].reindex(symbols)
+        forward_return = following.div(current).sub(1.0)
+        aligned = pd.concat(
+            [factor.rename("factor"), forward_return.rename("forward_return")],
+            axis=1,
+        ).dropna()
+        records.append(
+            {
+                "date": rebalance_date,
+                "ic": _safe_correlation(
+                    aligned["factor"], aligned["forward_return"]
+                ),
+                "rank_ic": _safe_correlation(
+                    aligned["factor"].rank(), aligned["forward_return"].rank()
+                ),
+            }
+        )
+    return pd.DataFrame.from_records(records).set_index("date")
+
+
+def _safe_correlation(left: pd.Series, right: pd.Series) -> float:
+    if len(left) < 2 or left.std(ddof=1) == 0 or right.std(ddof=1) == 0:
+        return np.nan
+    return float(left.corr(right))
 
 
 def _calculate_div_low_vol_monthly_index(

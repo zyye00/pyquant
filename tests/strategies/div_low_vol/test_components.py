@@ -18,6 +18,7 @@ calculate_rebalanced_index = COMPONENTS.calculate_div_low_vol_rebalanced_index
 calculate_monthly_rebalanced_index = (
     COMPONENTS.calculate_div_low_vol_monthly_rebalanced_index
 )
+calculate_volatility_groups = COMPONENTS.calculate_traditional_volatility_group_indices
 select_constituents = COMPONENTS.select_div_low_vol_constituents
 select_download_symbols = COMPONENTS.select_div_low_vol_download_symbols
 build_minute_requests = COMPONENTS.build_intraday_minute_requests
@@ -1200,3 +1201,73 @@ def test_high_frequency_factor_is_market_cap_neutralized():
         0.0,
         abs=1e-12,
     )
+
+
+def test_traditional_volatility_groups_are_balanced_and_stably_sorted():
+    symbols = [f"S{index:02d}" for index in range(11)]
+    volatility = {symbol: float(index // 2) for index, symbol in enumerate(symbols)}
+
+    groups = COMPONENTS._assign_traditional_volatility_groups(symbols, volatility)
+
+    assert groups.index.tolist() == sorted(symbols, key=lambda symbol: (volatility[symbol], symbol))
+    assert groups.value_counts().sort_index().tolist() == [3, 2, 2, 2, 2]
+    assert groups.iloc[0] == 1
+    assert groups.iloc[-1] == 5
+
+
+def test_traditional_volatility_group_indices_use_full_dividend_pool_and_long_short(
+    monkeypatch,
+):
+    symbols = [f"S{index:02d}" for index in range(10)]
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    config = make_config(
+        market_lookback_days=4,
+        dividend_yield_lookback_days=6,
+        dividend_top_n=3,
+        volatility_lookback_days=4,
+        final_n=2,
+    )
+    strategy_config = {
+        "universe": config["universe"],
+        "strategy_1": config["selection"],
+    }
+    dividends = make_dividends(symbols)
+    factors, coverage = make_adjustment_data(symbols)
+
+    def fake_universe(*args):
+        return pd.DataFrame(index=pd.Index(symbols, name="symbol"))
+
+    def fake_volatility_snapshots(adjusted_price, rebalance_dates, lookback_days):
+        return {
+            date: {symbol: float(symbol[1:]) for symbol in symbols}
+            for date in rebalance_dates
+        }
+
+    monkeypatch.setattr(COMPONENTS, "build_div_low_vol_universe", fake_universe)
+    monkeypatch.setattr(
+        COMPONENTS,
+        "_calculate_traditional_volatility_snapshots",
+        fake_volatility_snapshots,
+    )
+
+    result = calculate_volatility_groups(
+        make_price(symbols, dates=dates),
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+        factors,
+        coverage,
+    )
+
+    expected_columns = list(COMPONENTS.TRADITIONAL_VOLATILITY_GROUP_COLUMNS)
+    assert set(result) == {"all_a", "dividend_pool"}
+    for nav in result.values():
+        assert nav.columns.tolist() == expected_columns
+        assert nav.iloc[0].eq(1.0).all()
+        group_returns = nav.iloc[:, :5].pct_change().fillna(0.0)
+        assert nav[expected_columns[-1]].iloc[1] == pytest.approx(
+            (1 + group_returns.iloc[1, 0] - group_returns.iloc[1, 4])
+        )

@@ -26,6 +26,13 @@ def test_strategy_1_notebooks_split_downloads_from_calculation():
     assert "csindex_daily" in str(notebooks["download.ipynb"])
     assert "csindex_daily" in strategy_notebook
     assert "calculate_div_low_vol_monthly_rebalanced_index" in strategy_notebook
+    assert "calculate_traditional_volatility_group_indices" in strategy_notebook
+    assert "传统波动率因子五分组及多空对冲净值走势对比（全A）" in strategy_notebook
+    assert "传统波动率因子五分组及多空对冲净值走势对比（红利股票池）" in strategy_notebook
+    assert "group_labels = [\"分组1\", \"分组2\", \"分组3\", \"分组4\", \"分组5\"]" in strategy_notebook
+    assert "traditional-volatility-summary-table" in strategy_notebook
+    for metric in ["IC均值", "年化ICIR", "Rank IC均值", "年化Rank ICIR"]:
+        assert metric in strategy_notebook
     assert "stock_adjust_factor" in strategy_notebook
     assert "gross_reinvested_index" not in strategy_notebook
     assert "月调组合（无费率、分红立即再投资）" not in strategy_notebook

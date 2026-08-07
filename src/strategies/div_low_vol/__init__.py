@@ -4,6 +4,7 @@ from strategies.div_low_vol.components import (
     build_intraday_minute_requests,
     calculate_high_frequency_volatility_factor,
     calculate_div_low_vol_monthly_rebalanced_index,
+    calculate_traditional_volatility_group_indices,
     select_div_low_vol_candidates,
     select_div_low_vol_download_symbols,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "build_intraday_minute_requests",
     "calculate_bp_spread",
     "calculate_div_low_vol_monthly_rebalanced_index",
+    "calculate_traditional_volatility_group_indices",
     "calculate_high_frequency_volatility_factor",
     "select_div_low_vol_candidates",
     "select_div_low_vol_download_symbols",
