@@ -99,7 +99,7 @@ strategy_1:
 minute_data:
   min_bars_per_day: null
   max_attempts: 3
-  quota_reserve_bytes: 80000000
+  quota_reserve_bytes: 0
 
 strategy_2:
   dividend_yield_lookback_days: 720

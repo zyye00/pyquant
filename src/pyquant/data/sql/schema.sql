@@ -6,7 +6,7 @@ CREATE SCHEMA IF NOT EXISTS feature;
 
 CREATE TABLE IF NOT EXISTS ref.security (security_id UINTEGER PRIMARY KEY, symbol VARCHAR NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS ref.market_index (index_id USMALLINT PRIMARY KEY, index_code VARCHAR NOT NULL UNIQUE);
-CREATE TABLE IF NOT EXISTS core.stock_daily (security_id UINTEGER NOT NULL, trade_date DATE NOT NULL, open FLOAT, high FLOAT, low FLOAT, close FLOAT, preclose FLOAT, volume BIGINT, amount DOUBLE, turn FLOAT, pe_ttm FLOAT, ps_ttm FLOAT, pcf_ncf_ttm FLOAT, is_st BOOLEAN);
+CREATE TABLE IF NOT EXISTS core.stock_daily (security_id UINTEGER NOT NULL, trade_date DATE NOT NULL, open FLOAT, high FLOAT, low FLOAT, close FLOAT, preclose FLOAT, volume BIGINT, amount DOUBLE, turn FLOAT, pe_ttm FLOAT, pb_mrq FLOAT, ps_ttm FLOAT, pcf_ncf_ttm FLOAT, is_st BOOLEAN);
 CREATE TABLE IF NOT EXISTS core.stock_adjust_factor (security_id UINTEGER NOT NULL, operate_date DATE NOT NULL, fore_adjust_factor DOUBLE, back_adjust_factor DOUBLE, adjust_factor DOUBLE, PRIMARY KEY (security_id, operate_date));
 CREATE TABLE IF NOT EXISTS core.stock_minute_1m (security_id UINTEGER NOT NULL, datetime TIMESTAMP NOT NULL, open FLOAT, high FLOAT, low FLOAT, close FLOAT, volume DOUBLE, total_turnover DOUBLE);
 CREATE TABLE IF NOT EXISTS core.index_daily (index_id USMALLINT NOT NULL, trade_date DATE NOT NULL, open FLOAT, high FLOAT, low FLOAT, close DOUBLE, preclose FLOAT, volume BIGINT, amount DOUBLE, turn FLOAT, pe_ttm FLOAT, ps_ttm FLOAT, pcf_ncf_ttm FLOAT, is_st BOOLEAN);
@@ -25,10 +25,9 @@ CREATE TABLE IF NOT EXISTS meta.minute_download_task (task_id UBIGINT PRIMARY KE
 CREATE TABLE IF NOT EXISTS feature.intraday_volatility_daily (security_id UINTEGER NOT NULL, trade_date DATE NOT NULL, volatility FLOAT);
 ALTER TABLE feature.intraday_volatility_daily ADD COLUMN IF NOT EXISTS volatility FLOAT;
 
-ALTER TABLE core.stock_daily DROP COLUMN IF EXISTS pb_mrq;
-ALTER TABLE core.index_daily DROP COLUMN IF EXISTS pb_mrq;
+ALTER TABLE core.stock_daily ADD COLUMN IF NOT EXISTS pb_mrq FLOAT;
 
-CREATE OR REPLACE VIEW api.stock_daily AS SELECT s.symbol, d.trade_date AS date, d.open, d.high, d.low, d.close, d.preclose, d.volume, d.amount, d.turn, 100.0 * (d.close / d.preclose - 1.0) AS pct_chg, d.pe_ttm, d.ps_ttm, d.pcf_ncf_ttm, d.is_st FROM core.stock_daily AS d JOIN ref.security AS s USING (security_id);
+CREATE OR REPLACE VIEW api.stock_daily AS SELECT s.symbol, d.trade_date AS date, d.open, d.high, d.low, d.close, d.preclose, d.volume, d.amount, d.turn, 100.0 * (d.close / d.preclose - 1.0) AS pct_chg, d.pe_ttm, d.pb_mrq, d.ps_ttm, d.pcf_ncf_ttm, d.is_st FROM core.stock_daily AS d JOIN ref.security AS s USING (security_id);
 CREATE OR REPLACE VIEW api.stock_adjust_factor AS SELECT s.symbol, f.operate_date, f.fore_adjust_factor, f.back_adjust_factor, f.adjust_factor FROM core.stock_adjust_factor AS f JOIN ref.security AS s USING (security_id);
 CREATE OR REPLACE VIEW api.stock_minute_1m AS SELECT s.symbol, m.datetime, m.open, m.high, m.low, m.close, m.volume, m.total_turnover FROM core.stock_minute_1m AS m JOIN ref.security AS s USING (security_id);
 CREATE OR REPLACE VIEW api.intraday_volatility_daily AS SELECT s.symbol, f.trade_date, f.volatility, d.bar_count, d.return_count, d.status FROM feature.intraday_volatility_daily AS f JOIN ref.security AS s USING (security_id) LEFT JOIN meta.minute_day_status AS d ON f.security_id = d.security_id AND f.trade_date = d.trade_date AND d.field_set_id = 1;

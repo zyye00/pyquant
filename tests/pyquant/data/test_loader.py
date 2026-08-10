@@ -87,6 +87,36 @@ def test_load_stock_pb_daily_returns_all_float64_factors(tmp_path):
     assert all(out[column].dtype == "float64" for column in out.columns[2:])
 
 
+def test_load_stock_daily_returns_baostock_pb_mrq(tmp_path):
+    initialize_database(tmp_path / "pyquant.duckdb")
+    with connect_database(tmp_path / "pyquant.duckdb") as connection:
+        write_stock_daily_request(
+            connection,
+            "sh.600000",
+            pd.DataFrame(
+                {
+                    "date": [pd.Timestamp("2024-01-02")],
+                    "close": [10.0],
+                    "amount": [100.0],
+                    "peTTM": [8.0],
+                    "pbMRQ": [1.25],
+                }
+            ),
+            "2024-01-02",
+            "2024-01-02",
+        )
+
+    out = load_dataset(
+        "stock_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        data_root=tmp_path,
+    )
+
+    assert out.loc[0, "pb_mrq"] == pytest.approx(1.25)
+    assert "pb_mrq" in out.columns
+
+
 def test_five_minute_dataset_is_not_available():
     with pytest.raises(ValueError, match="Unknown dataset 'stock_5m'"):
         get_dataset_spec("stock_5m")

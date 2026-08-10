@@ -129,7 +129,19 @@ def test_changed_snapshots_drop_consecutive_duplicate_sets():
     ]
 
 
-def test_update_index_constituents_replaces_database_snapshots(tmp_path):
+def test_update_index_constituents_replaces_database_snapshots(
+    tmp_path,
+    monkeypatch,
+):
+    def fail_cross_source(*args, **kwargs):
+        pytest.fail("RQData constituent update called another external source")
+
+    monkeypatch.setattr("pyquant.data.updater.BaostockClient", fail_cross_source)
+    monkeypatch.setattr(
+        "pyquant.data.updater.query_csindex_history",
+        fail_cross_source,
+    )
+
     class FakeRqdata:
         def __init__(self):
             self.initialized = False

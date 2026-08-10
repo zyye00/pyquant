@@ -30,7 +30,7 @@
 | `volume` | `BIGINT` | 成交量 |
 | `amount` | `DOUBLE` | 成交额，单位为元 |
 | `turn` | `FLOAT` | 换手率 |
-| `pe_ttm`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | BaoStock 日行情估值字段 |
+| `pe_ttm`、`pb_mrq`、`ps_ttm`、`pcf_ncf_ttm` | `FLOAT` | BaoStock 日行情估值字段，其中 `pb_mrq` 为 BaoStock `pbMRQ` |
 | `is_st` | `BOOLEAN` | 是否为 ST 股票 |
 
 `pct_chg` 不在核心表重复保存，由 `api.stock_daily` 使用 `100 × (close / preclose - 1)` 动态计算，单位为百分比。
@@ -46,6 +46,8 @@
 
 策略 3 默认使用 `pb_ratio_lf`，可通过 `src/strategies/div_low_vol/config.yaml` 的
 `strategy_3.pb_factor` 切换到其他五列。`book_to_market_ratio_*` 是 PB 的倒数，不属于本数据集。
+BaoStock 的 `pbMRQ` 不写入本表，而是保留在 `core.stock_daily.pb_mrq`；因此两类来源的 PB
+可以并存、独立比较。
 
 ### `core.index_daily`
 
@@ -112,7 +114,11 @@ DuckDB。
 | `meta.dividend_coverage` | `security_id + query_year + field_set_id` |
 | `meta.share_capital_coverage` | `security_id + report_year + report_quarter` |
 
-日行情的重叠或相邻区间会合并。分红 `field_set_id=1` 只表示旧税后字段曾经查询过；正式下载器只把 `field_set_id=2` 视为税前字段已完成查询。空结果也会写入覆盖表。
+日行情的重叠或相邻区间会合并。`meta.stock_daily_coverage` 中，
+`field_set_id=1` 表示旧的不含 BaoStock `pbMRQ` 的日行情，`field_set_id=2` 表示包含
+`pb_mrq` 的完整股票日行情；当前股票下载器只把版本2视为已完成。分红 `field_set_id=1`
+只表示旧税后字段曾经查询过；正式下载器只把 `field_set_id=2` 视为税前字段已完成查询。
+空结果也会写入覆盖表。
 
 指数行情的字段集互不替代：
 

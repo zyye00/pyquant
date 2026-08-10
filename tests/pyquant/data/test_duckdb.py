@@ -32,7 +32,7 @@ def test_initialize_database_exposes_empty_api_relation(tmp_path):
                 """
             ).fetchall()
         }
-        assert "pb_mrq" not in stock_columns
+        assert "pb_mrq" in stock_columns
         assert connection.execute(
             "SELECT * FROM api.stock_pb_daily"
         ).fetchall() == []
@@ -132,7 +132,7 @@ def test_initialize_database_preserves_legacy_intraday_table(tmp_path):
     assert written[2:] == (3, 2, True)
 
 
-def test_initialize_database_removes_legacy_baostock_pb_columns(tmp_path):
+def test_initialize_database_restores_legacy_baostock_pb_column(tmp_path):
     database_path = tmp_path / "pyquant.duckdb"
     with duckdb.connect(str(database_path)) as connection:
         connection.execute("CREATE SCHEMA core")
@@ -150,7 +150,6 @@ def test_initialize_database_removes_legacy_baostock_pb_columns(tmp_path):
                 amount DOUBLE,
                 turn FLOAT,
                 pe_ttm FLOAT,
-                pb_mrq FLOAT,
                 ps_ttm FLOAT,
                 pcf_ncf_ttm FLOAT,
                 is_st BOOLEAN
@@ -172,7 +171,6 @@ def test_initialize_database_removes_legacy_baostock_pb_columns(tmp_path):
                 1::DOUBLE AS amount,
                 1::FLOAT AS turn,
                 1::FLOAT AS pe_ttm,
-                1::FLOAT AS pb_mrq,
                 1::FLOAT AS ps_ttm,
                 1::FLOAT AS pcf_ncf_ttm,
                 FALSE AS is_st
@@ -180,8 +178,11 @@ def test_initialize_database_removes_legacy_baostock_pb_columns(tmp_path):
         )
         connection.execute(
             """
-            INSERT INTO core.stock_daily
-            VALUES (1, DATE '2024-01-02', 1, 1, 1, 10, 9, 1, 1, 1, 1, 2, 1, 1, FALSE)
+            INSERT INTO core.stock_daily (
+                security_id, trade_date, open, high, low, close, preclose,
+                volume, amount, turn, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st
+            )
+            VALUES (1, DATE '2024-01-02', 1, 1, 1, 10, 9, 1, 1, 1, 1, 2, 1, FALSE)
             """
         )
 
@@ -196,6 +197,9 @@ def test_initialize_database_removes_legacy_baostock_pb_columns(tmp_path):
             row[1]
             for row in connection.execute("PRAGMA table_info('core.index_daily')").fetchall()
         }
-        assert "pb_mrq" not in stock_columns
+        assert "pb_mrq" in stock_columns
         assert "pb_mrq" not in index_columns
         assert connection.execute("SELECT COUNT(*) FROM core.stock_daily").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT pb_mrq FROM core.stock_daily"
+        ).fetchone() == (None,)

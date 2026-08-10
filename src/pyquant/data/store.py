@@ -19,7 +19,7 @@ from pyquant.data.intraday import (
 )
 from pyquant.data.resources import load_source_protocols
 
-STOCK_DAILY_FIELD_SET_ID = 1
+STOCK_DAILY_FIELD_SET_ID = 2
 STOCK_MINUTE_1M_FIELD_SET_ID = 1
 BAOSTOCK_INDEX_DAILY_FIELD_SET_ID = 1
 CSINDEX_DAILY_FIELD_SET_ID = 2
@@ -698,7 +698,13 @@ def write_stock_daily_request(
     incoming = _prepare_stock_daily(data)
     with _transaction(connection):
         security_id = ensure_securities(connection, [symbol])[symbol]
-        _replace_daily_facts(connection, security_id, incoming, _SECURITY_SPEC)
+        _replace_daily_facts(
+            connection,
+            security_id,
+            incoming,
+            _SECURITY_SPEC,
+            _STOCK_DAILY_VALUE_COLUMNS,
+        )
         _replace_daily_coverage(
             connection,
             security_id,
@@ -849,7 +855,13 @@ def write_index_daily_request(
     with _transaction(connection):
         index_id = ensure_market_indices(connection, [code])[code]
         if field_set_id == BAOSTOCK_INDEX_DAILY_FIELD_SET_ID:
-            _replace_daily_facts(connection, index_id, incoming, _INDEX_SPEC)
+            _replace_daily_facts(
+                connection,
+                index_id,
+                incoming,
+                _INDEX_SPEC,
+                _DAILY_VALUE_COLUMNS,
+            )
         elif not incoming.empty:
             with _registered_frame(connection, "incoming_index_daily", incoming):
                 connection.execute(
@@ -1061,9 +1073,12 @@ _DAILY_COLUMNS = [
     "pcf_ncf_ttm",
     "is_st",
 ]
+_STOCK_DAILY_COLUMNS = [*_DAILY_COLUMNS[:11], "pb_mrq", *_DAILY_COLUMNS[11:]]
 _DAILY_VALUE_COLUMNS = _DAILY_COLUMNS[1:]
+_STOCK_DAILY_VALUE_COLUMNS = _STOCK_DAILY_COLUMNS[1:]
 _DAILY_RENAMES = {
     "peTTM": "pe_ttm",
+    "pbMRQ": "pb_mrq",
     "psTTM": "ps_ttm",
     "pcfNcfTTM": "pcf_ncf_ttm",
     "isST": "is_st",
@@ -1072,16 +1087,16 @@ _PB_FACTORS = tuple(_RQDATA_PB["factors"])
 _PB_VALUE_COLUMNS = _PB_FACTORS
 
 
-def _prepare_daily(data: pd.DataFrame) -> pd.DataFrame:
+def _prepare_daily(data: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = data.rename(columns=_DAILY_RENAMES).copy()
-    for column in _DAILY_COLUMNS:
+    for column in columns:
         if column not in out:
             out[column] = pd.NA
-    return out[_DAILY_COLUMNS]
+    return out[columns]
 
 
 def _prepare_stock_daily(data: pd.DataFrame) -> pd.DataFrame:
-    return _prepare_daily(data)
+    return _prepare_daily(data, _STOCK_DAILY_COLUMNS)
 
 
 def _prepare_adjust_factors(data: pd.DataFrame) -> pd.DataFrame:
@@ -1132,7 +1147,7 @@ def _prepare_index_daily(data: pd.DataFrame) -> pd.DataFrame:
     for column in ["date", "close"]:
         if column not in data:
             raise ValueError(f"Index daily data missing required column: {column}")
-    out = _prepare_daily(data)
+    out = _prepare_daily(data, _DAILY_COLUMNS)
     out["date"] = pd.to_datetime(out["date"], errors="raise")
     if out["date"].isna().any():
         raise ValueError("Index daily dates must not be missing")
@@ -1165,6 +1180,7 @@ def _replace_daily_facts(
     entity_id: int,
     incoming: pd.DataFrame,
     spec: _EntitySpec,
+    value_columns: list[str],
 ) -> None:
     if incoming.empty:
         return
@@ -1191,11 +1207,13 @@ def _replace_daily_facts(
         )
         connection.execute(
             f"""
-            INSERT INTO {spec.daily_fact_table}
+            INSERT INTO {spec.daily_fact_table} (
+                {spec.id_column}, trade_date, {", ".join(value_columns)}
+            )
             SELECT
                 ?,
                 CAST(date AS DATE),
-                {", ".join(_DAILY_VALUE_COLUMNS)}
+                {", ".join(value_columns)}
             FROM incoming_daily
             {deduplication}
             """,

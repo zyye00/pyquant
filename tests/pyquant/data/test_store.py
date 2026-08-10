@@ -41,6 +41,7 @@ def make_stock_daily() -> pd.DataFrame:
             "turn": [1.0, 2.0],
             "pctChg": [5.0, 4.7619],
             "peTTM": [8.0, 9.0],
+            "pbMRQ": [1.25, 1.3],
             "psTTM": [2.0, 2.1],
             "pcfNcfTTM": [3.0, 3.1],
             "isST": [False, False],
@@ -177,13 +178,13 @@ def test_stock_daily_write_preserves_standardized_fact_fields(tmp_path):
         )
         row = connection.execute(
             """
-                SELECT open, close, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st
+                SELECT open, close, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st
             FROM api.stock_daily
             """
         ).fetchone()
 
-    assert row[:5] == pytest.approx((10.0, 10.5, 8.0, 2.0, 3.0))
-    assert row[5] is False
+    assert row[:6] == pytest.approx((10.0, 10.5, 8.0, 1.25, 2.0, 3.0))
+    assert row[6] is False
 
 
 def test_stock_daily_write_rolls_back_reference_and_fact_on_failure(

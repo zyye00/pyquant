@@ -42,6 +42,27 @@ def test_strategy_1_notebooks_split_downloads_from_calculation():
     assert "minute_job.wait()" in str(notebooks["download.ipynb"])
 
 
+def test_download_notebook_guards_every_external_source():
+    notebook = load_notebooks("download.ipynb")["download.ipynb"]
+    cells = {
+        cell["id"]: "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    }
+
+    assert 'active_source = "rqdata"' in cells["db2b166b"]
+    assert all("download_minute_data" not in source for source in cells.values())
+    assert cells["9c4ecd55"].startswith('if active_source == "csindex":')
+    for cell_id in ["68cf3c26", "download_pb_daily"]:
+        assert cells[cell_id].startswith('if active_source == "rqdata":')
+    for cell_id in ["6c08fed8", "950a773c", "cdeb9dfb", "f7e95571"]:
+        assert cells[cell_id].startswith('if active_source == "baostock":')
+    for cell_id in ["a042884e", "808ed88a"]:
+        assert cells[cell_id].startswith('if active_source == "rqdata":')
+    assert "stock_adjust_factor" in cells["950a773c"]
+    assert "update_dataset" not in cells["a042884e"]
+
+
 def test_strategy_3_notebook_and_download_entry_are_separated():
     notebooks = load_notebooks(
         "download.ipynb", "3_timing.ipynb"

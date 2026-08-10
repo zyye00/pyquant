@@ -6,12 +6,12 @@ stock_daily:
     path: data/pyquant.duckdb
     relation: api.stock_daily
     requires_dates: true
-  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm, is_st]
+  columns: [date, symbol, open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm, is_st]
   required: [date, symbol, close, amount, pe_ttm]
   primary_key: [date, symbol]
   date_column: date
   date_columns: [date]
-  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, ps_ttm, pcf_ncf_ttm]
+  numeric_columns: [open, high, low, close, preclose, volume, amount, turn, pct_chg, pe_ttm, pb_mrq, ps_ttm, pcf_ncf_ttm]
   update: {kind: history, target: stock, pool: true}
 
 stock_adjust_factor:

@@ -391,6 +391,45 @@ def test_history_query_cache_skips_completed_ranges(tmp_path):
     ) == [(date(2024, 1, 2), date(2024, 1, 5))]
 
 
+def test_history_with_pb_ignores_legacy_field_set_and_caches_version_two(tmp_path):
+    root = tmp_path / "data"
+    paths = init_data_storage(root)
+    with connect_database(paths.database_path) as connection:
+        security_id = ensure_securities(connection, ["sh.600000"])["600000.SH"]
+        connection.execute(
+            "INSERT INTO meta.stock_daily_coverage VALUES (?, ?, ?, 1)",
+            [security_id, date(2024, 1, 2), date(2024, 1, 3)],
+        )
+    client = FakeClient()
+
+    first = update_history_dataset(
+        "stock",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-03",
+        root,
+        10,
+        client=client,
+    )
+    second = update_history_dataset(
+        "stock",
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-03",
+        root,
+        10,
+        client=client,
+    )
+
+    assert len(first) == 1
+    assert second.empty
+    assert client.calls == [("sh.600000", "2024-01-02", "2024-01-03", "d", "3")]
+    assert read_database(
+        root,
+        "SELECT field_set_id FROM meta.stock_daily_coverage ORDER BY field_set_id",
+    ) == [(1,), (2,)]
+
+
 def test_local_min_max_does_not_hide_query_cache_gap(tmp_path):
     root = tmp_path / "data"
     paths = init_data_storage(root)
@@ -663,15 +702,25 @@ def test_clean_baostock_data_removes_source_fields_and_casts_types():
                 "amount": ["1000.5", "2000.5"],
                 "adjustflag": ["2", "2"],
                 "tradestatus": ["1", "0"],
+                "pbMRQ": ["1.25", "1.30"],
                 "isST": ["0", "0"],
             }
         )
     )
 
-    assert out.columns.tolist() == ["date", "open", "volume", "amount", "isST"]
+    assert out.columns.tolist() == [
+        "date",
+        "open",
+        "volume",
+        "amount",
+        "pbMRQ",
+        "isST",
+    ]
     assert len(out) == 1
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
     assert str(out["isST"].dtype) == "boolean"
+    assert out.loc[out.index[0], "pbMRQ"] == pytest.approx(1.25)
+    assert str(out["pbMRQ"].dtype) == "float32"
 
 
 def test_clean_baostock_dividends_keeps_cash_and_implementation_dates():
@@ -1017,7 +1066,18 @@ def test_update_dataset_dispatches_dividend_dates_and_limits_tasks(tmp_path):
     assert client.calls == [("sh.600000", "2022", "operate")]
 
 
-def test_update_dataset_dispatches_rqdata_pb_in_bounded_ranges(tmp_path):
+def test_update_dataset_dispatches_rqdata_pb_in_bounded_ranges(
+    tmp_path,
+    monkeypatch,
+):
+    def fail_cross_source(*args, **kwargs):
+        pytest.fail("RQData PB update called another external source")
+
+    monkeypatch.setattr("pyquant.data.updater.BaostockClient", fail_cross_source)
+    monkeypatch.setattr(
+        "pyquant.data.updater.query_csindex_history",
+        fail_cross_source,
+    )
     client = FakePBClient()
     data_root = tmp_path / "data"
 
@@ -1309,7 +1369,18 @@ class FakeMinuteRQData:
         )
 
 
-def test_minute_update_caches_completed_days_and_writes_features(tmp_path):
+def test_minute_update_caches_completed_days_and_writes_features(
+    tmp_path,
+    monkeypatch,
+):
+    def fail_cross_source(*args, **kwargs):
+        pytest.fail("RQData minute update called another external source")
+
+    monkeypatch.setattr("pyquant.data.updater.BaostockClient", fail_cross_source)
+    monkeypatch.setattr(
+        "pyquant.data.updater.query_csindex_history",
+        fail_cross_source,
+    )
     client = FakeMinuteRQData()
     request = MinuteRequest(
         "600000.SH",

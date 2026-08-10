@@ -115,6 +115,9 @@ pb_job = update_dataset(
 股票下载进度会在启动单元格中自动覆盖同一行显示，例如 `Updated 120/5231`。状态也可
 直接读取：
 
+`stock_daily` 返回 BaoStock 的 `pb_mrq`；RQData 的六种 PB 口径仍通过独立的
+`stock_pb_daily` 数据集读取，二者不会互相覆盖。
+
 ```python
 job.state
 job.completed, job.total
