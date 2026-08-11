@@ -276,6 +276,9 @@ def test_timing_signal_applies_to_following_month():
     assert out["benchmark_return"].iloc[1:].tolist() == pytest.approx([-0.1, 0.1])
     assert out["cash_timing_return"].iloc[1:].tolist() == pytest.approx([-0.1, 0.0])
     assert out["short_timing_return"].iloc[1:].tolist() == pytest.approx([-0.1, -0.1])
+    assert pd.isna(out["benchmark_return"].iloc[0])
+    assert out["cash_timing_nav"].tolist() == pytest.approx([1.0, 0.9, 0.9])
+    assert out["short_timing_nav"].tolist() == pytest.approx([1.0, 0.9, 0.81])
     assert out.loc["2024-03-29", "signal_date"] == pd.Timestamp("2024-02-29")
 
 

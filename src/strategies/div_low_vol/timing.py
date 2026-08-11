@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from pyquant import get_period_end_dates
+from pyquant import get_period_end_dates, run_backtest
 
 
 config_file = files("strategies.div_low_vol").joinpath("config.yaml")
@@ -104,7 +104,7 @@ def backtest_valuation_spread_timing(
     signal: pd.DataFrame,
     benchmark: pd.Series,
 ) -> pd.DataFrame:
-    """Apply each month-end bearish signal to the following month's return."""
+    """Backtest month-end timing signals on the total-return benchmark with VectorBT."""
     signal_data = _prepare_signal(signal)
     benchmark_data = _prepare_benchmark(benchmark)
     signal_months = signal_data.index.to_period("M")
@@ -120,15 +120,42 @@ def backtest_valuation_spread_timing(
 
     benchmark_close = benchmark_monthly.reindex(signal_months)
     benchmark_close.index = signal_data.index
-    benchmark_return = benchmark_close.pct_change(fill_method=None)
+    close = benchmark_close.to_frame("benchmark")
+    # Orders placed at each month-end hold until the next month-end return.
+    benchmark_weights = pd.DataFrame(1.0, index=signal_data.index, columns=close.columns)
+    cash_weights = (~signal_data["bearish_signal"]).astype(float).to_frame("benchmark")
+    short_weights = signal_data["bearish_signal"].map({False: 1.0, True: -1.0}).to_frame(
+        "benchmark"
+    )
+    benchmark_portfolio = run_backtest(close, benchmark_weights)
+    cash_portfolio = run_backtest(close, cash_weights, allow_cash=True)
+    short_portfolio = run_backtest(
+        close,
+        short_weights,
+        direction="both",
+    )
+
+    def portfolio_series(portfolio: object, name: str) -> tuple[pd.Series, pd.Series]:
+        values = portfolio.value()
+        returns = portfolio.returns()
+        if isinstance(values, pd.DataFrame):
+            values = values.iloc[:, 0]
+        if isinstance(returns, pd.DataFrame):
+            returns = returns.iloc[:, 0]
+        values = values.rename(name)
+        returns = returns.rename(name)
+        returns.iloc[0] = np.nan
+        return values.div(values.iloc[0]), returns
+
+    benchmark_nav, benchmark_return = portfolio_series(
+        benchmark_portfolio,
+        "benchmark",
+    )
+    cash_nav, cash_return = portfolio_series(cash_portfolio, "cash")
+    short_nav, short_return = portfolio_series(short_portfolio, "short")
     bearish_position = signal_data["bearish_signal"].shift(
         1,
         fill_value=False,
-    )
-    cash_return = benchmark_return.mask(bearish_position, 0.0)
-    short_return = benchmark_return.where(
-        ~bearish_position,
-        -benchmark_return,
     )
     signal_dates = pd.Series(
         signal_data.index,
@@ -142,9 +169,9 @@ def backtest_valuation_spread_timing(
             "bearish_position": bearish_position,
             "cash_timing_return": cash_return,
             "short_timing_return": short_return,
-            "benchmark_nav": (1.0 + benchmark_return.fillna(0.0)).cumprod(),
-            "cash_timing_nav": (1.0 + cash_return.fillna(0.0)).cumprod(),
-            "short_timing_nav": (1.0 + short_return.fillna(0.0)).cumprod(),
+            "benchmark_nav": benchmark_nav,
+            "cash_timing_nav": cash_nav,
+            "short_timing_nav": short_nav,
         }
     )
     return out[BACKTEST_COLUMNS]

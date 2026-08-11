@@ -38,3 +38,40 @@ def test_run_backtest_rejects_invalid_target_weights():
 
     with pytest.raises(ValueError, match="sum to 1"):
         run_backtest(close, weights)
+
+
+def test_run_backtest_supports_cash_and_theoretical_short_positions():
+    dates = pd.to_datetime(["2024-01-31", "2024-02-29", "2024-03-29"])
+    close = pd.DataFrame({"benchmark": [100.0, 90.0, 99.0]}, index=dates)
+
+    cash = run_backtest(
+        close,
+        pd.DataFrame({"benchmark": [1.0, 0.0, 1.0]}, index=dates),
+        allow_cash=True,
+    )
+    short = run_backtest(
+        close,
+        pd.DataFrame({"benchmark": [1.0, -1.0, 1.0]}, index=dates),
+        direction="both",
+    )
+
+    assert cash.value().tolist() == pytest.approx(
+        [1_000_000.0, 900_000.0, 900_000.0]
+    )
+    assert short.value().tolist() == pytest.approx(
+        [1_000_000.0, 900_000.0, 810_000.0]
+    )
+
+
+def test_run_backtest_rejects_invalid_direction_and_gross_exposure():
+    dates = pd.to_datetime(["2024-01-31", "2024-02-29"])
+    close = pd.DataFrame({"benchmark": [100.0, 90.0]}, index=dates)
+
+    with pytest.raises(ValueError, match="direction"):
+        run_backtest(close, pd.DataFrame({"benchmark": [1.0, 1.0]}, index=dates), direction="shortonly")
+    with pytest.raises(ValueError, match="gross exposure"):
+        run_backtest(
+            close,
+            pd.DataFrame({"benchmark": [1.1, 1.0]}, index=dates),
+            allow_cash=True,
+        )

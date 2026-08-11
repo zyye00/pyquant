@@ -91,6 +91,8 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
     assert "calculate_bp_spread" in strategy_notebook
     assert "stock_pb_daily" in strategy_notebook
     assert "backtest_valuation_spread_timing" in strategy_notebook
+    assert "vectorbt" in strategy_notebook
+    assert "H20269" in strategy_notebook
     assert "估值差BP_spread与对应下个月红利低波全收益指数月度收益" in strategy_notebook
     assert "twinx" in strategy_notebook
 

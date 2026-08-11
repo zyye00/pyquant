@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from typing import TYPE_CHECKING
+from typing import Literal
 
 if TYPE_CHECKING:
     import vectorbt as vbt
@@ -19,25 +20,36 @@ def run_backtest(
     slippage: float = 0.0,
     init_cash: float = 1_000_000.0,
     freq: str | pd.Timedelta = "ME",
+    direction: Literal["longonly", "both"] = "longonly",
+    allow_cash: bool = False,
 ) -> vbt.Portfolio:
     """Run a target-weight portfolio with VectorBT.
 
     ``target_weights`` is interpreted as a portfolio percentage at each
-    timestamp.  All orders share one cash account and are sequenced
-    automatically so switches between constituents are fully funded.  The
-    A scalar fee is applied after the free initial construction.  A fee matrix
+    timestamp. All orders share one cash account and are sequenced
+    automatically so switches between constituents are fully funded. A
+    scalar fee is applied after the free initial construction. A fee matrix
     can override this row-by-row behavior for more specific execution rules.
+
+    By default every row must be fully invested long-only. ``allow_cash``
+    permits zero exposure, while ``direction="both"`` additionally permits
+    negative target weights for theoretical short positions.
     """
     import vectorbt as vbt
 
     close_data = _prepare_panel(close, "close")
-    weights = _prepare_target_weights(target_weights, close_data.columns)
+    weights = _prepare_target_weights(
+        target_weights,
+        close_data.columns,
+        direction=direction,
+        allow_cash=allow_cash,
+    )
     if not weights.index.isin(close_data.index).all():
         raise ValueError("target_weights dates must be present in close")
     close_data = close_data.reindex(close_data.index.union(weights.index)).sort_index()
     close_data = close_data.ffill().reindex(columns=weights.columns)
     held_weights = weights.reindex(close_data.index).ffill().fillna(0.0)
-    if (close_data.isna() & held_weights.gt(0)).any().any():
+    if (close_data.isna() & held_weights.ne(0)).any().any():
         raise ValueError("close is missing while a target symbol is held")
     close_data = close_data.bfill()
     if close_data.isna().any().any() or close_data.le(0).any().any():
@@ -71,7 +83,7 @@ def run_backtest(
         close_data,
         size=held_weights,
         size_type="targetpercent",
-        direction="longonly",
+        direction=direction,
         price=price,
         fees=fee_data,
         slippage=slippage,
@@ -101,6 +113,9 @@ def _prepare_panel(data: pd.DataFrame, name: str) -> pd.DataFrame:
 def _prepare_target_weights(
     target_weights: pd.DataFrame,
     close_columns: pd.Index,
+    *,
+    direction: Literal["longonly", "both"],
+    allow_cash: bool,
 ) -> pd.DataFrame:
     if not isinstance(target_weights, pd.DataFrame):
         raise TypeError("target_weights must be a DataFrame")
@@ -117,8 +132,16 @@ def _prepare_target_weights(
     if unsupported:
         raise ValueError(f"target_weights symbols missing from close: {unsupported}")
     out = out.apply(pd.to_numeric, errors="coerce").fillna(0.0).sort_index()
-    if out.lt(0).any().any():
+    if direction not in {"longonly", "both"}:
+        raise ValueError("direction must be 'longonly' or 'both'")
+    if direction == "longonly" and out.lt(0).any().any():
         raise ValueError("target_weights must not be negative")
-    if not out.sum(axis=1).sub(1.0).abs().le(1e-10).all():
-        raise ValueError("Each target_weights row must sum to 1")
+    gross_exposure = out.abs().sum(axis=1)
+    if allow_cash:
+        if gross_exposure.gt(1.0 + 1e-10).any():
+            raise ValueError("Each target_weights row must have gross exposure <= 1")
+    elif not gross_exposure.sub(1.0).abs().le(1e-10).all():
+        if direction == "longonly":
+            raise ValueError("Each target_weights row must sum to 1")
+        raise ValueError("Each target_weights row must have gross exposure equal to 1")
     return out
