@@ -1,4 +1,4 @@
-"""RQData market-index constituent history."""
+"""RQData stock factors, prices, calendars, and index histories."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pyquant.data.resources import load_source_protocols
 _RQDATA = load_source_protocols()["rqdata"]
 _MINUTE = _RQDATA["stock_minute_1m"]
 _PB = _RQDATA["stock_pb_daily"]
+_MARKET_CAP = _RQDATA["stock_market_cap_daily"]
 _INITIALIZED_CLIENTS: list[Any] = []
 
 
@@ -56,8 +57,8 @@ def query_rqdata_stock_symbols(
     client = _resolve_client(client)
     try:
         data = client.all_instruments(
-            type=_PB["instrument_type"],
-            market=_PB["market"],
+            type=_MARKET_CAP["instrument_type"],
+            market=_MARKET_CAP["market"],
         )
     except Exception as exc:
         raise RuntimeError(f"RQData instrument-list request failed: {exc}") from exc
@@ -73,11 +74,13 @@ def query_rqdata_stock_symbols(
         errors="coerce",
     )
     de_listed = data["de_listed_date"].astype("string")
-    open_ended = de_listed.isna() | de_listed.isin(["0000-00-00", ""])
-    de_listed_at = pd.to_datetime(de_listed.mask(open_ended), errors="coerce")
-    invalid_dates = (listed.ne("2999-12-31") & listed_at.isna()) | (
-        ~open_ended & de_listed_at.isna()
+    open_ended = de_listed.isna() | de_listed.isin(
+        ["0000-00-00", "0", "0.0", ""]
     )
+    de_listed_at = pd.to_datetime(de_listed.mask(open_ended), errors="coerce")
+    invalid_dates = listed.isna() | (
+        listed.ne("2999-12-31") & listed_at.isna()
+    ) | (~open_ended & de_listed_at.isna())
     if invalid_dates.any():
         raise ValueError("RQData instrument-list response contains invalid listing dates")
     selected = data.loc[
@@ -165,6 +168,87 @@ def query_stock_pb_daily(
             f"RQData PB request failed for {start_date} to {end_date}: {exc}"
         ) from exc
     return extract_stock_pb_daily(data, normalized)
+
+
+def extract_stock_market_cap_daily(
+    data: pd.DataFrame | None,
+    symbols: Sequence[str],
+) -> pd.DataFrame:
+    """Normalize one RQData PIT total-market-cap response."""
+    columns = ["date", "symbol", "total_market_cap"]
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("RQData market-cap response must be a DataFrame")
+    out = data.reset_index()
+    order_book_column = next(
+        (column for column in ["order_book_id", "level_0"] if column in out),
+        None,
+    )
+    date_column = next(
+        (column for column in ["date", "level_1"] if column in out),
+        None,
+    )
+    if order_book_column is None or date_column is None:
+        raise ValueError("RQData market-cap response must have order_book_id and date")
+    factor = _MARKET_CAP["factor"]
+    if factor not in out:
+        raise ValueError(f"RQData market-cap response missing factor: {factor}")
+    expected = {
+        project_symbol_to_rqdata(normalize_security_symbol(symbol))
+        for symbol in symbols
+    }
+    actual = set(out[order_book_column].dropna().astype(str))
+    unexpected = sorted(actual - expected)
+    if unexpected:
+        raise ValueError(
+            f"RQData market-cap response contains unexpected symbols: {unexpected}"
+        )
+    out = out.rename(columns={order_book_column: "rq_symbol", date_column: "date"})
+    out["symbol"] = out["rq_symbol"].map(rqdata_symbol_to_project)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    if out[["date", "symbol"]].isna().any().any():
+        raise ValueError("RQData market-cap response contains invalid identifiers or dates")
+    out["total_market_cap"] = pd.to_numeric(out[factor], errors="coerce").astype(
+        "float64"
+    )
+    out = out[columns]
+    if out.duplicated(["date", "symbol"]).any():
+        raise ValueError("RQData market-cap response contains duplicate (date, symbol) rows")
+    return out.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def query_stock_market_cap_daily(
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str,
+    *,
+    client: Any | None = None,
+) -> pd.DataFrame:
+    """Query RQData PIT total market capitalization for a security collection."""
+    normalized = sorted({normalize_security_symbol(symbol) for symbol in symbols})
+    if not normalized:
+        raise ValueError("RQData market-cap query requires at least one symbol")
+    start_at = pd.Timestamp(start_date)
+    end_at = pd.Timestamp(end_date)
+    if start_at > end_at:
+        raise ValueError("start_date must not be after end_date")
+    client = _resolve_client(client)
+    rq_symbols = [project_symbol_to_rqdata(symbol) for symbol in normalized]
+    try:
+        data = client.get_factor(
+            rq_symbols,
+            factor=_MARKET_CAP["factor"],
+            start_date=start_at.strftime("%Y-%m-%d"),
+            end_date=end_at.strftime("%Y-%m-%d"),
+            expect_df=True,
+            market=_MARKET_CAP["market"],
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"RQData market-cap request failed for {start_date} to {end_date}: {exc}"
+        ) from exc
+    return extract_stock_market_cap_daily(data, normalized)
 
 
 def extract_minute_prices(data: pd.DataFrame, symbol: str) -> pd.DataFrame:

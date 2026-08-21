@@ -21,6 +21,7 @@ from pyquant.data.duckdb import connect_database, initialize_database
 from pyquant.data.store import (
     CSINDEX_DAILY_FIELD_SET_ID,
     write_index_daily_request,
+    write_stock_market_cap_request,
     write_stock_pb_request,
     write_stock_daily_request,
 )
@@ -85,6 +86,40 @@ def test_load_stock_pb_daily_returns_all_float64_factors(tmp_path):
         "pb_ratio_1_ttm",
     ]
     assert all(out[column].dtype == "float64" for column in out.columns[2:])
+
+
+def test_load_stock_market_cap_daily_returns_float64(tmp_path):
+    initialize_database(tmp_path / "pyquant.duckdb")
+    with connect_database(tmp_path / "pyquant.duckdb") as connection:
+        write_stock_market_cap_request(
+            connection,
+            ["600000.SH"],
+            pd.DataFrame(
+                {
+                    "date": [pd.Timestamp("2024-01-02")],
+                    "symbol": ["600000.SH"],
+                    "total_market_cap": [1_000_000],
+                }
+            ),
+            "2024-01-02",
+            "2024-01-02",
+        )
+
+    out = load_dataset(
+        "stock_market_cap_daily",
+        start="2024-01-02",
+        end="2024-01-02",
+        data_root=tmp_path,
+    )
+
+    assert out.to_dict("records") == [
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "600000.SH",
+            "total_market_cap": 1_000_000.0,
+        }
+    ]
+    assert out["total_market_cap"].dtype == "float64"
 
 
 def test_load_stock_daily_returns_baostock_pb_mrq(tmp_path):

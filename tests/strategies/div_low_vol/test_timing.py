@@ -302,7 +302,7 @@ def test_strategy_3_config_and_dataset_catalog():
 
     assert config["strategy_3"] == {
         "index_code": "H30269",
-        "pb_factor": "pb_ratio_lf",
+        "pb_factor": "pb_mrq",
         "trim_ratio": 0.1,
         "band_window_months": 6,
         "band_std_multiplier": 1.5,

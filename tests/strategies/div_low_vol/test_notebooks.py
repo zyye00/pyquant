@@ -72,9 +72,9 @@ def test_download_notebook_groups_sources_and_controls_current_job():
     baostock_adjust = index_of('"stock_adjust_factor",')
     pool_calculation = index_of("pool = select_div_low_vol_download_symbols")
     baostock_dividend = index_of('"dividend",')
-    baostock_shares = index_of('"stock_profit_quarterly",')
     rqdata_constituents = index_of('"index_constituents",')
     rqdata_pb = index_of('"stock_pb_daily",')
+    rqdata_market_cap = index_of('"stock_market_cap_daily",')
     minute_requests = index_of("minute_requests = []")
     rqdata_minute = index_of("update_minute_data(")
     akshare_index = index_of('"csindex_daily",')
@@ -83,15 +83,16 @@ def test_download_notebook_groups_sources_and_controls_current_job():
         < baostock_adjust
         < pool_calculation
         < baostock_dividend
-        < baostock_shares
         < rqdata_constituents
         < rqdata_pb
+        < rqdata_market_cap
         < minute_requests
         < rqdata_minute
         < akshare_index
     )
     assert "stock_adjust_factor" not in sources[pool_calculation]
     assert "update_dataset" not in sources[minute_requests]
+    assert "stock_profit_quarterly" not in str(notebook)
 
     start_indices = [
         index
@@ -156,6 +157,7 @@ def test_strategy_2_notebook_uses_public_interfaces_and_candidate_pool_scope():
     assert "load_dataset(\"intraday_volatility_daily\"" in strategy_notebook
     assert "calculate_high_frequency_div_low_vol_monthly_rebalanced_index" in strategy_notebook
     assert "calculate_high_frequency_volatility_candidate_group_indices" in strategy_notebook
+    assert "stock_market_cap_daily" in strategy_notebook
     assert "候选池" in strategy_notebook
     assert "不代表研报的全 A 或完整红利股票池结果" in strategy_notebook
     assert "Rank IC均值" in strategy_notebook

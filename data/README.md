@@ -1,6 +1,6 @@
 # 本地基础数据库
 
-本项目的长期基础数据统一保存在 `data/pyquant.duckdb`，包括股票与指数日行情、指数成分股、分红、季度总股本及其下载覆盖。
+本项目的长期基础数据统一保存在 `data/pyquant.duckdb`，包括股票与指数日行情、指数成分股、分红、RQData PIT 总市值、季度总股本及其下载覆盖。
 
 ## 数据层级
 
@@ -49,6 +49,20 @@
 BaoStock 的 `pbMRQ` 不写入本表，而是保留在 `core.stock_daily.pb_mrq`；因此两类来源的 PB
 可以并存、独立比较。
 
+### `core.stock_market_cap_daily`
+
+该表保存 RQData `get_factor(..., factor="market_cap_3")` 返回的 PIT 总市值，单位为元。
+`market_cap_3` 使用公告日可见的 PIT 总股本与未复权收盘价计算，不回填到报告期截止日。
+
+| 字段 | DuckDB 类型 | 说明 |
+| --- | --- | --- |
+| `security_id` | `UINTEGER` | 内部证券 ID |
+| `trade_date` | `DATE` | 交易日期 |
+| `total_market_cap` | `DOUBLE` | RQData `market_cap_3`，PIT 总市值，单位为元 |
+
+红利低波策略的市值筛选和高频市值中性化均使用该表。`api.daily_market_cap` 仍保留，
+但它是由 BaoStock 季度总股本推导的旧口径，仅用于审计和交叉验证。
+
 ### `core.index_daily`
 
 业务键为 `index_id + trade_date`，写入时覆盖同一指数日期。
@@ -88,10 +102,22 @@ BaoStock 的 `pbMRQ` 不写入本表，而是保留在 `core.stock_daily.pb_mrq`
 | `payment_date` | `DATE` | 派息日 |
 | `cash_dividend_before_tax` | `FLOAT` | 每股税前现金分红 |
 
-该表只保存 BaoStock 的原始税前字段 `dividCashPsBeforeTax` 转换后的浮点数。数据层不保存
-按投资者税率区分的税后字符串，也不在存储阶段推导税后值。红利低波策略统一以
+该表按统一结构保存原始税前每股现金分红；正常下载字段来自 BaoStock 的
+`dividCashPsBeforeTax` 转换结果。数据层不保存按投资者税率区分的税后字符串，也不在存储阶段推导税后值。红利低波策略统一以
 `cash_dividend_before_tax × 0.9` 近似税后现金分红；该固定比例仅用于策略计算，不会写回
 DuckDB。
+
+#### 2026-08-21 分红交叉验证修复
+
+- 删除 `002840.SZ` 在 `2021-06-30` 的一条重复记录，保留税前每股分红约
+  `0.031999` 的记录；原 BaoStock 公告日 `2021-04-16`、登记日、除息日和到账日均未修改。
+- 将 RQData 交叉验证确认的 57 条“RQData 有、本地缺失”事件写入 `core.dividend`，字段按
+  `announce_date`、`record_date`、`ex_date`、`payment_date` 和税前每股现金分红保存；RQData
+  的现金分红按 `dividend_cash_before_tax / round_lot` 换算。
+- 本次变更使分红事实行数从 29,510 增至 29,566，覆盖表不变。由于 `core.dividend` 当前没有
+  来源字段，补写事件的来源依据保存在
+  `data/validation/rqdata_dividend/missing_in_baostock.parquet` 及其验证报告中。
+- `300315.SZ` 的两条本地记录未删除；其税前分红合计 `0.15`，与 RQData 对应事件一致。
 
 ### `core.share_capital_quarterly`
 
@@ -110,6 +136,7 @@ DuckDB。
 | --- | --- |
 | `meta.stock_daily_coverage` | `security_id + start_date + end_date + field_set_id` |
 | `meta.stock_pb_daily_coverage` | `security_id + start_date + end_date + field_set_id` |
+| `meta.stock_market_cap_daily_coverage` | `security_id + start_date + end_date + field_set_id` |
 | `meta.index_daily_coverage` | `index_id + start_date + end_date + field_set_id` |
 | `meta.dividend_coverage` | `security_id + query_year + field_set_id` |
 | `meta.share_capital_coverage` | `security_id + report_year + report_quarter` |
@@ -142,6 +169,11 @@ pb = load_dataset(
     start="2014-01-01",
     end="2023-06-30",
 )
+market_cap = load_dataset(
+    "stock_market_cap_daily",
+    start="2013-01-31",
+    end="2023-06-30",
+)
 dividends = load_dataset("dividend")
 shares = load_dataset("stock_profit_quarterly")
 index_price = load_dataset(
@@ -152,4 +184,5 @@ index_price = load_dataset(
 constituents = load_dataset("index_constituents")
 ```
 
-`load_dataset()` 查询 `api` 视图。`stock_daily` 仍要求显式给出开始和结束日期；当前分红未重新下载时，`load_dataset("dividend")` 返回具有正式字段但没有数据行的 DataFrame。
+`load_dataset()` 查询 `api` 视图。`stock_daily` 仍要求显式给出开始和结束日期；当前分红表包含
+29,566 条事实，其中 2026-08-21 的交叉验证修复补写了 57 条 RQData 事件。

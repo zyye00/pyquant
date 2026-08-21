@@ -51,6 +51,7 @@ from pyquant.data.sources.rqdata import (
     query_rqdata_quota_remaining,
     query_rqdata_stock_symbols,
     query_rqdata_trading_dates,
+    query_stock_market_cap_daily,
     query_stock_pb_daily,
     query_stock_minute_1m,
 )
@@ -65,6 +66,7 @@ from pyquant.data.store import (
     share_capital_coverage,
     stock_adjust_factor_coverage,
     stock_pb_coverage,
+    stock_market_cap_coverage,
     stock_daily_coverage,
     recover_minute_download_tasks,
     update_minute_download_task,
@@ -77,12 +79,14 @@ from pyquant.data.store import (
     write_minute_request_failure,
     write_stock_daily_request,
     write_stock_pb_request,
+    write_stock_market_cap_request,
 )
 
 _fields = load_source_protocols()["baostock"]
 _csindex = load_source_protocols()["csindex"]
 _rqdata_minute = load_source_protocols()["rqdata"]["stock_minute_1m"]
 _rqdata_pb = load_source_protocols()["rqdata"]["stock_pb_daily"]
+_rqdata_market_cap = load_source_protocols()["rqdata"]["stock_market_cap_daily"]
 _normalize_baostock_code = normalize_baostock_code
 
 
@@ -754,6 +758,83 @@ def _update_stock_pb(
     return pd.DataFrame(results, columns=_rqdata_pb["result"])
 
 
+def _update_stock_market_cap(
+    symbols: Iterable[str],
+    start_date: str,
+    end_date: str,
+    data_root: Path = Path("data"),
+    client: Any | None = None,
+    checkpoint: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    max_tasks: int | None = None,
+) -> pd.DataFrame:
+    """Download RQData PIT total market capitalization into DuckDB."""
+    symbols = sorted({normalize_security_symbol(symbol) for symbol in symbols})
+    if not symbols:
+        raise ValueError("No security symbols were selected")
+    if max_tasks is not None and max_tasks <= 0:
+        raise ValueError("max_tasks must be positive")
+    paths = init_data_storage(data_root)
+    tasks_by_range: dict[tuple[str, str], list[str]] = {}
+    with connect_database(paths.database_path) as connection:
+        for symbol in symbols:
+            missing = missing_baostock_ranges(
+                start_date,
+                end_date,
+                stock_market_cap_coverage(
+                    connection,
+                    symbol,
+                    int(_rqdata_market_cap["field_set_id"]),
+                ),
+            )
+            for missing_start, missing_end in missing:
+                for range_start, range_end in _split_rqdata_pb_range(
+                    missing_start,
+                    missing_end,
+                    int(_rqdata_market_cap["request_months"]),
+                ):
+                    tasks_by_range.setdefault((range_start, range_end), []).append(symbol)
+        tasks = [
+            (range_start, range_end, sorted(batch_symbols))
+            for (range_start, range_end), batch_symbols in sorted(tasks_by_range.items())
+        ]
+        if max_tasks is not None:
+            tasks = tasks[:max_tasks]
+        if progress is not None:
+            progress(0, len(tasks))
+        results = []
+        for completed, (range_start, range_end, batch_symbols) in enumerate(tasks, start=1):
+            if checkpoint is not None and not checkpoint():
+                break
+            data = query_stock_market_cap_daily(
+                batch_symbols,
+                range_start,
+                range_end,
+                client=client,
+            )
+            write_stock_market_cap_request(
+                connection,
+                batch_symbols,
+                data,
+                range_start,
+                range_end,
+                int(_rqdata_market_cap["field_set_id"]),
+            )
+            results.append(
+                (
+                    range_start,
+                    range_end,
+                    "success",
+                    len(batch_symbols),
+                    len(data),
+                    "",
+                )
+            )
+            if progress is not None:
+                progress(completed, len(tasks))
+    return pd.DataFrame(results, columns=_rqdata_market_cap["result"])
+
+
 def update_adjust_factors(
     codes: Iterable[str],
     start_date: str,
@@ -1228,6 +1309,29 @@ def _run_update_dataset(
             else:
                 symbols = pool
             return _update_stock_pb(
+                symbols,
+                start,
+                end_date,
+                data_root,
+                client,
+                checkpoint,
+                progress,
+                max_tasks,
+            )
+        if update.kind == "stock_market_cap":
+            if isinstance(pool, str):
+                if pool != "all":
+                    raise ValueError(
+                        f"Dataset {name!r} only supports the named pool 'all'"
+                    )
+                symbols = query_rqdata_stock_symbols(
+                    start,
+                    end_date,
+                    client=client,
+                )
+            else:
+                symbols = pool
+            return _update_stock_market_cap(
                 symbols,
                 start,
                 end_date,

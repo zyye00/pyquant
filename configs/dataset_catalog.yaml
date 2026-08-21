@@ -47,6 +47,18 @@ stock_pb_daily:
   numeric_columns: [pb_ratio_lf, pb_ratio_lyr, pb_ratio_ttm, pb_ratio_1_lf, pb_ratio_1_lyr, pb_ratio_1_ttm]
   update: {kind: stock_pb, pool: true}
 
+stock_market_cap_daily:
+  description: Daily PIT total market capitalization from RQData market_cap_3.
+  source: rqdata
+  storage: {kind: duckdb, path: data/pyquant.duckdb, relation: api.stock_market_cap_daily, requires_dates: true}
+  columns: [date, symbol, total_market_cap]
+  required: [date, symbol, total_market_cap]
+  primary_key: [date, symbol]
+  date_column: date
+  date_columns: [date]
+  numeric_columns: [total_market_cap]
+  update: {kind: stock_market_cap, pool: true}
+
 stock_minute_1m:
   description: Unadjusted one-minute stock bars downloaded from RQData.
   source: rqdata

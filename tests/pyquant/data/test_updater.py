@@ -193,7 +193,8 @@ class FakePBClient:
             }
         )
 
-    def get_factor(self, symbols, factors, **kwargs):
+    def get_factor(self, symbols, factors=None, factor=None, **kwargs):
+        factors = list(factors) if factors is not None else [factor]
         self.calls.append((symbols, factors, kwargs))
         index = pd.MultiIndex.from_tuples(
             [
@@ -1108,6 +1109,68 @@ def test_update_dataset_dispatches_rqdata_pb_in_bounded_ranges(
         assert connection.execute(
             "SELECT COUNT(*) FROM api.stock_pb_daily"
         ).fetchone() == (2,)
+
+
+def test_update_dataset_dispatches_rqdata_market_cap_without_other_sources(
+    tmp_path,
+    monkeypatch,
+):
+    def fail_cross_source(*args, **kwargs):
+        pytest.fail("RQData market-cap update called another external source")
+
+    monkeypatch.setattr("pyquant.data.updater.BaostockClient", fail_cross_source)
+    monkeypatch.setattr("pyquant.data.updater.query_csindex_history", fail_cross_source)
+    client = FakePBClient()
+    data_root = tmp_path / "data"
+
+    out = update_dataset(
+        "stock_market_cap_daily",
+        start="2024-01-01",
+        end="2024-12-31",
+        pool=["600000.SH", "000001.SZ"],
+        max_tasks=1,
+        client=client,
+        data_root=data_root,
+    )
+
+    assert out["row_count"].tolist() == [2]
+    assert client.calls[0] == ("init",)
+    assert client.calls[1][0] == ["000001.XSHE", "600000.XSHG"]
+    assert not any(call[0] == "instruments" for call in client.calls)
+    with connect_database(data_root / "pyquant.duckdb") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM api.stock_market_cap_daily"
+        ).fetchone() == (2,)
+
+
+def test_update_dataset_resolves_historical_rqdata_market_cap_universe(tmp_path):
+    client = FakePBClient()
+
+    out = update_dataset(
+        "stock_market_cap_daily",
+        start="2017-01-01",
+        end="2019-01-01",
+        pool="all",
+        max_tasks=1,
+        client=client,
+        data_root=tmp_path / "data",
+    )
+
+    assert out.iloc[0]["symbol_count"] == 3
+    assert client.calls[0] == ("init",)
+    assert client.calls[1] == ("instruments", "CS", "cn")
+    assert client.calls[2][0] == ["000001.XSHE", "000002.XSHE", "600000.XSHG"]
+
+
+def test_update_dataset_rejects_unsupported_rqdata_market_cap_named_pool(tmp_path):
+    with pytest.raises(ValueError, match="only supports the named pool 'all'"):
+        update_dataset(
+            "stock_market_cap_daily",
+            start="2017-01-01",
+            pool="hs300",
+            client=FakePBClient(),
+            data_root=tmp_path / "data",
+        )
 
 
 def test_update_dataset_resolves_historical_rqdata_pb_universe(tmp_path):

@@ -34,6 +34,7 @@ MINUTE_TASK_FAILED = 5
 MINUTE_TASK_INVALID_CODE = 6
 MINUTE_TASK_QUOTA_STOPPED = 7
 _RQDATA_PB = load_source_protocols()["rqdata"]["stock_pb_daily"]
+_RQDATA_MARKET_CAP = load_source_protocols()["rqdata"]["stock_market_cap_daily"]
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,14 @@ _PB_SPEC = _EntitySpec(
     id_column="security_id",
     coverage_table="meta.stock_pb_daily_coverage",
     daily_fact_table="core.stock_pb_daily",
+    normalize=normalize_security_symbol,
+)
+_MARKET_CAP_SPEC = _EntitySpec(
+    reference_table="ref.security",
+    value_column="symbol",
+    id_column="security_id",
+    coverage_table="meta.stock_market_cap_daily_coverage",
+    daily_fact_table="core.stock_market_cap_daily",
     normalize=normalize_security_symbol,
 )
 _INDEX_SPEC = _EntitySpec(
@@ -203,6 +212,15 @@ def stock_pb_coverage(
 ) -> list[tuple[str, str]]:
     """Return completed RQData PB ranges for one security."""
     return _daily_coverage(connection, code, field_set_id, _PB_SPEC)
+
+
+def stock_market_cap_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    code: str,
+    field_set_id: int = int(_RQDATA_MARKET_CAP["field_set_id"]),
+) -> list[tuple[str, str]]:
+    """Return completed RQData market-cap ranges for one security."""
+    return _daily_coverage(connection, code, field_set_id, _MARKET_CAP_SPEC)
 
 
 def index_daily_coverage(
@@ -836,6 +854,63 @@ def write_stock_pb_request(
             )
 
 
+def write_stock_market_cap_request(
+    connection: duckdb.DuckDBPyConnection,
+    symbols: Iterable[str],
+    data: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    field_set_id: int = int(_RQDATA_MARKET_CAP["field_set_id"]),
+) -> None:
+    """Persist one RQData market-cap response and merged coverage atomically."""
+    symbols = sorted({normalize_security_symbol(symbol) for symbol in symbols})
+    if not symbols:
+        raise ValueError("Market-cap write requires at least one symbol")
+    start_at = pd.Timestamp(start_date)
+    end_at = pd.Timestamp(end_date)
+    if start_at > end_at:
+        raise ValueError("Market-cap coverage start_date must not be after end_date")
+    incoming = _prepare_stock_market_cap(data)
+    if not incoming.empty:
+        if not incoming["symbol"].isin(symbols).all():
+            raise ValueError("Market-cap response contains an unexpected symbol")
+        if not incoming["date"].between(start_at, end_at).all():
+            raise ValueError("Market-cap response contains a date outside its request")
+    with _transaction(connection):
+        security_ids = ensure_securities(connection, symbols)
+        for symbol in symbols:
+            connection.execute(
+                """
+                DELETE FROM core.stock_market_cap_daily
+                WHERE security_id = ? AND trade_date BETWEEN ? AND ?
+                """,
+                [security_ids[symbol], start_at.date(), end_at.date()],
+            )
+        if not incoming.empty:
+            incoming = incoming.assign(
+                security_id=incoming["symbol"].map(security_ids).astype("int64")
+            )
+            with _registered_frame(connection, "incoming_stock_market_cap", incoming):
+                connection.execute(
+                    """
+                    INSERT INTO core.stock_market_cap_daily (
+                        security_id, trade_date, total_market_cap
+                    )
+                    SELECT security_id, CAST(date AS DATE), total_market_cap
+                    FROM incoming_stock_market_cap
+                    """
+                )
+        for symbol in symbols:
+            _replace_daily_coverage(
+                connection,
+                security_ids[symbol],
+                start_date,
+                end_date,
+                field_set_id,
+                _MARKET_CAP_SPEC,
+            )
+
+
 def write_index_daily_request(
     connection: duckdb.DuckDBPyConnection,
     index_code: str,
@@ -1138,6 +1213,26 @@ def _prepare_stock_pb(data: pd.DataFrame) -> pd.DataFrame:
         out[factor] = pd.to_numeric(out[factor], errors="coerce").astype("float64")
     if out.duplicated(["date", "symbol"]).any():
         raise ValueError("PB data contains duplicate (date, symbol) rows")
+    return out.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def _prepare_stock_market_cap(data: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "symbol", "total_market_cap"]
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+    missing = sorted(set(columns) - set(data))
+    if missing:
+        raise ValueError(f"Market-cap data missing columns: {missing}")
+    out = data[columns].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if out["date"].isna().any():
+        raise ValueError("Market-cap dates must not be missing")
+    out["symbol"] = out["symbol"].map(normalize_security_symbol)
+    out["total_market_cap"] = pd.to_numeric(
+        out["total_market_cap"], errors="coerce"
+    ).astype("float64")
+    if out.duplicated(["date", "symbol"]).any():
+        raise ValueError("Market-cap data contains duplicate (date, symbol) rows")
     return out.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 

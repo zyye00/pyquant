@@ -44,6 +44,13 @@ rqdata:
     field_set_id: 1
     request_months: 6
     result: [start_date, end_date, status, symbol_count, row_count, error]
+  stock_market_cap_daily:
+    market: cn
+    instrument_type: CS
+    factor: market_cap_3
+    field_set_id: 1
+    request_months: 6
+    result: [start_date, end_date, status, symbol_count, row_count, error]
 
 price:
   columns: [date, symbol, open, high, low, close, volume, amount]

@@ -9,6 +9,7 @@ from pyquant.data.sources.rqdata import (
     query_rqdata_stock_symbols,
     query_rqdata_trading_dates,
     query_stock_minute_1m,
+    query_stock_market_cap_daily,
     query_stock_pb_daily,
 )
 
@@ -66,7 +67,8 @@ class FakeRQData:
             index=index,
         )
 
-    def get_factor(self, order_book_ids, factors, **kwargs):
+    def get_factor(self, order_book_ids, factors=None, factor=None, **kwargs):
+        factors = list(factors) if factors is not None else [factor]
         self.calls.append(("factor", order_book_ids, factors, kwargs))
         index = pd.MultiIndex.from_tuples(
             [(order_book_ids[0], pd.Timestamp("2024-01-02"))],
@@ -172,6 +174,25 @@ def test_pb_query_requests_all_configured_factor_conventions():
         "pb_ratio_1_ttm",
     ]
     assert out.loc[0, "symbol"] == "600000.SH"
+
+
+def test_market_cap_query_maps_market_cap_3_to_total_market_cap():
+    client = FakeRQData()
+
+    out = query_stock_market_cap_daily(
+        ["sh.600000"],
+        "2024-01-02",
+        "2024-01-02",
+        client=client,
+    )
+
+    _, symbols, factors, arguments = client.calls[-1]
+    assert symbols == ["600000.XSHG"]
+    assert factors == ["market_cap_3"]
+    assert arguments["market"] == "cn"
+    assert out.columns.tolist() == ["date", "symbol", "total_market_cap"]
+    assert out.loc[0, "total_market_cap"] == 1.0
+    assert out["total_market_cap"].dtype == "float64"
 
 
 def test_stock_symbols_cover_historical_interval_and_exclude_non_overlapping_rows():

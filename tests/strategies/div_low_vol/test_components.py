@@ -93,18 +93,19 @@ def make_shares(
     symbols: list[str],
     values: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    out = pd.DataFrame(
-        {
-            "symbol": symbols,
-            "publish_date": pd.Timestamp("2023-01-01"),
-            "total_shares": [
-                (values or {}).get(symbol, float(index + 1) * 100)
-                for index, symbol in enumerate(symbols)
-            ],
-        }
-    )
-    out["publish_date"] = pd.to_datetime(out["publish_date"]).astype("datetime64[ms]")
-    return out
+    dates = pd.bdate_range("2000-01-01", "2030-12-31")
+    rows = []
+    for index, symbol in enumerate(symbols):
+        total_market_cap = (values or {}).get(symbol, float(index + 1) * 100) * 10
+        rows.extend(
+            {
+                "date": date,
+                "symbol": symbol,
+                "total_market_cap": total_market_cap,
+            }
+            for date in dates
+        )
+    return pd.DataFrame(rows)
 
 
 def make_queries(
@@ -267,17 +268,16 @@ def test_percentage_rankings_exclude_missing_metrics_before_counting():
     )
     config = make_config(market_cap_keep_ratio=0.5, amount_keep_ratio=0.5)
 
-    out = build_div_low_vol_universe(
-        price,
-        make_dividends(symbols),
-        make_queries(symbols),
-        make_shares(["A", "B", "C"], {"A": 400.0, "B": 300.0, "C": 200.0}),
-        "2024-11-29",
-        config["universe"],
-        price_history_lookback_days=1,
-    )
-
-    assert out.index.tolist() == ["A"]
+    with pytest.raises(ValueError, match="RQData market-cap values are missing"):
+        build_div_low_vol_universe(
+            price,
+            make_dividends(symbols),
+            make_queries(symbols),
+            make_shares(["A", "B", "C"], {"A": 400.0, "B": 300.0, "C": 200.0}),
+            "2024-11-29",
+            config["universe"],
+            price_history_lookback_days=1,
+        )
 
 
 def test_public_universe_uses_common_dates_and_exact_date_population():
@@ -335,12 +335,18 @@ def test_public_universe_uses_common_dates_and_exact_date_population():
         ]
     )
     price["date"] = pd.to_datetime(price["date"]).astype("datetime64[ms]")
-    shares = make_shares(["A", "B"], {"A": 100.0, "B": 200.0})
+    shares = make_shares(
+        ["A", "B", "C", "OFF_DATE"],
+        {"A": 100.0, "B": 200.0, "C": 300.0, "OFF_DATE": 400.0},
+    )
 
     snapshot = build_div_low_vol_universe(
         price,
-        make_dividends(["A", "B"]),
-        make_queries(["A", "B"]),
+        make_dividends(
+            ["A", "B", "C"],
+            {"C": [0.0, 0.0, 0.0, 0.0]},
+        ),
+        make_queries(["A", "B", "C"]),
         shares,
         dates[-1],
         {
@@ -357,7 +363,7 @@ def test_public_universe_uses_common_dates_and_exact_date_population():
     assert snapshot.loc["A", "avg_amount_240d"] == pytest.approx(70.0 / 3.0)
     assert snapshot.loc["B", "avg_amount_240d"] == pytest.approx(200.0)
     assert snapshot.loc["A", "avg_market_cap_240d"] == pytest.approx(1_000.0)
-    assert snapshot.loc["B", "avg_market_cap_240d"] == pytest.approx(4_000.0)
+    assert snapshot.loc["B", "avg_market_cap_240d"] == pytest.approx(2_000.0)
 
 
 def test_public_universe_requires_a_full_market_calendar_window():
@@ -497,14 +503,12 @@ def test_future_dividend_announcement_and_share_publication_are_not_visible():
     )
     shares = pd.DataFrame(
         {
-            "symbol": ["A", "A"],
-            "publish_date": pd.to_datetime(["2023-01-01", "2024-12-15"]),
-            "total_shares": [100.0, 1_000.0],
+            "date": pd.bdate_range("2023-01-01", "2025-01-01"),
+            "symbol": "A",
+            "total_market_cap": 1_000.0,
         }
     )
-    shares["publish_date"] = pd.to_datetime(shares["publish_date"]).astype(
-        "datetime64[ms]"
-    )
+    shares.loc[shares["date"].ge("2024-12-15"), "total_market_cap"] = 10_000.0
 
     out = select_constituents(
         make_price(["A"], dates=pd.bdate_range("2023-12-18", periods=10)),
@@ -547,7 +551,19 @@ def test_public_universe_applies_december_annual_dividend_cutoff(as_of, is_eligi
         }
     )
     shares = make_shares(["A"])
-    shares["publish_date"] = pd.Timestamp("2009-01-01").as_unit("ms")
+    shares = pd.concat(
+        [
+            shares,
+            pd.DataFrame(
+                {
+                    "date": [as_of_date],
+                    "symbol": ["A"],
+                    "total_market_cap": [1_000.0],
+                }
+            ),
+        ],
+        ignore_index=True,
+    ).drop_duplicates(["date", "symbol"])
     out = build_div_low_vol_universe(
         price,
         dividends,

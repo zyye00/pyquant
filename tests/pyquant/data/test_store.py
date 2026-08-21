@@ -16,6 +16,7 @@ from pyquant.data.store import (
     ensure_securities,
     index_daily_coverage,
     stock_daily_coverage,
+    stock_market_cap_coverage,
     stock_pb_coverage,
     write_dividend_request,
     write_index_constituents,
@@ -24,6 +25,7 @@ from pyquant.data.store import (
     write_share_capital_request,
     write_stock_daily_request,
     write_stock_pb_request,
+    write_stock_market_cap_request,
 )
 
 
@@ -60,6 +62,16 @@ def make_stock_pb() -> pd.DataFrame:
             "pb_ratio_1_lf": [0.9, 1.0],
             "pb_ratio_1_lyr": [1.1, 1.2],
             "pb_ratio_1_ttm": [1.3, 1.4],
+        }
+    )
+
+
+def make_stock_market_cap() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["600000.SH", "600000.SH"],
+            "total_market_cap": [1_000_000.0, 1_100_000.0],
         }
     )
 
@@ -248,6 +260,37 @@ def test_stock_pb_write_persists_all_factors_and_merges_empty_coverage(tmp_path)
     assert row == [
         ("600000.SH", pd.Timestamp("2024-01-02").date(), 1.0, 1.3),
         ("600000.SH", pd.Timestamp("2024-01-03").date(), 1.1, 1.4),
+    ]
+    assert coverage == [("2024-01-02", "2024-01-05")]
+
+
+def test_stock_market_cap_write_persists_values_and_empty_coverage(tmp_path):
+    database_path = tmp_path / "pyquant.duckdb"
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        write_stock_market_cap_request(
+            connection,
+            ["sh.600000"],
+            make_stock_market_cap(),
+            "2024-01-02",
+            "2024-01-03",
+        )
+        write_stock_market_cap_request(
+            connection,
+            ["sh.600000"],
+            pd.DataFrame(columns=make_stock_market_cap().columns),
+            "2024-01-04",
+            "2024-01-05",
+        )
+        values = connection.execute(
+            "SELECT symbol, date, total_market_cap FROM api.stock_market_cap_daily ORDER BY date"
+        ).fetchall()
+        coverage = stock_market_cap_coverage(connection, "sh.600000")
+
+    assert values == [
+        ("600000.SH", pd.Timestamp("2024-01-02").date(), 1_000_000.0),
+        ("600000.SH", pd.Timestamp("2024-01-03").date(), 1_100_000.0),
     ]
     assert coverage == [("2024-01-02", "2024-01-05")]
 

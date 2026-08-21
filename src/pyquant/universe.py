@@ -41,7 +41,7 @@ def build_div_low_vol_universe(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
     price_history_lookback_days: int,
@@ -55,7 +55,7 @@ def build_div_low_vol_universe(
     _validate_div_low_vol_config(config, price_history_lookback_days)
     as_of_date = pd.Timestamp(as_of_date)
     prepared = prepared or prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     price_data = prepared["price"]
     price_data = price_data[price_data["date"].le(as_of_date)]
@@ -115,20 +115,17 @@ def prepare_div_low_vol_universe_inputs(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
 ) -> dict[str, pd.DataFrame]:
     """Prepare reusable inputs for repeated dividend low-volatility selections."""
     price_data = _prepare_div_low_vol_price(price)
-    share_data = _prepare_div_low_vol_shares(shares)
-    market_data = pd.merge_asof(
-        price_data.sort_values(["date", "symbol"]),
-        share_data.sort_values(["publish_date", "symbol"]),
-        left_on="date",
-        right_on="publish_date",
-        by="symbol",
-        direction="backward",
+    cap_data = _prepare_div_low_vol_market_cap(market_cap)
+    market_data = price_data.merge(
+        cap_data,
+        on=["date", "symbol"],
+        how="left",
+        validate="one_to_one",
     )
-    market_data["total_market_cap"] = market_data["close"] * market_data["total_shares"]
     price_counts = price_data[["date", "symbol"]].copy()
     price_counts["observation_count"] = price_counts.groupby("symbol").cumcount() + 1
     return {
@@ -184,16 +181,19 @@ def _prepare_div_low_vol_dividends(dividends: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _prepare_div_low_vol_shares(shares: pd.DataFrame) -> pd.DataFrame:
-    required = {"symbol", "publish_date", "total_shares"}
-    _require_div_low_vol_columns(shares, required, "shares")
-    out = shares.copy()
-    if "report_date" in out:
-        out = out.sort_values(["symbol", "publish_date", "report_date"])
-    out = out.dropna(subset=["publish_date", "total_shares"])
-    return out[out["total_shares"] > 0].drop_duplicates(
-        ["symbol", "publish_date"], keep="last"
-    )
+def _prepare_div_low_vol_market_cap(market_cap: pd.DataFrame) -> pd.DataFrame:
+    required = {"date", "symbol", "total_market_cap"}
+    _require_div_low_vol_columns(market_cap, required, "market_cap")
+    out = market_cap.loc[:, sorted(required)].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if out["date"].isna().any():
+        raise ValueError("market_cap dates must not be missing")
+    out["total_market_cap"] = pd.to_numeric(
+        out["total_market_cap"], errors="coerce"
+    ).astype("float64")
+    if out.duplicated(["date", "symbol"]).any():
+        raise ValueError("market_cap contains duplicate symbol-date rows")
+    return out.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
 def _div_low_vol_market_snapshot(
@@ -215,8 +215,26 @@ def _div_low_vol_market_snapshot(
     snapshot = price[price["date"].eq(as_of_date)].copy()
     if snapshot.empty:
         raise ValueError(f"No price data is available on {as_of_date.date()}")
+    window = market_data[market_data["date"].isin(dates)].copy()
+    invalid = (
+        ~np.isfinite(window["total_market_cap"])
+        | window["total_market_cap"].le(0)
+    )
+    if invalid.any():
+        missing = window.loc[invalid, ["symbol", "date"]]
+        details = (
+            missing.groupby("symbol")["date"]
+            .agg(["min", "max", "count"])
+            .sort_index()
+            .head(10)
+            .to_dict("index")
+        )
+        raise ValueError(
+            "RQData market-cap values are missing in the required 240-day window; "
+            f"symbols={len(missing['symbol'].unique())}, examples={details}"
+        )
     average = (
-        market_data[market_data["date"].isin(dates)]
+        window
         .groupby("symbol", as_index=False)
         .agg(
             avg_market_cap_240d=("total_market_cap", "mean"),

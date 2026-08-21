@@ -64,7 +64,7 @@ def select_div_low_vol_constituents(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
     prepared: dict[str, pd.DataFrame] | None = None,
@@ -72,13 +72,13 @@ def select_div_low_vol_constituents(
 ) -> pd.DataFrame:
     """Select one point-in-time constituent snapshot and dividend-yield weights."""
     prepared = prepared or prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     metrics = select_div_low_vol_candidates(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         as_of_date,
         config,
         prepared,
@@ -117,7 +117,7 @@ def select_div_low_vol_candidates(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
     prepared: dict[str, pd.DataFrame] | None = None,
@@ -127,7 +127,7 @@ def select_div_low_vol_candidates(
     selection = config["selection"]
     as_of_date = pd.Timestamp(as_of_date)
     prepared = prepared or prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     price_data = prepared["price"]
     price_data = price_data[price_data["date"] <= as_of_date]
@@ -136,7 +136,7 @@ def select_div_low_vol_candidates(
         price_data,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         as_of_date,
         config["universe"],
         selection["dividend_yield_lookback_days"],
@@ -297,7 +297,7 @@ def select_high_frequency_div_low_vol_constituents(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     daily_volatility: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
@@ -308,7 +308,7 @@ def select_high_frequency_div_low_vol_constituents(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         daily_volatility,
         as_of_date,
         config,
@@ -336,7 +336,7 @@ def _calculate_high_frequency_candidate_metrics(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     daily_volatility: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
     config: dict,
@@ -344,13 +344,13 @@ def _calculate_high_frequency_candidate_metrics(
 ) -> pd.DataFrame:
     _validate_strategy_2_config(config)
     prepared = prepared or prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     candidates = select_div_low_vol_candidates(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         as_of_date,
         config,
         prepared,
@@ -456,7 +456,7 @@ def calculate_div_low_vol_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
     config: dict,
@@ -485,7 +485,7 @@ def calculate_div_low_vol_rebalanced_index(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         end,
         config,
         schedule,
@@ -496,7 +496,7 @@ def calculate_div_low_vol_monthly_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
     config: dict,
@@ -535,7 +535,7 @@ def calculate_div_low_vol_monthly_rebalanced_index(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         strategy_config,
         rebalance_dates,
         transaction_cost_rate,
@@ -548,7 +548,7 @@ def calculate_high_frequency_div_low_vol_monthly_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     daily_volatility: pd.DataFrame,
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
@@ -574,13 +574,13 @@ def calculate_high_frequency_div_low_vol_monthly_rebalanced_index(
     if rebalance_dates.empty:
         raise ValueError("No monthly rebalance effective date falls within the period")
     prepared = prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     return _calculate_monthly_index_with_selector(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         strategy_config,
         rebalance_dates,
         strategy_config["selection"]["transaction_cost_rate"],
@@ -590,7 +590,7 @@ def calculate_high_frequency_div_low_vol_monthly_rebalanced_index(
             price,
             dividends,
             dividend_queries,
-            shares,
+            market_cap,
             daily_volatility,
             date,
             strategy_config,
@@ -604,7 +604,7 @@ def calculate_high_frequency_volatility_candidate_group_indices(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     daily_volatility: pd.DataFrame,
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
@@ -630,7 +630,7 @@ def calculate_high_frequency_volatility_candidate_group_indices(
     if rebalance_dates.empty:
         raise ValueError("No monthly rebalance effective date falls within the period")
     prepared = prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     adjusted_price = build_back_adjusted_close(
         price,
@@ -651,7 +651,7 @@ def calculate_high_frequency_volatility_candidate_group_indices(
             price,
             dividends,
             dividend_queries,
-            shares,
+            market_cap,
             daily_volatility,
             rebalance_date,
             strategy_config,
@@ -678,7 +678,7 @@ def calculate_traditional_volatility_group_indices(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     start_date: str | pd.Timestamp,
     end_date: str | pd.Timestamp,
     config: dict,
@@ -717,7 +717,7 @@ def calculate_traditional_volatility_group_indices(
         raise ValueError("No monthly rebalance effective date falls within the period")
 
     prepared = prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     adjusted_price = build_back_adjusted_close(
         price,
@@ -755,7 +755,7 @@ def calculate_traditional_volatility_group_indices(
             price,
             dividends,
             dividend_queries,
-            shares,
+            market_cap,
             rebalance_date,
             strategy_config["universe"],
             strategy_config["selection"]["dividend_yield_lookback_days"],
@@ -953,7 +953,7 @@ def _calculate_div_low_vol_monthly_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     config: dict,
     rebalance_dates: pd.DatetimeIndex,
     transaction_cost_rate: float,
@@ -964,7 +964,7 @@ def _calculate_div_low_vol_monthly_index(
         price,
         dividends,
         dividend_queries,
-        shares,
+        market_cap,
         config,
         rebalance_dates,
         transaction_cost_rate,
@@ -974,7 +974,7 @@ def _calculate_div_low_vol_monthly_index(
             price,
             dividends,
             dividend_queries,
-            shares,
+            market_cap,
             date,
             config,
             prepared,
@@ -987,7 +987,7 @@ def _calculate_monthly_index_with_selector(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     config: dict,
     rebalance_dates: pd.DatetimeIndex,
     transaction_cost_rate: float,
@@ -997,7 +997,7 @@ def _calculate_monthly_index_with_selector(
     prepared: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     ) if prepared is None else prepared
     adjusted_price = build_back_adjusted_close(
         price,
@@ -1051,13 +1051,13 @@ def _calculate_div_low_vol_rebalanced_index(
     price: pd.DataFrame,
     dividends: pd.DataFrame,
     dividend_queries: pd.DataFrame,
-    shares: pd.DataFrame,
+    market_cap: pd.DataFrame,
     end_date: pd.Timestamp,
     config: dict,
     schedule: list[tuple[pd.Timestamp, pd.Timestamp]],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = prepare_div_low_vol_universe_inputs(
-        price, dividends, dividend_queries, shares
+        price, dividends, dividend_queries, market_cap
     )
     index_inputs = _prepare_index_inputs(price, dividends, dividend_queries)
     index_segments = []
@@ -1067,7 +1067,7 @@ def _calculate_div_low_vol_rebalanced_index(
             price,
             dividends,
             dividend_queries,
-            shares,
+            market_cap,
             as_of_date,
             config,
             prepared,
