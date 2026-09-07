@@ -74,6 +74,9 @@ def make_spread_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
             for symbol, bp in zip(symbols, bp_values, strict=True)
         )
     price = pd.DataFrame(rows)
+    previous = price.copy()
+    previous["date"] = previous["date"] - pd.offsets.BDay(1)
+    price = pd.concat([previous, price], ignore_index=True)
     constituents = pd.DataFrame(
         {
             "effective_date": pd.Timestamp("2024-01-02"),
@@ -216,6 +219,20 @@ def test_bp_spread_excludes_non_positive_pb():
     assert out.loc["2024-01-31", "constituent_count"] == 3
     assert out.loc["2024-01-31", "non_constituent_count"] == 3
     assert out.loc["2024-01-31", "bp_spread"] == pytest.approx(0.0)
+
+
+def test_bp_spread_excludes_execution_day_pb_and_constituent_changes():
+    price, constituents = make_spread_inputs()
+    expected = calculate_bp_spread(price, constituents, make_config())
+    price.loc[price["date"].eq("2024-06-28"), "pb_ratio_lf"] *= 100
+    changed = constituents.copy()
+    changed["effective_date"] = pd.Timestamp("2024-06-28")
+    changed["symbol"] = list("EFGH")
+    actual = calculate_bp_spread(
+        price, pd.concat([constituents, changed]), make_config()
+    )
+    pd.testing.assert_frame_equal(actual, expected)
+    assert actual.loc["2024-06-28", "as_of_date"] == pd.Timestamp("2024-06-27")
 
 
 def test_bp_spread_uses_latest_snapshot_and_latest_valid_monthly_pb():

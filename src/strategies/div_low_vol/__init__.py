@@ -1,6 +1,7 @@
 """Dividend low-volatility strategy APIs."""
 
 from strategies.div_low_vol.components import (
+    get_rebalance_information_dates,
     build_intraday_minute_requests,
     calculate_high_frequency_volatility_factor,
     calculate_high_frequency_div_low_vol_monthly_rebalanced_index,
@@ -17,6 +18,7 @@ from strategies.div_low_vol.timing import (
 )
 
 __all__ = [
+    "get_rebalance_information_dates",
     "backtest_valuation_spread_timing",
     "build_intraday_minute_requests",
     "calculate_bp_spread",

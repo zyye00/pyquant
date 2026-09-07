@@ -51,6 +51,7 @@ output_columns:
     - total_return
     - total_return_index
   timing_spread:
+    - as_of_date
     - constituent_effective_date
     - constituent_count
     - non_constituent_count

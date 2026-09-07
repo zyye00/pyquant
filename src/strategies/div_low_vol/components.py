@@ -39,6 +39,19 @@ HIGH_FREQUENCY_CONSTITUENT_COLUMNS = _OUTPUT_COLUMNS[
 ]
 
 
+def get_rebalance_information_dates(
+    trading_dates: pd.Index | pd.Series,
+    rebalance_dates: pd.DatetimeIndex,
+) -> pd.Series:
+    """Map execution dates to the previous observed market trading date."""
+    calendar = pd.DatetimeIndex(trading_dates).drop_duplicates().sort_values()
+    dates = pd.DatetimeIndex(rebalance_dates)
+    positions = calendar.searchsorted(dates)
+    if not dates.isin(calendar).all() or (positions == 0).any():
+        raise ValueError("Each rebalance date requires a preceding trading date")
+    return pd.Series(calendar[positions - 1], index=dates, name="as_of_date")
+
+
 def select_div_low_vol_download_symbols(
     price: pd.DataFrame,
     as_of_date: str | pd.Timestamp,
@@ -503,7 +516,7 @@ def calculate_div_low_vol_monthly_rebalanced_index(
     adjustment_factors: pd.DataFrame,
     adjustment_factor_coverage: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Calculate strategy 1 using BaoStock back-adjusted monthly prices."""
+    """Trade at month-end closes using information through the preceding trading day."""
     try:
         strategy_config = {
             "universe": config["universe"],
@@ -556,7 +569,7 @@ def calculate_high_frequency_div_low_vol_monthly_rebalanced_index(
     adjustment_factors: pd.DataFrame,
     adjustment_factor_coverage: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Calculate strategy 2 with monthly high-frequency-volatility selection."""
+    """Trade monthly high-frequency selections with a one-trading-day information lag."""
     strategy_config = _strategy_2_selection_config(config)
     _validate_strategy_2_config(strategy_config)
     start = pd.Timestamp(start_date)
@@ -646,6 +659,7 @@ def calculate_high_frequency_volatility_candidate_group_indices(
     )
     snapshots = []
     groups = []
+    information_dates = get_rebalance_information_dates(price_data["date"], rebalance_dates)
     for rebalance_date in rebalance_dates:
         metrics = _calculate_high_frequency_candidate_metrics(
             price,
@@ -653,7 +667,7 @@ def calculate_high_frequency_volatility_candidate_group_indices(
             dividend_queries,
             market_cap,
             daily_volatility,
-            rebalance_date,
+            information_dates.loc[rebalance_date],
             strategy_config,
             prepared,
         )
@@ -731,11 +745,15 @@ def calculate_traditional_volatility_group_indices(
     monthly_prices = adjusted_price.pivot(
         index="date", columns="symbol", values="close"
     ).ffill().reindex(rebalance_dates)
+    information_dates = get_rebalance_information_dates(price_data["date"], rebalance_dates)
     volatility_snapshots = _calculate_traditional_volatility_snapshots(
         adjusted_price,
-        rebalance_dates,
+        pd.DatetimeIndex(information_dates),
         strategy_config["selection"]["volatility_lookback_days"],
     )
+    volatility_snapshots = {
+        date: volatility_snapshots[information_dates.loc[date]] for date in rebalance_dates
+    }
 
     all_a_groups = []
     dividend_groups = []
@@ -743,7 +761,7 @@ def calculate_traditional_volatility_group_indices(
         volatility = volatility_snapshots[rebalance_date]
         month_symbols = set(
             price_data.loc[
-                price_data["date"].eq(rebalance_date), "symbol"
+                price_data["date"].eq(information_dates.loc[rebalance_date]), "symbol"
             ].astype(str)
         )
         all_a_groups.append(
@@ -756,7 +774,7 @@ def calculate_traditional_volatility_group_indices(
             dividends,
             dividend_queries,
             market_cap,
-            rebalance_date,
+            information_dates.loc[rebalance_date],
             strategy_config["universe"],
             strategy_config["selection"]["dividend_yield_lookback_days"],
             prepared,
@@ -1008,9 +1026,10 @@ def _calculate_monthly_index_with_selector(
     )
     constituent_snapshots = []
     constituent_weights = {}
+    information_dates = get_rebalance_information_dates(price["date"], rebalance_dates)
 
     for rebalance_date in rebalance_dates:
-        constituents = selector(rebalance_date, adjusted_price, prepared)
+        constituents = selector(information_dates.loc[rebalance_date], adjusted_price, prepared)
         constituent_weights[rebalance_date] = constituents["weight"]
         constituent_snapshots.append(
             constituents.reset_index()

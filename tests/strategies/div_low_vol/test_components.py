@@ -684,7 +684,7 @@ def test_strategy_config_defines_component_output_columns():
     assert config["output_columns"]["monthly_index"] == COMPONENTS.MONTHLY_INDEX_COLUMNS
 
 
-def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
+def test_monthly_rebalanced_index_uses_previous_trading_day_information():
     symbols = [f"S{index:03d}" for index in range(3)]
     dates = pd.bdate_range("2024-01-02", periods=45)
     config = make_config(
@@ -719,8 +719,42 @@ def test_monthly_rebalanced_index_uses_next_trading_day_after_month_end():
     assert constituents.index.get_level_values("effective_date").min() == pd.Timestamp(
         "2024-01-31"
     )
+    first = constituents.xs(pd.Timestamp("2024-01-31"), level="effective_date")
+    assert first["as_of_date"].eq(pd.Timestamp("2024-01-30")).all()
+    assert first["price_date"].le(pd.Timestamp("2024-01-30")).all()
     assert index.index.equals(pd.Index(index.index.unique(), name="date"))
     assert index.loc[pd.Timestamp("2024-02-29"), "total_return"] == pytest.approx(0.0)
+
+    changed_price = make_price(symbols, dates=dates)
+    changed_price.loc[
+        changed_price["date"].eq(pd.Timestamp("2024-01-31")),
+        ["close", "amount", "pe_ttm"],
+    ] *= 10
+    changed_index, changed_constituents = calculate_monthly_rebalanced_index(
+        changed_price,
+        dividends,
+        make_queries(symbols),
+        make_shares(symbols),
+        dates[0],
+        dates[-1],
+        strategy_config,
+        factors,
+        coverage,
+    )
+    pd.testing.assert_frame_equal(
+        first,
+        changed_constituents.xs(pd.Timestamp("2024-01-31"), level="effective_date"),
+    )
+    # The order uses January's execution price, not the preceding day's price.
+    assert changed_index.loc["2024-02-29", "total_return"] == pytest.approx(-0.9)
+
+
+def test_rebalance_information_dates_follow_market_calendar_and_require_history():
+    dates = pd.to_datetime(["2024-09-30", "2024-10-08", "2024-10-30", "2024-10-31"])
+    out = COMPONENTS.get_rebalance_information_dates(dates, dates[[1, 3]])
+    assert out.tolist() == [pd.Timestamp("2024-09-30"), pd.Timestamp("2024-10-30")]
+    with pytest.raises(ValueError, match="preceding trading date"):
+        COMPONENTS.get_rebalance_information_dates(dates, dates[:1])
 
 
 def test_monthly_rebalance_charges_turnover_cost_after_initial_construction(
@@ -1369,6 +1403,8 @@ def test_high_frequency_monthly_index_uses_shared_rebalance_backtest(monkeypatch
 
     def fake_select(*args):
         date = pd.Timestamp(args[5])
+        month_end = dates[dates.to_period("M") == date.to_period("M")].max()
+        assert date == dates[dates < month_end][-1]
         symbol = "S000" if date.month == 1 else "S001"
         return pd.DataFrame(
             {"weight": [1.0]}, index=pd.Index([symbol], name="symbol")

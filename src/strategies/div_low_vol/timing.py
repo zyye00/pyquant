@@ -9,6 +9,7 @@ import pandas as pd
 import yaml
 
 from pyquant import get_period_end_dates, run_backtest
+from strategies.div_low_vol.components import get_rebalance_information_dates
 
 
 config_file = files("strategies.div_low_vol").joinpath("config.yaml")
@@ -24,7 +25,7 @@ def calculate_bp_spread(
     constituents: pd.DataFrame,
     config: dict,
 ) -> pd.DataFrame:
-    """Calculate monthly constituent/non-constituent BP spread and lower band."""
+    """Calculate month-end signals from PB and membership available the preceding day."""
     strategy = _validate_strategy_config(config)
     price_data = _prepare_price(price, strategy["pb_factor"])
     constituent_data = _prepare_constituents(
@@ -34,14 +35,10 @@ def calculate_bp_spread(
     price_data["month"] = price_data["date"].dt.to_period("M")
     period_ends = get_period_end_dates(price_data["date"])
     valuation_dates = pd.Series(period_ends, index=period_ends.to_period("M"))
+    information_dates = get_rebalance_information_dates(price_data["date"], period_ends)
     price_data = price_data[
         np.isfinite(price_data["pb"]) & price_data["pb"].gt(0)
     ]
-    price_data = (
-        price_data.sort_values(["date", "symbol"])
-        .groupby(["month", "symbol"], as_index=False)
-        .tail(1)
-    )
     snapshots = {
         effective_date: frozenset(snapshot["symbol"])
         for effective_date, snapshot in constituent_data.groupby(
@@ -52,13 +49,20 @@ def calculate_bp_spread(
     snapshot_dates = pd.DatetimeIndex(snapshots)
     rows = []
     for month, valuation_date in valuation_dates.items():
-        position = snapshot_dates.searchsorted(valuation_date, side="right") - 1
+        as_of_date = information_dates.loc[valuation_date]
+        position = snapshot_dates.searchsorted(as_of_date, side="right") - 1
         if position < 0:
             raise ValueError(
                 f"No constituent snapshot is available at {valuation_date.date()}"
             )
         effective_date = snapshot_dates[position]
-        monthly = price_data[price_data["month"].eq(month)].copy()
+        monthly = (
+            price_data.loc[price_data["month"].eq(month) & price_data["date"].le(as_of_date)]
+            .sort_values(["date", "symbol"])
+            .groupby("symbol", as_index=False)
+            .tail(1)
+            .copy()
+        )
         monthly["bp"] = 1.0 / monthly["pb"]
         is_constituent = monthly["symbol"].isin(snapshots[effective_date])
         low = monthly.loc[is_constituent, ["symbol", "bp"]]
@@ -78,6 +82,7 @@ def calculate_bp_spread(
         rows.append(
             {
                 "date": valuation_date,
+                "as_of_date": as_of_date,
                 "constituent_effective_date": effective_date,
                 "constituent_count": len(low),
                 "non_constituent_count": len(high),

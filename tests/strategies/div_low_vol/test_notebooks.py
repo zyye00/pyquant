@@ -153,6 +153,8 @@ def test_strategy_2_notebook_uses_public_interfaces_and_candidate_pool_scope():
     strategy_notebook = str(notebooks["2_high_frequency.ipynb"])
 
     assert "config[\"strategy_2\"]" in download_notebook
+    assert "get_rebalance_information_dates(trading_dates, rebalance_dates)" in download_notebook
+    assert "for signal_date in information_dates:" in download_notebook
     assert "update_dataset" not in strategy_notebook
     assert "load_dataset(\"intraday_volatility_daily\"" in strategy_notebook
     assert "calculate_high_frequency_div_low_vol_monthly_rebalanced_index" in strategy_notebook
