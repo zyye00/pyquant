@@ -18,12 +18,12 @@ def load_notebooks(*names: str) -> dict[str, dict]:
 
 
 def test_strategy_1_notebooks_split_downloads_from_calculation():
-    notebooks = load_notebooks("download.ipynb", "1_rebalance.ipynb")
+    notebooks = load_notebooks("0_download.ipynb", "1_rebalance.ipynb")
 
-    assert "update_dataset" in str(notebooks["download.ipynb"])
+    assert "update_dataset" in str(notebooks["0_download.ipynb"])
     strategy_notebook = str(notebooks["1_rebalance.ipynb"])
     assert "update_dataset" not in strategy_notebook
-    assert "csindex_daily" in str(notebooks["download.ipynb"])
+    assert "csindex_daily" in str(notebooks["0_download.ipynb"])
     assert "csindex_daily" in strategy_notebook
     assert "calculate_div_low_vol_monthly_rebalanced_index" in strategy_notebook
     assert "calculate_traditional_volatility_group_indices" in strategy_notebook
@@ -37,17 +37,17 @@ def test_strategy_1_notebooks_split_downloads_from_calculation():
     assert "gross_reinvested_index" not in strategy_notebook
     assert "月调组合（无费率、分红立即再投资）" not in strategy_notebook
     assert "official_index_downloads = current_job.wait()" in str(
-        notebooks["download.ipynb"]
+        notebooks["0_download.ipynb"]
     )
-    assert "update_minute_data" in str(notebooks["download.ipynb"])
-    assert "build_intraday_minute_requests" in str(notebooks["download.ipynb"])
+    assert "update_minute_data" in str(notebooks["0_download.ipynb"])
+    assert "build_intraday_minute_requests" in str(notebooks["0_download.ipynb"])
     assert "minute_downloads = current_job.wait()" in str(
-        notebooks["download.ipynb"]
+        notebooks["0_download.ipynb"]
     )
 
 
 def test_download_notebook_groups_sources_and_controls_current_job():
-    notebook = load_notebooks("download.ipynb")["download.ipynb"]
+    notebook = load_notebooks("0_download.ipynb")["0_download.ipynb"]
     cells = notebook["cells"]
     sources = ["".join(cell.get("source", [])) for cell in cells]
     code_sources = [
@@ -111,10 +111,10 @@ def test_download_notebook_groups_sources_and_controls_current_job():
 
 def test_strategy_3_notebook_and_download_entry_are_separated():
     notebooks = load_notebooks(
-        "download.ipynb", "3_timing.ipynb"
+        "0_download.ipynb", "3_timing.ipynb"
     )
 
-    download_notebook = str(notebooks["download.ipynb"])
+    download_notebook = str(notebooks["0_download.ipynb"])
     strategy_notebook = str(notebooks["3_timing.ipynb"])
     assert "index_constituents" in download_notebook
     assert "constituent_snapshots = current_job.wait()" in download_notebook
@@ -122,7 +122,7 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
     assert "pb_downloads = current_job.wait()" in download_notebook
     assert 'pool="all"' in download_notebook
     assert "valuation_symbols" not in download_notebook
-    cells = notebooks["download.ipynb"]["cells"]
+    cells = notebooks["0_download.ipynb"]["cells"]
     pb_index = next(
         index
         for index, cell in enumerate(cells)
@@ -148,8 +148,8 @@ def test_strategy_3_notebook_and_download_entry_are_separated():
 
 
 def test_strategy_2_notebook_uses_public_interfaces_and_candidate_pool_scope():
-    notebooks = load_notebooks("download.ipynb", "2_high_frequency.ipynb")
-    download_notebook = str(notebooks["download.ipynb"])
+    notebooks = load_notebooks("0_download.ipynb", "2_high_frequency.ipynb")
+    download_notebook = str(notebooks["0_download.ipynb"])
     strategy_notebook = str(notebooks["2_high_frequency.ipynb"])
 
     assert "config[\"strategy_2\"]" in download_notebook
