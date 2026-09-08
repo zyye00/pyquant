@@ -1,8 +1,41 @@
 import json
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import pytest
+
+from pyquant import calc_metrics
 
 NOTEBOOK_DIR = Path(__file__).parents[3] / "notebooks" / "div_low_vol"
+
+
+@pytest.mark.parametrize("name", ["1_rebalance.ipynb", "2_high_frequency.ipynb", "3_timing.ipynb"])
+def test_performance_cells_execute_with_distinct_metrics(name):
+    notebook = load_notebooks(name)[name]
+    source = next(
+        "".join(cell["source"]) for cell in notebook["cells"]
+        if cell["cell_type"] == "code" and "def summarize_performance(" in "".join(cell["source"])
+    )
+    dates = pd.to_datetime(["2024-01-31", "2024-02-29", "2024-03-29"])
+    returns = pd.DataFrame({
+        "红利低波全收益指数": [np.nan, 0.02, -0.02],
+        "测试策略": [np.nan, -0.1, 0.1],
+    }, index=dates)
+    timing = returns.rename(columns={
+        "红利低波全收益指数": "benchmark_return", "测试策略": "cash_timing_return",
+    })
+    timing["short_timing_return"] = timing["cash_timing_return"]
+    namespace = {"pd": pd, "calc_metrics": calc_metrics, "returns": returns, "timing": timing}
+    exec(compile(source, name, "exec"), namespace)
+    performance = namespace["performance"]
+    strategy = performance.iloc[:, 1]
+    assert strategy["最大回撤"] == pytest.approx(0.1)
+    assert strategy["月度胜率"] == pytest.approx(0.5)
+    assert strategy["Sharpe（无风险收益率=0）"] == pytest.approx(0.0)
+    assert strategy["年化收益／年化波动（研报对照口径）"] < 0
+    assert strategy["信息比率"] == pytest.approx(0.0)
+    assert np.isnan(performance.loc["信息比率", "红利低波全收益指数"])
 
 
 def load_notebooks(*names: str) -> dict[str, dict]:
